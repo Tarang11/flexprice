@@ -7,15 +7,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/flexprice/flexprice/internal/clock"
+
+	"github.com/samber/lo"
+	"github.com/shopspring/decimal"
+
 	"github.com/flexprice/flexprice/internal/api/dto"
-	"github.com/flexprice/flexprice/internal/domain/checkout"
 	"github.com/flexprice/flexprice/internal/domain/proration"
 	"github.com/flexprice/flexprice/internal/domain/subscription"
 	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/idempotency"
 	"github.com/flexprice/flexprice/internal/types"
-	"github.com/samber/lo"
-	"github.com/shopspring/decimal"
 )
 
 // quantityChangeRequest is the validated, ready-to-apply intent for a quantity change.
@@ -86,7 +88,7 @@ func (s *subscriptionModificationService) requestFromModifySubscriptionParams(
 			Mark(ierr.ErrValidation)
 	}
 
-	now := time.Now().UTC()
+	now := clock.Now()
 	mods := make([]*quantityChangeLineItemMod, 0, len(params.LineItemModifications))
 	for _, m := range params.LineItemModifications {
 		lineItem, err := sp.SubscriptionLineItemRepo.Get(ctx, m.LineItemID)
@@ -125,7 +127,7 @@ func (s *subscriptionModificationService) requestFromModifySubscriptionParams(
 
 		alreadyApplied := !lineItem.EndDate.IsZero() && lineItem.EndDate.Equal(effectiveDate)
 		if !alreadyApplied {
-			if err := validateQuantityChangeEffectiveDateWithinLineItemWindow(
+			if err := validateChangeEffectiveDateWithinLineItemWindow(
 				effectiveDate, sub, lineItem, m.LineItemID,
 			); err != nil {
 				return nil, err
@@ -137,9 +139,14 @@ func (s *subscriptionModificationService) requestFromModifySubscriptionParams(
 			newEndDate = lineItem.EndDate
 		}
 
+		quantity := lineItem.Quantity
+		if m.Quantity != nil {
+			quantity = *m.Quantity
+		}
+
 		mods = append(mods, newQuantityChangeLineItemMod(
 			m.LineItemID,
-			m.Quantity,
+			quantity,
 			effectiveDate,
 			lineItem,
 			newEndDate,
@@ -165,12 +172,13 @@ func (r *quantityChangeRequest) toModifySubscriptionParams() *types.ModifySubscr
 		ed := effectiveDate
 		lineMods = append(lineMods, types.ModifySubscriptionLineItem{
 			LineItemID:    m.getLineItemID(),
-			Quantity:      m.getQuantity(),
+			Quantity:      lo.ToPtr(m.getQuantity()),
 			EffectiveDate: &ed,
 		})
 	}
 	return &types.ModifySubscriptionParams{
 		SubscriptionID:        r.GetSubscriptionID(),
+		ModifyType:            types.ModifySubscriptionTypeQuantityChange,
 		LineItemModifications: lineMods,
 	}
 }
@@ -198,7 +206,7 @@ func (r *quantityChangeRequest) previewChangedLineItems() []dto.ChangedLineItem 
 		newEndDate := m.getNewEndDate()
 		out = append(out,
 			dto.ChangedLineItem{
-				ID:           "(preview-ended)",
+				ID:           previewEndedLineItemID,
 				PriceID:      old.PriceID,
 				Quantity:     old.Quantity,
 				StartDate:    &oldStart,
@@ -206,7 +214,7 @@ func (r *quantityChangeRequest) previewChangedLineItems() []dto.ChangedLineItem 
 				ChangeAction: dto.ChangedLineItemActionEnded,
 			},
 			dto.ChangedLineItem{
-				ID:           "(preview-created)",
+				ID:           previewCreatedID,
 				PriceID:      old.PriceID,
 				Quantity:     m.getQuantity(),
 				StartDate:    &startDate,
@@ -286,6 +294,7 @@ func (s *subscriptionModificationService) buildQuantityChangeRequest(
 	params *dto.SubModifyQuantityChangeRequest,
 ) (*quantityChangeRequest, error) {
 	sp := s.serviceParams
+	subSvc := NewSubscriptionService(sp).(*subscriptionService)
 
 	if params == nil {
 		return nil, ierr.NewError("quantity_change_params is required").
@@ -304,7 +313,15 @@ func (s *subscriptionModificationService) buildQuantityChangeRequest(
 			Mark(ierr.ErrValidation)
 	}
 
-	now := time.Now().UTC()
+	// This path invoices on the subscription itself, so a grouped child's charge would be skipped.
+	if sub.SubscriptionType == types.SubscriptionTypeGroupedInvoicing {
+		return nil, ierr.NewError("quantity_change is not supported on a grouped invoicing subscription").
+			WithHint("Use line_item_change to change quantities on this subscription").
+			WithReportableDetails(map[string]interface{}{"subscription_id": subscriptionID}).
+			Mark(ierr.ErrValidation)
+	}
+
+	now := clock.Now()
 	mods := make([]*quantityChangeLineItemMod, 0, len(params.LineItems))
 
 	for _, change := range params.LineItems {
@@ -357,7 +374,13 @@ func (s *subscriptionModificationService) buildQuantityChangeRequest(
 				Mark(ierr.ErrValidation)
 		}
 
-		if err := validateQuantityChangeEffectiveDateWithinLineItemWindow(effectiveDate, sub, lineItem, change.ID); err != nil {
+		if successor, err := subSvc.findPublishedSuccessor(ctx, lineItem); err != nil {
+			return nil, err
+		} else if successor != nil {
+			return nil, alreadyScheduledVersionError(change.ID, successor.ID)
+		}
+
+		if err := validateChangeEffectiveDateWithinLineItemWindow(effectiveDate, sub, lineItem, change.ID); err != nil {
 			return nil, err
 		}
 
@@ -509,7 +532,8 @@ func (s *subscriptionModificationService) calculateProration(
 		if oldItem == nil {
 			continue
 		}
-		if oldItem.InvoiceCadence != types.InvoiceCadenceAdvance {
+		// Only recurring advance items are prorated; one-time charges never are.
+		if oldItem.InvoiceCadence != types.InvoiceCadenceAdvance || oldItem.BillingPeriod == types.BILLING_PERIOD_ONETIME {
 			continue
 		}
 
@@ -519,23 +543,24 @@ func (s *subscriptionModificationService) calculateProration(
 		}
 
 		result, err := prorationSvc.CalculateProration(ctx, proration.ProrationParams{
+			Subscription:       sub,
+			BillingPeriod:      oldItem.BillingPeriod,
+			BillingPeriodCount: oldItem.BillingPeriodCount,
 			SubscriptionID:     sub.ID,
 			LineItemID:         oldItem.ID,
 			PlanPayInAdvance:   oldItem.InvoiceCadence == types.InvoiceCadenceAdvance,
 			CurrentPeriodStart: sub.CurrentPeriodStart,
-			CurrentPeriodEnd:   sub.CurrentPeriodEnd.Add(-time.Second),
+			CurrentPeriodEnd:   sub.CurrentPeriodEnd,
 			Action:             types.ProrationActionQuantityChange,
 			NewPriceID:         oldItem.PriceID,
 			OldQuantity:        oldItem.Quantity,
 			NewQuantity:        mod.getQuantity(),
-			NewPricePerUnit:    price.Price.Amount,
-			OldPricePerUnit:    price.Price.Amount,
+			NewPricePerUnit:    priceSvc.CalculateUnitCost(ctx, price.Price, mod.getQuantity()),
+			OldPricePerUnit:    priceSvc.CalculateUnitCost(ctx, price.Price, oldItem.Quantity),
 			ProrationDate:      mod.getEffectiveDate(),
 			ProrationBehavior:  types.ProrationBehaviorCreateProrations,
-			ProrationStrategy:  types.StrategySecondBased,
 			Currency:           sub.Currency,
 			PlanDisplayName:    oldItem.PlanDisplayName,
-			Timezone:           customerTimezone,
 		})
 		if err != nil {
 			return nil, err
@@ -574,6 +599,7 @@ func (s *subscriptionModificationService) applyQuantityChange(
 	}
 
 	sp := s.serviceParams
+	subSvc := NewSubscriptionService(sp).(*subscriptionService)
 	mods := request.GetModifications()
 	if len(mods) == 0 {
 		return []dto.ChangedLineItem{}, nil
@@ -591,7 +617,7 @@ func (s *subscriptionModificationService) applyQuantityChange(
 			effectiveDate := mod.getEffectiveDate()
 			lineItemID := mod.getLineItemID()
 
-			lineItem, err := sp.SubscriptionLineItemRepo.Get(txCtx, lineItemID)
+			lineItem, err := sp.SubscriptionLineItemRepo.GetForUpdate(txCtx, lineItemID)
 			if err != nil {
 				return err
 			}
@@ -614,14 +640,22 @@ func (s *subscriptionModificationService) applyQuantityChange(
 					Mark(ierr.ErrValidation)
 			}
 
+			if successor, err := subSvc.findPublishedSuccessor(txCtx, lineItem); err != nil {
+				return err
+			} else if successor != nil {
+				return alreadyScheduledVersionError(lineItemID, successor.ID)
+			}
+
 			// Preserve a finite original window on the replacement; open-ended stays open-ended.
 			newItemEndDate := time.Time{}
 			if !lineItem.EndDate.IsZero() {
 				newItemEndDate = lineItem.EndDate
 			}
 
+			newItemID := types.GenerateUUIDWithPrefix(types.UUID_PREFIX_SUBSCRIPTION_LINE_ITEM)
 			endedItem := subscription.NewSubscriptionLineItemBuilder(lineItem).
 				WithEndDate(effectiveDate).
+				WithSuccessorLineItemID(lo.ToPtr(newItemID)).
 				Build()
 			if err := sp.SubscriptionLineItemRepo.Update(txCtx, endedItem); err != nil {
 				return ierr.WithError(err).
@@ -631,12 +665,18 @@ func (s *subscriptionModificationService) applyQuantityChange(
 
 			// Copy from the ended line item, then override identity / window / quantity.
 			newItem := subscription.NewSubscriptionLineItemBuilder(endedItem).
-				WithID(types.GenerateUUIDWithPrefix(types.UUID_PREFIX_SUBSCRIPTION_LINE_ITEM)).
+				WithID(newItemID).
 				WithQuantity(mod.getQuantity()).
 				WithStartDate(effectiveDate).
 				WithEndDate(newItemEndDate).
 				WithBaseModel(types.GetDefaultBaseModel(txCtx)).
+				WithPredecessorLineItemID(lo.ToPtr(lineItemID)).
+				WithSuccessorLineItemID(nil).
 				Build()
+			clearLineItemMetadataIDs(newItem, lineageMetadataKeys...)
+			if err := checkLineAttach(txCtx, sp, request.GetSubscription(), newItem); err != nil {
+				return err
+			}
 			if err := sp.SubscriptionLineItemRepo.Create(txCtx, newItem); err != nil {
 				return err
 			}
@@ -779,18 +819,8 @@ func (s *subscriptionModificationService) settlePayFirst(
 		return nil, err
 	}
 
-	existing, err := s.getAnyPendingCheckoutSession(ctx, sub.CustomerID, sub.ID)
-	if err != nil {
+	if err := ensureNoPendingCheckoutSession(ctx, sp, sub.ID); err != nil {
 		return nil, err
-	}
-	if len(existing) > 0 {
-		return nil, ierr.NewError("a pending checkout session already exists for this subscription").
-			WithHint("Complete or cancel the existing checkout before starting another payment-gated modification").
-			WithReportableDetails(map[string]any{
-				"subscription_id":     sub.ID,
-				"checkout_session_id": existing[0].ID,
-			}).
-			Mark(ierr.ErrAlreadyExists)
 	}
 
 	draftInvoice, err := s.createAggregatedProrationDraftInvoice(ctx, sub, prorationResult)
@@ -842,25 +872,6 @@ func (s *subscriptionModificationService) settlePayFirst(
 	}, nil
 }
 
-func (s *subscriptionModificationService) getAnyPendingCheckoutSession(ctx context.Context, customerID string, subscriptionID string) ([]*checkout.CheckoutSession, error) {
-	pendingFilter := &types.CheckoutSessionFilter{
-		QueryFilter: types.NewNoLimitPublishedQueryFilter(),
-		CustomerIDs: []string{customerID},
-		Actions: []types.CheckoutAction{
-			types.CheckoutActionModifySubscription,
-			types.CheckoutActionAddAddon,
-		},
-		CheckoutStatuses: []types.CheckoutStatus{
-			types.CheckoutStatusInitiated,
-			types.CheckoutStatusPending,
-		},
-		Configuration: &types.CheckoutConfigurationFilter{SubscriptionID: subscriptionID},
-	}
-	pendingFilter.Limit = lo.ToPtr(1)
-
-	return s.serviceParams.CheckoutSessionRepo.List(ctx, pendingFilter)
-}
-
 // createAggregatedProrationDraftInvoice locks the batch net (charges − credits) on one DRAFT ONE_OFF.
 // Line items keep per-LI charge/credit amounts; AmountDue is their sum (the net).
 func (s *subscriptionModificationService) createAggregatedProrationDraftInvoice(
@@ -884,40 +895,42 @@ func (s *subscriptionModificationService) createAggregatedProrationDraftInvoice(
 			Mark(ierr.ErrValidation)
 	}
 
-	req := buildAggregatedProrationChargeInvoiceRequest(sub, items)
-	req.SourceType = types.InvoiceSourceTypeCheckout
+	quote, periodStart, idempKey := aggregatedProrationQuote(sub, items)
 
-	invoiceSvc := NewInvoiceService(s.serviceParams)
-	inv, skipped, err := invoiceSvc.CreateComputedDraftInvoice(ctx, req)
+	settleReq := NewSettleProrationRequest(
+		sub, quote, periodStart, sub.CurrentPeriodEnd,
+		"Quantity change", idempKey, SettleModeDraft,
+	)
+
+	settled, err := NewLineItemProrationService(s.serviceParams).Settle(ctx, settleReq)
 	if err != nil {
 		return nil, err
 	}
-	if skipped {
-		return nil, ierr.NewError("draft invoice was skipped").
-			WithHint("Expected a non-zero invoice amount").
-			WithReportableDetails(map[string]any{
-				"invoice_id": inv.GetId(),
-			}).
-			Mark(ierr.ErrValidation)
-	}
-	return inv, nil
+
+	return settled.Draft, nil
 }
 
-func buildAggregatedProrationChargeInvoiceRequest(
+func aggregatedProrationQuote(
 	sub *subscription.Subscription,
 	items []*quantityChangeProrationItem,
-) dto.CreateInvoiceRequest {
-	lineItems := make([]dto.CreateInvoiceLineItemRequest, 0, len(items))
-	total := decimal.Zero
+) (*LineItemProrationSummary, time.Time, string) {
+	quote := emptyProrationSummary(sub)
 	var periodStart *time.Time
-	periodEnd := sub.CurrentPeriodEnd
-	billingPeriod := string(sub.BillingPeriod)
 	keyParts := make([]prorationChargeKeyPart, 0, len(items))
 
 	for _, item := range items {
 		single := buildProrationChargeInvoiceRequest(sub, item)
-		total = total.Add(single.AmountDue)
-		lineItems = append(lineItems, single.LineItems...)
+
+		for _, line := range single.LineItems {
+			if line.Amount.IsNegative() {
+				quote.CreditLineItems = append(quote.CreditLineItems, line)
+				quote.TotalCreditAmount = quote.TotalCreditAmount.Add(line.Amount.Abs())
+				continue
+			}
+			quote.ChargeLineItems = append(quote.ChargeLineItems, line)
+			quote.TotalChargeAmount = quote.TotalChargeAmount.Add(line.Amount)
+		}
+
 		if single.PeriodStart != nil && (periodStart == nil || single.PeriodStart.Before(*periodStart)) {
 			periodStart = single.PeriodStart
 		}
@@ -928,23 +941,7 @@ func buildAggregatedProrationChargeInvoiceRequest(
 		}
 	}
 
-	idempKey := prorationChargeIdempotencyKey(sub.ID, keyParts)
-	return dto.CreateInvoiceRequest{
-		CustomerID:     sub.GetInvoicingCustomerID(),
-		SubscriptionID: &sub.ID,
-		InvoiceType:    types.InvoiceTypeOneOff,
-		Currency:       sub.Currency,
-		BillingReason:  types.InvoiceBillingReasonSubscriptionUpdate,
-		AmountDue:      total,
-		Total:          total,
-		Subtotal:       total,
-		PeriodStart:    periodStart,
-		PeriodEnd:      &periodEnd,
-		BillingPeriod:  &billingPeriod,
-		LineItems:      lineItems,
-		IdempotencyKey: &idempKey,
-		Metadata:       types.WithCollapsedInvoiceDisplayName(nil, "Quantity change"),
-	}
+	return quote, lo.FromPtr(periodStart), prorationChargeIdempotencyKey(sub.ID, keyParts)
 }
 
 // createProrationChargeInvoice creates a ONE_OFF proration charge for one B item.
@@ -1095,15 +1092,16 @@ func buildProrationChargeInvoiceRequest(
 		Metadata:       types.WithCollapsedInvoiceDisplayName(nil, "Quantity change"),
 		LineItems: []dto.CreateInvoiceLineItemRequest{
 			{
-				PriceID:         &priceID,
-				PriceType:       &priceType,
-				PlanDisplayName: &planDisplayName,
-				DisplayName:     &displayName,
-				Amount:          netAmount,
-				Quantity:        qtyDelta,
-				PeriodStart:     &effectiveDate,
-				PeriodEnd:       &periodEnd,
-				Metadata:        types.Metadata{"description": lineItemDescription},
+				PriceID:                &priceID,
+				SubscriptionLineItemID: &oldItem.ID,
+				PriceType:              &priceType,
+				PlanDisplayName:        &planDisplayName,
+				DisplayName:            &displayName,
+				Amount:                 netAmount,
+				Quantity:               qtyDelta,
+				PeriodStart:            &effectiveDate,
+				PeriodEnd:              &periodEnd,
+				Metadata:               types.Metadata{"description": lineItemDescription},
 			},
 		},
 	}
@@ -1153,10 +1151,10 @@ func prorationChargeIdempotencyKey(subID string, parts []prorationChargeKeyPart)
 	})
 }
 
-// validateQuantityChangeEffectiveDateWithinLineItemWindow ensures effectiveDate lies in
+// validateChangeEffectiveDateWithinLineItemWindow ensures effectiveDate lies in
 // [lineItem.StartDate, lineEnd), where lineEnd is lineItem.EndDate when set, otherwise
 // sub.CurrentPeriodEnd (open-ended line item). Subscription period bounds are validated separately.
-func validateQuantityChangeEffectiveDateWithinLineItemWindow(
+func validateChangeEffectiveDateWithinLineItemWindow(
 	effectiveDate time.Time,
 	sub *subscription.Subscription,
 	lineItem *subscription.SubscriptionLineItem,

@@ -427,12 +427,23 @@ func paymentFilterFn(ctx context.Context, p *payment.Payment, filter interface{}
 	if f.DestinationID != nil && p.DestinationID != *f.DestinationID {
 		return false
 	}
+	if len(f.DestinationIDs) > 0 && !lo.Contains(f.DestinationIDs, p.DestinationID) {
+		return false
+	}
 
 	if f.DestinationType != nil && string(p.DestinationType) != *f.DestinationType {
 		return false
 	}
 
 	if f.PaymentStatus != nil && string(p.PaymentStatus) != *f.PaymentStatus {
+		return false
+	}
+
+	if len(f.PaymentStatuses) > 0 && !lo.Contains(f.PaymentStatuses, p.PaymentStatus) {
+		return false
+	}
+
+	if f.PaymentMethodType != nil && string(p.PaymentMethodType) != *f.PaymentMethodType {
 		return false
 	}
 
@@ -520,4 +531,10 @@ func (m *InMemoryPaymentStore) GetCreatedPayments() []*payment.Payment {
 	result := make([]*payment.Payment, len(m.createdInOrder))
 	copy(result, m.createdInOrder)
 	return result
+}
+
+func (m *InMemoryPaymentStore) GetLinkedCustomerID(_ context.Context, _ string) (string, error) {
+	return "", ierr.NewError("not implemented").
+		WithHint("not implemented").
+		Mark(ierr.ErrSystem)
 }

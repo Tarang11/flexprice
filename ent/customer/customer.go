@@ -38,6 +38,8 @@ const (
 	FieldEmail = "email"
 	// FieldContact holds the string denoting the contact field in the database.
 	FieldContact = "contact"
+	// FieldBillingCurrency holds the string denoting the billing_currency field in the database.
+	FieldBillingCurrency = "billing_currency"
 	// FieldAddressLine1 holds the string denoting the address_line1 field in the database.
 	FieldAddressLine1 = "address_line1"
 	// FieldAddressLine2 holds the string denoting the address_line2 field in the database.
@@ -54,6 +56,12 @@ const (
 	FieldTimezone = "timezone"
 	// FieldTaxTreatment holds the string denoting the tax_treatment field in the database.
 	FieldTaxTreatment = "tax_treatment"
+	// FieldContactPersons holds the string denoting the contact_persons field in the database.
+	FieldContactPersons = "contact_persons"
+	// FieldBillingEntityID holds the string denoting the billing_entity_id field in the database.
+	FieldBillingEntityID = "billing_entity_id"
+	// FieldSettings holds the string denoting the settings field in the database.
+	FieldSettings = "settings"
 	// Table holds the table name of the customer in the database.
 	Table = "customers"
 )
@@ -73,6 +81,7 @@ var Columns = []string{
 	FieldName,
 	FieldEmail,
 	FieldContact,
+	FieldBillingCurrency,
 	FieldAddressLine1,
 	FieldAddressLine2,
 	FieldAddressCity,
@@ -81,6 +90,9 @@ var Columns = []string{
 	FieldAddressCountry,
 	FieldTimezone,
 	FieldTaxTreatment,
+	FieldContactPersons,
+	FieldBillingEntityID,
+	FieldSettings,
 }
 
 // ValidColumn reports if the column name is valid (part of the table columns).
@@ -181,6 +193,11 @@ func ByContact(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldContact, opts...).ToFunc()
 }
 
+// ByBillingCurrency orders the results by the billing_currency field.
+func ByBillingCurrency(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldBillingCurrency, opts...).ToFunc()
+}
+
 // ByAddressLine1 orders the results by the address_line1 field.
 func ByAddressLine1(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldAddressLine1, opts...).ToFunc()
@@ -219,4 +236,9 @@ func ByTimezone(opts ...sql.OrderTermOption) OrderOption {
 // ByTaxTreatment orders the results by the tax_treatment field.
 func ByTaxTreatment(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldTaxTreatment, opts...).ToFunc()
+}
+
+// ByBillingEntityID orders the results by the billing_entity_id field.
+func ByBillingEntityID(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldBillingEntityID, opts...).ToFunc()
 }

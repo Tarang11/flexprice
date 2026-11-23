@@ -8,6 +8,7 @@ import (
 	integrationwhop "github.com/flexprice/flexprice/internal/integration/whop"
 	"github.com/flexprice/flexprice/internal/interfaces"
 	"github.com/flexprice/flexprice/internal/logger"
+	"github.com/flexprice/flexprice/internal/temporal/activities/billingentity"
 	"github.com/flexprice/flexprice/internal/temporal/models"
 	"github.com/flexprice/flexprice/internal/types"
 	"go.temporal.io/sdk/temporal"
@@ -17,6 +18,7 @@ import (
 type InvoiceSyncActivities struct {
 	integrationFactory *integration.Factory
 	customerService    interfaces.CustomerService
+	entityScope        interfaces.BillingEntityScope
 	logger             *logger.Logger
 }
 
@@ -24,11 +26,13 @@ type InvoiceSyncActivities struct {
 func NewInvoiceSyncActivities(
 	integrationFactory *integration.Factory,
 	customerService interfaces.CustomerService,
+	entityScope interfaces.BillingEntityScope,
 	logger *logger.Logger,
 ) *InvoiceSyncActivities {
 	return &InvoiceSyncActivities{
 		integrationFactory: integrationFactory,
 		customerService:    customerService,
+		entityScope:        entityScope,
 		logger:             logger,
 	}
 }
@@ -46,12 +50,17 @@ func (a *InvoiceSyncActivities) MarkWhopInvoicePaid(
 	ctx = types.SetTenantID(ctx, input.TenantID)
 	ctx = types.SetEnvironmentID(ctx, input.EnvironmentID)
 
+	ctx, err := billingentity.ScopeActivity(ctx, a.entityScope, "", input.InvoiceID, "")
+	if err != nil {
+		return err
+	}
+
 	whopIntegration, err := a.integrationFactory.GetWhopIntegration(ctx)
 	if err != nil {
 		if ierr.IsNotFound(err) {
 			return temporal.NewNonRetryableApplicationError(
 				"Whop connection not configured",
-				"ConnectionNotFound",
+				ierr.ErrConnectionNotFound,
 				err,
 			)
 		}
@@ -87,6 +96,11 @@ func (a *InvoiceSyncActivities) SyncInvoiceToWhop(
 	ctx = types.SetTenantID(ctx, input.TenantID)
 	ctx = types.SetEnvironmentID(ctx, input.EnvironmentID)
 
+	ctx, err := billingentity.ScopeActivity(ctx, a.entityScope, "", input.InvoiceID, "")
+	if err != nil {
+		return err
+	}
+
 	whopIntegration, err := a.integrationFactory.GetWhopIntegration(ctx)
 	if err != nil {
 		if ierr.IsNotFound(err) {
@@ -94,7 +108,7 @@ func (a *InvoiceSyncActivities) SyncInvoiceToWhop(
 				"invoice_id", input.InvoiceID)
 			return temporal.NewNonRetryableApplicationError(
 				"Whop connection not configured",
-				"ConnectionNotFound",
+				ierr.ErrConnectionNotFound,
 				err,
 			)
 		}

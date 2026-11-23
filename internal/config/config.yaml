@@ -1,8 +1,15 @@
 deployment:
-  mode: "local" # "local", "docker", "production"
+  mode: "local" # local, api, consumer, temporal_worker, admin
 
 server:
   address: ":8080"
+  # Grace period for in-flight requests after SIGTERM. Clamped to 45s.
+  shutdown_timeout: 25s
+
+# Operator portal (deployment.mode=admin). Empty secret refuses that mode at boot.
+# Prod sets FLEXPRICE_ADMIN_SECRET from the secret manager. Header: X-Admin-Secret.
+admin:
+  secret: ""
 
 auth:
   provider: "flexprice" # "flexprice" or "supabase"
@@ -42,6 +49,11 @@ analytics:
   enabled: false # FLEXPRICE_ANALYTICS_ENABLED
   # FLEXPRICE_ANALYTICS_METER_USAGE_SINK_TOPIC. Future: .sink.backfill / .sink.lazy
   meter_usage_sink_topic: "analytics.meter_usage.sink.realtime"
+  # Periodic Temporal revenue_facts dirty-rollup (RevenueRollupWorkflow). Off by
+  # default — enable only once revenue_facts is trusted enough to run unattended.
+  revenue_rollup:
+    enabled: false # FLEXPRICE_ANALYTICS_REVENUE_ROLLUP_ENABLED
+    auto_correct: false # FLEXPRICE_ANALYTICS_REVENUE_ROLLUP_AUTO_CORRECT
 
 kafka:
   brokers: "localhost:29092" # For local mode
@@ -161,6 +173,23 @@ clickhouse:
   dial_timeout: 0s
   read_timeout: 0s
 
+reports:
+  # Empty database or username disables reports.
+  address: ""
+  # Login must allow setting changes.
+  database: ""
+  # Empty falls back to database.
+  usage_database: ""
+  # Read usage from the events clickhouse, not reports.
+  usage_on_events_clickhouse: false
+  username: ""
+  password: ""
+  max_execution_seconds: 10
+  max_result_rows: 10000
+  max_rows_to_read: 0
+  # Server query cache; 0 disables.
+  query_cache_ttl_seconds: 1800
+
 postgres:
   host: 127.0.0.1 # For local mode
   # Will be overridden by FLEXPRICE_POSTGRES_HOST env var in Docker
@@ -268,6 +297,9 @@ otel:
     # route). Off here — SigNoz derives it from traces; turn it on where the
     # backend cannot store traces.
     http_server_enabled: false
+    app_enabled: false # Kill switch for internal/metrics.
+    disabled_metrics: [] # internal/metrics names to drop.
+    tenant_allowlist: [] # "tenant_id:environment_id" or "tenant_id"; empty = all.
 
 pyroscope:
   enabled: false # Set to true to enable continuous profiling
@@ -305,6 +337,8 @@ logging:
   # otel_auth_header: ""
   # otel_auth_value: ""
   otel_debug: false # synchronous SimpleProcessor for log export; use to confirm delivery
+  # Kill switch for provider call logs: FLEXPRICE_LOGGING_PROVIDER_CALLS_ENABLED=false
+  provider_calls_enabled: true
 
 webhook:
   enabled: true
@@ -358,6 +392,10 @@ temporal:
     max_concurrent_workflow_task_execution_size: 10 # Max workflow tasks running concurrently per worker (default: 10)
     worker_activities_per_second: 5 # Rate limit: activities dispatched per second per worker (default: 5, 0=unlimited)
     task_queue_activities_per_second: 0 # Rate limit: activities per second across ALL workers for a task queue (default: 0=unlimited)
+    # Per-queue overrides; unset keys inherit the values above.
+    queues:
+      invoice:
+        task_queue_activities_per_second: 20
   connection:
     dial_timeout_seconds: 5
     retry_max_attempts: 5
@@ -371,6 +409,19 @@ secrets:
 billing:
   tenant_id: ""
   environment_id: ""
+  enabled: false
+  region: ""
+  api_host: ""
+  api_key: ""
+  # The plan every new tenant's trial starts on; must be one of plan_ids.
+  default_plan_id: ""
+  # Every plan a tenant may buy at checkout, the default included (FLEXPRICE_BILLING_PLAN_IDS=plan_a,plan_b)
+  plan_ids: []
+  dashboard_url: ""
+  payment_provider: "stripe"
+  usage_lookback_hours: 6
+  # Zapier catch hook for self-billing Slack alerts (FLEXPRICE_BILLING_ZAPIER_WEBHOOK_URL)
+  zapier_webhook_url: ""
 
 s3:
   enabled: false
@@ -520,11 +571,29 @@ usage_alerts:
   spend_alerts_enabled: true
   entitlement_alerts_enabled: true
 
+entitlement_grants:
+  refresh_on_read: true # entitlement reads with refresh_grants=true evaluate grants first
+
 wallet_balance_alert:
   enabled: true
   topic: "wallet_alert"
   rate_limit: 1
   consumer_group: "v1_wallet_alert_service"
+
+activity:
+  enabled: false
+  topic: activity_logs
+  topic_dlq: activity_logs_dlq
+  consumer_group: "activity_log"
+  rate_limit: 50
+  excluded_tenants: [] # "tenant_id:environment_id" or "tenant_id"; empty = log all.
+  publisher:
+    buffer_size: 10000
+    workers: 4
+    max_entries_per_message: 100
+    max_message_bytes: 524288
+    max_snapshot_bytes: 262144
+    shutdown_timeout: 10s
 
 # Google Gemini (server-side AI pricing parse for dashboard). Set FLEXPRICE_GEMINI_API_KEY in secure environments.
 gemini:
@@ -536,11 +605,17 @@ whop:
 
 email:
   enabled: false # Set to true to enable email sending (override with FLEXPRICE_EMAIL_ENABLED=true)
-  resend_api_key: "" # Resend API key (set via FLEXPRICE_EMAIL_RESEND_API_KEY environment variable)
   from_address: "" # Default from address for emails (MUST be verified in Resend)
   reply_to: "" # Reply-to address for emails
   calendar_url: "" # Calendar booking URL for onboarding
   zapier_webhook_url: "" # Zapier webhook URL for user signup (set via FLEXPRICE_EMAIL_ZAPIER_WEBHOOK_URL environment variable)
+  provider: "" # resend | local; empty turns customer emails off (local writes them to disk, local runs only)
+  resend:
+    api_key: "" # FLEXPRICE_EMAIL_RESEND_API_KEY
+    webhook_secret: "" # Signing secret of this region's Resend webhook (FLEXPRICE_EMAIL_RESEND_WEBHOOK_SECRET)
+  sender_domain: "mail.flexprice.io"
+  sender_local_part: "invoices"
+  region_tag: "" # us | ca | in | staging; delivery events tagged with another region are dropped
 
 rbac:
   roles_config_path: "internal/config/rbac/roles.json" # Path to the roles.json file
@@ -598,6 +673,12 @@ integration_events:
   consumer_group: "integration-events-consumer"
   rate_limit: 10
 
+# Auto-sends customer emails from finalized-invoice events on webhook.topic; also needs email.provider set.
+email_events:
+  enabled: true
+  consumer_group: "email-events-consumer"
+  rate_limit: 10
+
 onboarding_events:
   enabled: true
   topic: "onboarding_events"
@@ -608,6 +689,14 @@ onboarding_events:
 # Checkout base URL for the checkout page
 checkout:
   base_url: ""
+
+# Hosted invoice page base; links are this value, a slash and the token. Empty returns no Flexprice link.
+hosted_invoice:
+  base_url: ""
+
+# Off rejects enabling billing entities for any environment (FLEXPRICE_BILLING_ENTITIES_ENABLED).
+billing_entities:
+  enabled: false
 
 onboarding:
   default_tenant_name: "Flexprice"

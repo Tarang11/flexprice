@@ -6,7 +6,9 @@ import (
 	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/integration"
 	"github.com/flexprice/flexprice/internal/integration/tabs"
+	"github.com/flexprice/flexprice/internal/interfaces"
 	"github.com/flexprice/flexprice/internal/logger"
+	"github.com/flexprice/flexprice/internal/temporal/activities/billingentity"
 	"github.com/flexprice/flexprice/internal/temporal/models"
 	"github.com/flexprice/flexprice/internal/types"
 	"go.temporal.io/sdk/temporal"
@@ -14,12 +16,14 @@ import (
 
 type InvoiceSyncActivities struct {
 	integrationFactory *integration.Factory
+	entityScope        interfaces.BillingEntityScope
 	logger             *logger.Logger
 }
 
-func NewInvoiceSyncActivities(integrationFactory *integration.Factory, logger *logger.Logger) *InvoiceSyncActivities {
+func NewInvoiceSyncActivities(integrationFactory *integration.Factory, entityScope interfaces.BillingEntityScope, logger *logger.Logger) *InvoiceSyncActivities {
 	return &InvoiceSyncActivities{
 		integrationFactory: integrationFactory,
+		entityScope:        entityScope,
 		logger:             logger,
 	}
 }
@@ -28,10 +32,15 @@ func (a *InvoiceSyncActivities) SyncInvoiceToTabs(ctx context.Context, input mod
 	ctx = types.SetTenantID(ctx, input.TenantID)
 	ctx = types.SetEnvironmentID(ctx, input.EnvironmentID)
 
+	ctx, err := billingentity.ScopeActivity(ctx, a.entityScope, "", input.InvoiceID, "")
+	if err != nil {
+		return err
+	}
+
 	tabsIntegration, err := a.integrationFactory.GetTabsIntegration(ctx)
 	if err != nil {
 		if ierr.IsNotFound(err) {
-			return temporal.NewNonRetryableApplicationError("Tabs connection not configured", "ConnectionNotFound", err)
+			return temporal.NewNonRetryableApplicationError("Tabs connection not configured", ierr.ErrConnectionNotFound, err)
 		}
 		a.logger.Error(ctx, "SyncInvoiceToTabs activity failed to get Tabs integration",
 			"error", err,

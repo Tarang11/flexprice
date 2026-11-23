@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/flexprice/flexprice/internal/domain/settings"
 	"github.com/flexprice/flexprice/internal/domain/wallet"
 	ierr "github.com/flexprice/flexprice/internal/errors"
+	"github.com/flexprice/flexprice/internal/interfaces"
 	"github.com/flexprice/flexprice/internal/testutil"
 	"github.com/flexprice/flexprice/internal/types"
 	"github.com/flexprice/flexprice/internal/utils"
@@ -66,6 +68,8 @@ func (s *PortalWalletSuite) SetupTest() {
 }
 
 func (s *PortalWalletSuite) TearDownTest() {
+	s.GetIntegrationFactory().SetCheckoutProvider(nil)
+	s.GetIntegrationFactory().SetPaymentMethodProvider(nil)
 	s.BaseServiceTestSuite.TearDownTest()
 }
 
@@ -84,6 +88,7 @@ func (s *PortalWalletSuite) buildParams() ServiceParams {
 		MeterRepo:                    stores.MeterRepo,
 		CustomerRepo:                 stores.CustomerRepo,
 		InvoiceRepo:                  stores.InvoiceRepo,
+		HostedInvoiceTokenRepo:       stores.HostedInvoiceTokenRepo,
 		InvoiceLineItemRepo:          stores.InvoiceLineItemRepo,
 		EnvironmentRepo:              stores.EnvironmentRepo,
 		TenantRepo:                   stores.TenantRepo,
@@ -108,6 +113,45 @@ func (s *PortalWalletSuite) buildParams() ServiceParams {
 		IntegrationFactory:           s.GetIntegrationFactory(),
 		WalletBalanceAlertPubSub:     types.WalletBalanceAlertPubSub{PubSub: testutil.NewInMemoryPubSub()},
 	}
+}
+
+func (s *PortalWalletSuite) setWalletAlertConfig(cfg types.AlertSettings) {
+	value, err := utils.ToMap(cfg)
+	s.NoError(err)
+	s.NoError(s.GetStores().SettingsRepo.Create(s.ctx, &settings.Setting{
+		ID:            types.GenerateUUIDWithPrefix(types.UUID_PREFIX_SETTING),
+		Key:           types.SettingKeyWalletBalanceAlertConfig,
+		Value:         value,
+		EnvironmentID: types.GetEnvironmentID(s.ctx),
+		BaseModel:     types.GetDefaultBaseModel(s.ctx),
+	}))
+}
+
+func (s *PortalWalletSuite) TestGetWallets_SetsBalanceAlertStatus() {
+	s.setWalletAlertConfig(types.AlertSettings{
+		AlertEnabled: lo.ToPtr(true),
+		Warning:      &types.AlertThreshold{Threshold: decimal.NewFromInt(100), Condition: types.AlertConditionBelow},
+		Critical:     &types.AlertThreshold{Threshold: decimal.Zero, Condition: types.AlertConditionBelow},
+	})
+
+	wallets, err := s.svc.GetWallets(s.ctx)
+	s.NoError(err)
+	s.Require().Len(wallets, 1)
+	s.Require().NotNil(wallets[0].BalanceAlertStatus)
+	s.Equal(types.AlertStateWarning, *wallets[0].BalanceAlertStatus)
+}
+
+func (s *PortalWalletSuite) TestGetWallets_OmitsStatusWhenNothingToEvaluate() {
+	s.setWalletAlertConfig(types.AlertSettings{
+		AlertEnabled:       lo.ToPtr(true),
+		AlertThresholdType: types.AlertThresholdTypePercentage,
+		Warning:            &types.AlertThreshold{Threshold: decimal.NewFromInt(25), Condition: types.AlertConditionBelow},
+	})
+
+	wallets, err := s.svc.GetWallets(s.ctx)
+	s.NoError(err)
+	s.Require().Len(wallets, 1)
+	s.Nil(wallets[0].BalanceAlertStatus)
 }
 
 func (s *PortalWalletSuite) connect(providers ...types.SecretProvider) {
@@ -160,7 +204,7 @@ func (s *PortalWalletSuite) TestTopUpHonoursNamedProvider() {
 
 // Stripe is connected but has no checkout adapter, so it must not be resolved to.
 func (s *PortalWalletSuite) TestTopUpIgnoresProvidersWithoutCheckout() {
-	s.connect(types.SecretProviderStripe)
+	s.connect(types.SecretProviderNomod)
 
 	_, err := s.svc.(*customerPortalService).
 		resolveCheckoutProvider(s.ctx, "cust_portal", nil)
@@ -171,7 +215,7 @@ func (s *PortalWalletSuite) TestTopUpIgnoresProvidersWithoutCheckout() {
 
 // An abandoned session locks the wallet until it expires; the customer gets the
 // in-flight session back instead of a conflict they cannot act on.
-func (s *PortalWalletSuite) TestTopUpReturnsExistingPendingSession() {
+func (s *PortalWalletSuite) TestTopUpReportsAlreadyExistsWhenSessionInFlight() {
 	s.connect(types.SecretProviderChargebee)
 	s.seedPendingSession("cs_inflight")
 
@@ -181,10 +225,144 @@ func (s *PortalWalletSuite) TestTopUpReturnsExistingPendingSession() {
 		Checkout:       &dto.PortalCheckoutParams{},
 	})
 
-	s.NoError(err, "an in-flight session must not surface as a conflict")
+	s.Require().NoError(err, "an in-flight session is reported on the response, not as an error")
 	s.Require().NotNil(resp.CheckoutSession)
 	s.Equal("cs_inflight", resp.CheckoutSession.ID)
-	s.Nil(resp.WalletTransaction, "no new transaction is created when one is in flight")
+	s.Require().NotNil(resp.CheckoutSession.EntityCreationResult)
+	s.Equal(types.EntityCreationStatusFailedAlreadyExists, resp.CheckoutSession.EntityCreationResult.Status)
+}
+
+func (s *PortalWalletSuite) TestTopUpSupersedesSessionInFlight() {
+	s.connect(types.SecretProviderChargebee)
+	s.seedPendingSession("cs_inflight")
+
+	// The provider call cannot succeed here, so this asserts the supersede itself:
+	// the in-flight session is retired before the replacement is attempted.
+	_, _ = s.svc.TopUpWallet(s.ctx, s.walletID, &dto.PortalTopUpWalletRequest{
+		CreditsToAdd:   decimal.NewFromInt(5),
+		IdempotencyKey: lo.ToPtr("idem_1"),
+		Checkout: &dto.PortalCheckoutParams{
+			EntityCreationOptions: &dto.EntityCreationOptions{
+				EntityCreationConflictPolicies: &dto.EntityCreationConflictPolicies{
+					OnExistingEntity: types.OnExistingEntityPolicySupersede,
+				},
+			},
+		},
+	})
+
+	superseded, err := s.GetStores().CheckoutSessionRepo.Get(s.ctx, "cs_inflight")
+	s.Require().NoError(err)
+	s.Equal(types.CheckoutStatusExpired, superseded.CheckoutStatus)
+}
+
+func (s *PortalWalletSuite) TestTopUpUseSavedMethodValidation() {
+	s.connect(types.SecretProviderRazorpay, types.SecretProviderChargebee)
+
+	tests := []struct {
+		name           string
+		provider       types.PaymentGatewayType
+		useSavedMethod bool
+		wantErr        bool
+		errCheck       func(error) bool
+	}{
+		{
+			name:           "saved method with razorpay fails validation as mandates cannot be charged instantly",
+			provider:       types.PaymentGatewayTypeRazorpay,
+			useSavedMethod: true,
+			wantErr:        true,
+			errCheck:       ierr.IsValidation,
+		},
+		{
+			name:           "saved method with chargebee fails validation when customer has no saved card",
+			provider:       types.PaymentGatewayTypeChargebee,
+			useSavedMethod: true,
+			wantErr:        true,
+			errCheck:       ierr.IsValidation,
+		},
+	}
+
+	for _, tt := range tests {
+		s.Run(tt.name, func() {
+			req := &dto.PortalTopUpWalletRequest{
+				CreditsToAdd: decimal.NewFromInt(5),
+				Checkout: &dto.PortalCheckoutParams{
+					PaymentProvider: lo.ToPtr(tt.provider),
+					UseSavedMethod:  tt.useSavedMethod,
+				},
+			}
+
+			resp, err := s.svc.TopUpWallet(s.ctx, s.walletID, req)
+			if tt.wantErr {
+				s.Error(err)
+				if tt.errCheck != nil {
+					s.True(tt.errCheck(err))
+				}
+				s.Nil(resp)
+			} else {
+				s.NoError(err)
+				s.NotNil(resp)
+			}
+		})
+	}
+}
+
+type stubPaymentMethodProvider struct {
+	methods []interfaces.ProviderPaymentMethod
+	err     error
+}
+
+func (p *stubPaymentMethodProvider) ListSavedMethods(_ context.Context, _ string) ([]interfaces.ProviderPaymentMethod, error) {
+	return p.methods, p.err
+}
+
+func (p *stubPaymentMethodProvider) DeleteSavedMethod(_ context.Context, _ string, _ string) error {
+	return nil
+}
+
+func (p *stubPaymentMethodProvider) SetDefaultSavedMethod(_ context.Context, _ string, _ string) error {
+	return nil
+}
+
+func (p *stubPaymentMethodProvider) CreateSetupLink(_ context.Context, _ interfaces.SetupLinkRequest) (*interfaces.SetupLinkResponse, error) {
+	return nil, nil
+}
+
+func (s *PortalWalletSuite) TestValidateSavedMethodForTopUp_ActiveSavedCard_Success() {
+	s.connect(types.SecretProviderChargebee)
+
+	pmProvider := &stubPaymentMethodProvider{
+		methods: []interfaces.ProviderPaymentMethod{
+			{
+				GatewayMethodID:     "pm_chargebee_valid",
+				Method:              types.PaymentMethodTypeCard,
+				Active:              true,
+				InstantlyChargeable: true,
+			},
+		},
+	}
+	s.GetIntegrationFactory().SetPaymentMethodProvider(pmProvider)
+
+	portal := s.svc.(*customerPortalService)
+	err := portal.validateSavedMethodForTopUp(s.ctx, "cust_portal", types.PaymentGatewayTypeChargebee)
+	s.NoError(err, "validateSavedMethodForTopUp should pass when an active saved method exists")
+}
+
+func (s *PortalWalletSuite) TestValidateSavedMethodForTopUp_MandateNotInstant() {
+	s.connect(types.SecretProviderRazorpay)
+
+	s.GetIntegrationFactory().SetPaymentMethodProvider(&stubPaymentMethodProvider{
+		methods: []interfaces.ProviderPaymentMethod{{
+			GatewayMethodID: "token_live",
+			Method:          types.PaymentMethodTypeUPI,
+			Active:          true,
+			Recurring:       &interfaces.ProviderRecurringPaymentDetails{Status: types.RecurringPaymentStatusActive},
+		}},
+	})
+
+	portal := s.svc.(*customerPortalService)
+	err := portal.validateSavedMethodForTopUp(s.ctx, "cust_portal", types.PaymentGatewayTypeRazorpay)
+	s.Error(err)
+	s.True(ierr.IsValidation(err))
 }
 
 func (s *PortalWalletSuite) seedPendingSession(id string) {
@@ -228,6 +406,18 @@ func (s *PortalWalletSuite) TestAutoTopupEnableRequiresChargeableMethod() {
 	s.False(ierr.IsValidation(err), "a missing card is a state conflict, not a bad request")
 }
 
+func (s *PortalWalletSuite) TestAutoTopupEnableRequiresChargeableMethodRazorpay() {
+	s.connect(types.SecretProviderRazorpay)
+
+	_, err := s.svc.UpdateAutoTopup(s.ctx, s.walletID, &dto.PortalUpdateAutoTopupRequest{
+		Enabled:   true,
+		Threshold: lo.ToPtr(decimal.NewFromInt(5)),
+		Amount:    lo.ToPtr(decimal.NewFromInt(20)),
+	})
+	s.Error(err)
+	s.False(ierr.IsValidation(err), "a missing mandate is a state conflict, not a bad request")
+}
+
 // Disabling must never be gated on a card: a customer with no usable method still
 // has to be able to turn auto top-up off.
 func (s *PortalWalletSuite) TestAutoTopupDisableIsNotGated() {
@@ -249,7 +439,7 @@ func (s *PortalWalletSuite) TestAutoTopupRequiresWalletOwnership() {
 
 	_, err := s.svc.UpdateAutoTopup(other, s.walletID, &dto.PortalUpdateAutoTopupRequest{})
 	s.Error(err)
-	s.True(ierr.IsPermissionDenied(err))
+	s.True(ierr.IsNotFound(err))
 }
 
 // A customer-initiated top-up must never grant credits before the invoice is paid,
@@ -287,4 +477,53 @@ func (s *PortalWalletSuite) enableAutoCompletePurchasedCredit() {
 	}
 	setting.Status = types.StatusPublished
 	s.Require().NoError(s.GetStores().SettingsRepo.Create(s.ctx, setting))
+}
+
+func (s *PortalWalletSuite) TestUpdateCustomerIgnoresSettings() {
+	var req dto.PortalUpdateCustomerRequest
+	s.Require().NoError(json.Unmarshal([]byte(`{"name":"Renamed","settings":{"subscription_config":{"grace_period_days":90}}}`), &req))
+	resp, err := s.svc.UpdateCustomer(s.ctx, req)
+	s.Require().NoError(err)
+	s.Equal("Renamed", resp.Customer.Name)
+	s.Nil(resp.Customer.Settings)
+}
+
+func (s *PortalWalletSuite) TestWalletReadsAuthorizeBeforeCompute() {
+	other := &wallet.Wallet{
+		ID:                  "wallet_other",
+		CustomerID:          "cust_other",
+		Currency:            "usd",
+		Balance:             decimal.NewFromInt(5),
+		CreditBalance:       decimal.NewFromInt(5),
+		ConversionRate:      decimal.NewFromInt(1),
+		TopupConversionRate: decimal.NewFromInt(1),
+		WalletStatus:        types.WalletStatusActive,
+		BaseModel:           types.GetDefaultBaseModel(s.ctx),
+	}
+	s.NoError(s.GetStores().WalletRepo.CreateWallet(s.ctx, other))
+
+	tests := []struct {
+		name     string
+		walletID string
+		wantErr  bool
+	}{
+		{"own wallet", s.walletID, false},
+		{"other customer's wallet", "wallet_other", true},
+		{"missing wallet", "wallet_missing", true},
+	}
+	for _, tc := range tests {
+		s.Run(tc.name, func() {
+			bal, err := s.svc.GetWallet(s.ctx, tc.walletID)
+			txs, txErr := s.svc.GetWalletTransactions(s.ctx, tc.walletID, types.NewWalletTransactionFilter())
+			if tc.wantErr {
+				s.True(ierr.IsNotFound(err), "got %v", err)
+				s.Nil(bal)
+				s.True(ierr.IsNotFound(txErr), "got %v", txErr)
+				s.Nil(txs)
+				return
+			}
+			s.NoError(err)
+			s.NoError(txErr)
+		})
+	}
 }

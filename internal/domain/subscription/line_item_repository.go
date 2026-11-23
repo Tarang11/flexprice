@@ -34,6 +34,10 @@ type LineItemRepository interface {
 	// ListBySubscription retrieves all line items for a subscription
 	ListBySubscription(ctx context.Context, sub *Subscription) ([]*SubscriptionLineItem, error)
 
+	// ListLineage returns the versions linked to the line item through its predecessor and
+	// successor pointers, ordered by start date. Deleted versions are left out unless it is the requested item.
+	ListLineage(ctx context.Context, id string) ([]*SubscriptionLineItem, error)
+
 	// List retrieves subscription line items based on filter
 	List(ctx context.Context, filter *types.SubscriptionLineItemFilter) ([]*SubscriptionLineItem, error)
 
@@ -43,4 +47,12 @@ type LineItemRepository interface {
 	// GetDistinctCustomerIDsWithCommitmentTrueUp returns distinct customer IDs from published
 	// line items where commitment_true_up_enabled is true.
 	GetDistinctCustomerIDsWithCommitmentTrueUp(ctx context.Context) ([]string, error)
+
+	// SubscriptionIDsWithWindowedCommitment returns the subscriptions holding a
+	// published windowed-commitment line item. Only a WINDOWED commitment
+	// accrues without usage — its true-up fills empty windows as the bucketed
+	// curve's clamp advances — so this is deliberately narrower than the
+	// true-up probe above, and its predicate is a plain boolean so the scan
+	// does not evaluate jsonb per row.
+	SubscriptionIDsWithWindowedCommitment(ctx context.Context) ([]string, error)
 }

@@ -53,6 +53,12 @@ type InvoiceLineItem struct {
 	// sub_line_item_id links this invoice line item to the subscription_line_item that generated it.
 	SubscriptionLineItemID *string `json:"subscription_line_item_id,omitempty"`
 
+	// commitment_id links this line item to the commitment it bills.
+	CommitmentID *string `json:"commitment_id,omitempty"`
+
+	// billing_instalment_id links this line item to the billing instalment it bills.
+	BillingInstalmentID *string `json:"billing_instalment_id,omitempty"`
+
 	// parent_line_item_id links this line item to the line item it replaced, if it was created by editing
 	// an existing line item. Forms a linked-list chain across edits; nil for line items that were never edited.
 	ParentLineItemID *string `json:"parent_line_item_id,omitempty"`
@@ -60,6 +66,10 @@ type InvoiceLineItem struct {
 	// custom_currency holds this line item's amounts in the tenant's custom currency.
 	// The fields above are fiat projections of it; nil for fiat invoices.
 	CustomCurrency *types.CustomCurrencyLineItem `json:"custom_currency,omitempty"`
+
+	// fx_conversion holds this line's charge-currency amounts from before conversion (charge_currency
+	// and source only; the rate lives on the invoice). Nil for lines that were never converted.
+	FxConversion *types.FxConversion `json:"fx_conversion,omitempty"`
 
 	types.BaseModel
 }
@@ -99,8 +109,11 @@ func (i *InvoiceLineItem) FromEnt(e *ent.InvoiceLineItem) *InvoiceLineItem {
 		InvoiceLevelDiscount:        lo.FromPtrOr(e.InvoiceLevelDiscount, decimal.Zero),
 		AdjustedEntitlementQuantity: e.AdjustedEntitlementQuantity,
 		SubscriptionLineItemID:      e.SubscriptionLineItemID,
+		CommitmentID:                e.CommitmentID,
+		BillingInstalmentID:         e.BillingInstalmentID,
 		ParentLineItemID:            e.ParentLineItemID,
 		CustomCurrency:              e.CustomCurrency,
+		FxConversion:                e.FxConversion,
 		BaseModel: types.BaseModel{
 			TenantID:  e.TenantID,
 			Status:    types.Status(e.Status),
@@ -141,9 +154,9 @@ func (i *InvoiceLineItem) ProjectCustomCurrency(cc *types.CustomCurrency, fiatCu
 
 // Validate validates the invoice line item.
 // Amount may be negative: a credit line (e.g. unused time on a plan being replaced) sits on the
-// same invoice as the charges it offsets. Non-negativity is enforced on the invoice aggregates.
+// same invoice as the charges it offsets. Usage quantities may also be signed.
 func (i *InvoiceLineItem) Validate() error {
-	if i.Quantity.IsNegative() {
+	if i.Quantity.IsNegative() && lo.FromPtr(i.PriceType) != string(types.PRICE_TYPE_USAGE) {
 		return ierr.NewError("invoice line item validation failed").WithHint("quantity must be non negative").Mark(ierr.ErrValidation)
 	}
 

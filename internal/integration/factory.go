@@ -4,7 +4,10 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"time"
+
+	"github.com/flexprice/flexprice/internal/clock"
+
+	"github.com/shopspring/decimal"
 
 	"github.com/flexprice/flexprice/internal/cache"
 	"github.com/flexprice/flexprice/internal/config"
@@ -18,7 +21,9 @@ import (
 	"github.com/flexprice/flexprice/internal/domain/paymentmethod"
 	"github.com/flexprice/flexprice/internal/domain/plan"
 	"github.com/flexprice/flexprice/internal/domain/price"
+	"github.com/flexprice/flexprice/internal/domain/settings"
 	"github.com/flexprice/flexprice/internal/domain/subscription"
+	"github.com/flexprice/flexprice/internal/domain/taxapplied"
 	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/integration/awsmarketplace"
 	"github.com/flexprice/flexprice/internal/integration/azuremarketplace"
@@ -52,7 +57,6 @@ import (
 	"github.com/flexprice/flexprice/internal/storage/s3backend"
 	temporalservice "github.com/flexprice/flexprice/internal/temporal/service"
 	"github.com/flexprice/flexprice/internal/types"
-	"github.com/shopspring/decimal"
 )
 
 // Factory manages different payment integration providers and storage providers
@@ -73,6 +77,7 @@ type Factory struct {
 	featureRepo                  feature.Repository
 	encryptionService            security.EncryptionService
 	locker                       cache.Locker
+	settingsRepo                 settings.Repository
 
 	temporalSvc    temporalservice.TemporalService
 	paymentService interfaces.PaymentService
@@ -82,6 +87,11 @@ type Factory struct {
 	// checkoutProvider, when set, is returned by GetCheckoutProvider instead of
 	// constructing a live adapter. Tests use this; production never sets it.
 	checkoutProvider interfaces.CheckoutProvider
+
+	// paymentMethodProvider, when set, is returned by GetPaymentMethodProvider instead of
+	// constructing a live adapter. Tests use this; production never sets it.
+	paymentMethodProvider interfaces.PaymentMethodProvider
+	taxAppliedRepo        taxapplied.Repository
 }
 
 // NewFactory creates a new integration factory
@@ -102,6 +112,8 @@ func NewFactory(
 	encryptionService security.EncryptionService,
 	temporalSvc temporalservice.TemporalService,
 	locker cache.Locker,
+	settingsRepo settings.Repository,
+	taxAppliedRepo taxapplied.Repository,
 ) *Factory {
 	return &Factory{
 		config:                       config,
@@ -121,6 +133,8 @@ func NewFactory(
 		encryptionService:            encryptionService,
 		locker:                       locker,
 		temporalSvc:                  temporalSvc,
+		settingsRepo:                 settingsRepo,
+		taxAppliedRepo:               taxAppliedRepo,
 	}
 }
 
@@ -160,6 +174,8 @@ func (f *Factory) GetStripeIntegration(ctx context.Context) (*StripeIntegration,
 		f.invoiceRepo,
 		f.entityIntegrationMappingRepo,
 		priceSyncSvc,
+		f.taxAppliedRepo,
+		f.paymentRepo,
 		f.logger,
 	)
 
@@ -171,6 +187,7 @@ func (f *Factory) GetStripeIntegration(ctx context.Context) (*StripeIntegration,
 		priceSyncSvc,
 		f.invoiceRepo,
 		f.paymentRepo,
+		f.locker,
 		f.logger,
 	)
 
@@ -301,9 +318,7 @@ func (f *Factory) GetRazorpayIntegration(ctx context.Context) (*RazorpayIntegrat
 		f.invoiceRepo,
 		f.paymentRepo,
 		f.entityIntegrationMappingRepo,
-		f.locker,
 		f.logger,
-		paymentSvc,
 	)
 
 	webhookHandler := razorpaywebhook.NewHandler(
@@ -377,6 +392,7 @@ func (f *Factory) GetChargebeeIntegration(ctx context.Context) (*ChargebeeIntegr
 		PriceRepo:                    f.priceRepo,
 		PlanSyncSvc:                  planSyncSvc,
 		EntityIntegrationMappingRepo: f.entityIntegrationMappingRepo,
+		PaymentService:               f.paymentService,
 		Logger:                       f.logger,
 	})
 
@@ -693,6 +709,8 @@ func (f *Factory) GetZohoBooksIntegration(ctx context.Context) (*ZohoBooksIntegr
 		f.priceRepo,
 		f.entityIntegrationMappingRepo,
 		f.paymentRepo,
+		f.subscriptionRepo,
+		f.settingsRepo,
 		f.logger,
 	)
 
@@ -951,7 +969,7 @@ func (m *MoyasarIntegration) VoidOrRefundAuthPayment(ctx context.Context, flexpr
 		if lifecycleErr := m.Lifecycle.RecordPaymentVoided(ctx, payments.RecordPaymentVoidedParams{
 			FlexpricePaymentID: flexpricePaymentID,
 			GatewayPaymentID:   gatewayPaymentID,
-			VoidedAt:           time.Now().UTC(),
+			VoidedAt:           clock.Now(),
 		}); lifecycleErr != nil {
 			return false, false, lifecycleErr
 		}
@@ -972,7 +990,7 @@ func (m *MoyasarIntegration) VoidOrRefundAuthPayment(ctx context.Context, flexpr
 	if lifecycleErr := m.Lifecycle.RecordPaymentRefunded(ctx, payments.RecordPaymentRefundedParams{
 		FlexpricePaymentID: flexpricePaymentID,
 		GatewayPaymentID:   gatewayPaymentID,
-		RefundedAt:         time.Now().UTC(),
+		RefundedAt:         clock.Now(),
 	}); lifecycleErr != nil {
 		return false, false, lifecycleErr
 	}
@@ -1053,7 +1071,7 @@ func (m *MoyasarIntegration) ChargeInvoiceWithToken(ctx context.Context, invoice
 		if failErr := m.Lifecycle.RecordPaymentFailure(ctx, payments.RecordPaymentFailureParams{
 			FlexpricePaymentID: flexpricePaymentID,
 			GatewayPaymentID:   "",
-			FailedAt:           time.Now().UTC(),
+			FailedAt:           clock.Now(),
 			ErrorMessage:       err.Error(),
 		}); failErr != nil {
 			m.Logger.Error(ctx, "failed to record payment failure after charge error",
@@ -1482,29 +1500,9 @@ func (f *Factory) buildS3Storage(ctx context.Context, conn *connection.Connectio
 		return s3backend.New(ctx, s3Cfg, f.logger)
 	}
 
-	if conn.EncryptedSecretData.S3 == nil {
-		return nil, ierr.NewError("no S3 credentials found on connection").Mark(ierr.ErrValidation)
-	}
-
-	accessKey, err := f.encryptionService.Decrypt(conn.EncryptedSecretData.S3.AWSAccessKeyID)
+	accessKey, secretKey, sessionToken, err := f.decryptS3Credentials(conn)
 	if err != nil {
-		return nil, ierr.NewError("failed to decrypt AWS access key").Mark(ierr.ErrInternal)
-	}
-	secretKey, err := f.encryptionService.Decrypt(conn.EncryptedSecretData.S3.AWSSecretAccessKey)
-	if err != nil {
-		return nil, ierr.NewError("failed to decrypt AWS secret key").Mark(ierr.ErrInternal)
-	}
-	if accessKey == "" || secretKey == "" {
-		return nil, ierr.NewError("empty S3 credentials on connection").
-			WithHint("AWS access key and secret key must be non-empty; refusing to fall back to ambient AWS credentials").
-			Mark(ierr.ErrValidation)
-	}
-	var sessionToken string
-	if conn.EncryptedSecretData.S3.AWSSessionToken != "" {
-		sessionToken, err = f.encryptionService.Decrypt(conn.EncryptedSecretData.S3.AWSSessionToken)
-		if err != nil {
-			return nil, ierr.NewError("failed to decrypt AWS session token").Mark(ierr.ErrInternal)
-		}
+		return nil, err
 	}
 
 	// Destination comes from the run's job_config (dst) when this is an export;
@@ -1541,6 +1539,46 @@ func (f *Factory) buildS3Storage(ctx context.Context, conn *connection.Connectio
 	return s3backend.New(ctx, s3Cfg, f.logger)
 }
 
+// ValidateS3Credentials checks that a customer-owned S3 connection carries usable keys.
+// It needs no bucket: each export brings its own destination.
+func (f *Factory) ValidateS3Credentials(conn *connection.Connection) error {
+	if conn == nil {
+		return ierr.NewError("connection is required for storage").
+			Mark(ierr.ErrValidation)
+	}
+	_, _, _, err := f.decryptS3Credentials(conn)
+	return err
+}
+
+func (f *Factory) decryptS3Credentials(conn *connection.Connection) (accessKey, secretKey, sessionToken string, err error) {
+	if conn.EncryptedSecretData.S3 == nil {
+		return "", "", "", ierr.NewError("no S3 credentials found on connection").
+			WithHint("AWS access key and secret key are required").
+			Mark(ierr.ErrValidation)
+	}
+
+	accessKey, err = f.encryptionService.Decrypt(conn.EncryptedSecretData.S3.AWSAccessKeyID)
+	if err != nil {
+		return "", "", "", ierr.NewError("failed to decrypt AWS access key").Mark(ierr.ErrInternal)
+	}
+	secretKey, err = f.encryptionService.Decrypt(conn.EncryptedSecretData.S3.AWSSecretAccessKey)
+	if err != nil {
+		return "", "", "", ierr.NewError("failed to decrypt AWS secret key").Mark(ierr.ErrInternal)
+	}
+	if accessKey == "" || secretKey == "" {
+		return "", "", "", ierr.NewError("empty S3 credentials on connection").
+			WithHint("AWS access key and secret key must be non-empty; refusing to fall back to ambient AWS credentials").
+			Mark(ierr.ErrValidation)
+	}
+	if conn.EncryptedSecretData.S3.AWSSessionToken != "" {
+		sessionToken, err = f.encryptionService.Decrypt(conn.EncryptedSecretData.S3.AWSSessionToken)
+		if err != nil {
+			return "", "", "", ierr.NewError("failed to decrypt AWS session token").Mark(ierr.ErrInternal)
+		}
+	}
+	return accessKey, secretKey, sessionToken, nil
+}
+
 func (f *Factory) buildGCSStorage(ctx context.Context, conn *connection.Connection, _ *exportDestination) (storage.Storage, error) {
 	jobConfig := conn.GetSyncConfig().Storage
 	if jobConfig == nil {
@@ -1570,9 +1608,11 @@ func (f *Factory) buildGCSStorage(ctx context.Context, conn *connection.Connecti
 
 // GetPaymentMethodProvider returns the PaymentMethodProvider adapter for the given
 // gateway. ErrNotImplemented means the provider cannot manage saved methods at all
-// — the permanent answer for Razorpay, whose tokens need a mandate — and callers
-// must treat it as a capability answer rather than a failure.
+// and callers must treat it as a capability answer rather than a failure.
 func (f *Factory) GetPaymentMethodProvider(ctx context.Context, gateway types.PaymentGatewayType, customerSvc interfaces.CustomerService) (interfaces.PaymentMethodProvider, error) {
+	if f.paymentMethodProvider != nil {
+		return f.paymentMethodProvider, nil
+	}
 	switch gateway {
 	case types.PaymentGatewayTypeChargebee:
 		i, err := f.GetChargebeeIntegration(ctx)
@@ -1584,6 +1624,23 @@ func (f *Factory) GetPaymentMethodProvider(ctx context.Context, gateway types.Pa
 			CustomerSvc: i.CustomerSvc.(*chargebee.CustomerService),
 			Logger:      f.logger,
 		}, nil
+	case types.PaymentGatewayTypeStripe:
+		i, err := f.GetStripeIntegration(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return &stripe.PaymentMethodAdapter{
+			Client:            i.Client,
+			StripeCustomerSvc: i.CustomerSvc,
+			CustomerSvc:       customerSvc,
+			Logger:            f.logger,
+		}, nil
+	case types.PaymentGatewayTypeRazorpay:
+		i, err := f.GetRazorpayIntegration(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return razorpay.NewPaymentMethodAdapter(i.Client, i.CustomerSvc, customerSvc), nil
 	default:
 		return nil, ierr.NewError("saved payment methods are not supported for this provider").
 			WithHintf("%s cannot manage saved payment methods", gateway).
@@ -1591,28 +1648,52 @@ func (f *Factory) GetPaymentMethodProvider(ctx context.Context, gateway types.Pa
 	}
 }
 
+// SupportsGatewayRefund reports whether the gateway can issue refunds, without any connection lookup.
+func (f *Factory) SupportsGatewayRefund(gateway types.PaymentGatewayType) bool {
+	return f.refundProviderFor(gateway) != nil
+}
+
 // GetRefundProvider returns ErrNotImplemented for gateways without a v1 refund
 // adapter — Moyasar's API refunds only in full, so it cannot back this ledger.
 func (f *Factory) GetRefundProvider(ctx context.Context, gateway types.PaymentGatewayType) (interfaces.RefundProvider, error) {
-	switch gateway {
-	case types.PaymentGatewayTypeRazorpay:
-		i, err := f.GetRazorpayIntegration(ctx)
-		if err != nil {
-			return nil, err
-		}
-		return &razorpay.RefundAdapter{Client: i.Client, Logger: f.logger}, nil
-	case types.PaymentGatewayTypeChargebee:
-		i, err := f.GetChargebeeIntegration(ctx)
-		if err != nil {
-			return nil, err
-		}
-		return &chargebee.RefundAdapter{Client: i.Client, Logger: f.logger}, nil
-	default:
+	build := f.refundProviderFor(gateway)
+	if build == nil {
 		return nil, ierr.NewError("gateway refunds are not supported for this provider").
 			WithHintf("%s cannot issue gateway refunds", gateway).
 			WithReportableDetails(map[string]interface{}{"gateway": gateway}).
 			Mark(ierr.ErrNotImplemented)
 	}
+	return build(ctx)
+}
+
+// refundProviderFor returns the gateway's refund adapter constructor, or nil when it has none.
+func (f *Factory) refundProviderFor(gateway types.PaymentGatewayType) func(context.Context) (interfaces.RefundProvider, error) {
+	switch gateway {
+	case types.PaymentGatewayTypeRazorpay:
+		return func(ctx context.Context) (interfaces.RefundProvider, error) {
+			i, err := f.GetRazorpayIntegration(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return &razorpay.RefundAdapter{Client: i.Client, Logger: f.logger}, nil
+		}
+	case types.PaymentGatewayTypeChargebee:
+		return func(ctx context.Context) (interfaces.RefundProvider, error) {
+			i, err := f.GetChargebeeIntegration(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return &chargebee.RefundAdapter{Client: i.Client, Logger: f.logger}, nil
+		}
+	default:
+		return nil
+	}
+}
+
+// SetPaymentMethodProvider overrides GetPaymentMethodProvider with a fixed adapter.
+// Tests use this when no live gateway connection exists. Production never calls it.
+func (f *Factory) SetPaymentMethodProvider(provider interfaces.PaymentMethodProvider) {
+	f.paymentMethodProvider = provider
 }
 
 // SetCheckoutProvider overrides GetCheckoutProvider with a fixed adapter.
@@ -1643,6 +1724,18 @@ func (f *Factory) GetCheckoutProvider(ctx context.Context, provider types.Checko
 			Client:      i.Client,
 			CustomerSvc: i.CustomerSvc,
 			InvoiceSvc:  i.InvoiceSvc,
+			Logger:      f.logger,
+		}, nil
+	case types.CheckoutPaymentProviderStripe:
+		i, err := f.GetStripeIntegration(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return &stripe.CheckoutAdapter{
+			Client:      i.Client,
+			PaymentSvc:  i.PaymentSvc,
+			CustomerSvc: customerSvc,
+			InvoiceSvc:  invoiceSvc,
 			Logger:      f.logger,
 		}, nil
 	default:

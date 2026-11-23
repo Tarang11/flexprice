@@ -41,6 +41,12 @@ type IntegrationSyncRequest struct {
 	// entity to the external provider. "pull" fetches the latest state from the
 	// provider and updates the local record. Omitting this field defaults to "push".
 	Method IntegrationSyncMethod `json:"method"`
+	// Resync updates an invoice that is already in the provider instead of skipping it.
+	Resync bool `json:"resync"`
+	// ConnectionID limits the sync to that one connection, so a push chosen for one
+	// provider does not also go to every other connected provider. Omitted, the
+	// entity syncs with each connection that syncs its type in that direction.
+	ConnectionID string `json:"connection_id,omitempty"`
 }
 
 func (r *IntegrationSyncRequest) Validate() error {
@@ -64,6 +70,8 @@ type LinkIntegrationMappingRequest struct {
 	ProviderType     string                      `json:"provider_type" validate:"required,max=50"`
 	ProviderEntityID string                      `json:"provider_entity_id" validate:"required,max=255"`
 	Metadata         map[string]interface{}      `json:"metadata,omitempty"`
+
+	ConnectionID *string `json:"-"`
 }
 
 type LinkIntegrationMappingResponse struct {
@@ -139,6 +147,9 @@ const (
 	IntegrationCapabilityPaymentLink             = types.IntegrationCapabilityPaymentLink
 	IntegrationCapabilityPaymentMethodManagement = types.IntegrationCapabilityPaymentMethodManagement
 	IntegrationCapabilityInvoiceSync             = types.IntegrationCapabilityInvoiceSync
+	IntegrationCapabilityListPaymentMethods      = types.IntegrationCapabilityListPaymentMethods
+	IntegrationCapabilityAddPaymentMethod        = types.IntegrationCapabilityAddPaymentMethod
+	IntegrationCapabilityDeletePaymentMethod     = types.IntegrationCapabilityDeletePaymentMethod
 )
 
 type PaymentIntegration struct {

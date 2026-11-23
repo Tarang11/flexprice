@@ -6,14 +6,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/flexprice/flexprice/internal/clock"
+
+	"github.com/samber/lo"
+	"github.com/shopspring/decimal"
+
 	"github.com/flexprice/flexprice/internal/domain/events"
 	"github.com/flexprice/flexprice/internal/domain/price"
 	"github.com/flexprice/flexprice/internal/domain/subscription"
 	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/types"
 	"github.com/flexprice/flexprice/internal/validator"
-	"github.com/samber/lo"
-	"github.com/shopspring/decimal"
 )
 
 type SubscriptionPhaseCreateRequest struct {
@@ -73,12 +76,15 @@ func (r *SubscriptionPhaseCreateRequest) ToSubscriptionPhase(ctx context.Context
 	}
 }
 
+// LineItemCommitmentConfig is a legacy line-item commitment.
+//
+// Deprecated: use the commitments API instead.
 type LineItemCommitmentConfig struct {
-	CommitmentAmount   *decimal.Decimal     `json:"commitment_amount,omitempty"`
-	CommitmentQuantity *decimal.Decimal     `json:"commitment_quantity,omitempty"`
+	CommitmentAmount   *decimal.Decimal     `json:"commitment_amount,omitempty" swaggertype:"string"`
+	CommitmentQuantity *decimal.Decimal     `json:"commitment_quantity,omitempty" swaggertype:"string"`
 	CommitmentType     types.CommitmentType `json:"commitment_type,omitempty"`
 	// OverageFactor is a multiplier on usage beyond commitment; 1.0 = base rate.
-	OverageFactor *decimal.Decimal `json:"overage_factor,omitempty"`
+	OverageFactor *decimal.Decimal `json:"overage_factor,omitempty" swaggertype:"string"`
 	// EnableTrueUp charges the shortfall when usage is below commitment.
 	EnableTrueUp *bool `json:"enable_true_up,omitempty"`
 	// IsWindowCommitment applies commitment per window (e.g. per day) rather than per billing period.
@@ -91,6 +97,23 @@ type LineItemCommitmentConfig struct {
 
 func (c *LineItemCommitmentConfig) ToDomainBuckets() types.TimeOfDayBuckets {
 	return bucketRequestsToDomain(c.CommitmentTimeBuckets)
+}
+
+func (c *LineItemCommitmentConfig) ApplyDefaults() {
+	if c == nil {
+		return
+	}
+	hasAmountCommitment := c.CommitmentAmount != nil && c.CommitmentAmount.GreaterThan(decimal.Zero)
+	hasQuantityCommitment := c.CommitmentQuantity != nil && c.CommitmentQuantity.GreaterThan(decimal.Zero)
+	if c.OverageFactor == nil && (hasAmountCommitment || hasQuantityCommitment || len(c.CommitmentTimeBuckets) > 0) {
+		c.OverageFactor = types.DefaultOverageFactor()
+	}
+}
+
+func applyLineItemCommitmentDefaults(commitments map[string]*LineItemCommitmentConfig) {
+	for _, c := range commitments {
+		c.ApplyDefaults()
+	}
 }
 
 func validateLineItemCommitments(commitments map[string]*LineItemCommitmentConfig) error {
@@ -151,6 +174,14 @@ func (c *LineItemCommitmentConfig) Validate() error {
 	hasCommitment := hasAmountCommitment || hasQuantityCommitment
 
 	if !hasCommitment {
+		if c.OverageFactor != nil && c.OverageFactor.LessThan(decimal.NewFromInt(1)) {
+			return ierr.NewError("overage_factor must be at least 1.0").
+				WithHint("Overage factor determines the multiplier for usage beyond commitment").
+				WithReportableDetails(map[string]interface{}{
+					"overage_factor": c.OverageFactor,
+				}).
+				Mark(ierr.ErrValidation)
+		}
 		return nil
 	}
 
@@ -201,13 +232,7 @@ func (c *LineItemCommitmentConfig) Validate() error {
 		}
 	}
 
-	// overage_factor is optional; omitting it defaults to 1.0, meaning usage beyond
-	// the commitment bills at the base rate.
-	if c.OverageFactor == nil {
-		c.OverageFactor = types.DefaultOverageFactor()
-	}
-
-	if c.OverageFactor.LessThan(decimal.NewFromInt(1)) {
+	if c.OverageFactor != nil && c.OverageFactor.LessThan(decimal.NewFromInt(1)) {
 		return ierr.NewError("overage_factor must be at least 1.0").
 			WithHint("Overage factor determines the multiplier for usage beyond commitment").
 			WithReportableDetails(map[string]interface{}{
@@ -300,6 +325,8 @@ func (r *SubscriptionCouponInput) Validate() error {
 type GroupedInvoicingChildRequest struct {
 	PlanID             string `json:"plan_id" validate:"required"`
 	ExternalCustomerID string `json:"external_customer_id" validate:"required"`
+	// ProrationBehavior is stored on the child. Empty defaults to none.
+	ProrationBehavior types.ProrationBehavior `json:"proration_behavior,omitempty"`
 	SubscriptionCreationConfig
 }
 
@@ -408,13 +435,18 @@ type SubscriptionCreationConfig struct {
 
 	CreditGrants []CreateCreditGrantRequest `json:"credit_grants,omitempty"`
 
+	// Deprecated: use POST /commitments instead.
 	CommitmentAmount *decimal.Decimal `json:"commitment_amount,omitempty" swaggertype:"string"`
 
-	// CommitmentDuration allows a different commitment period than billing (e.g. ANNUAL on MONTHLY).
+	// Deprecated: use POST /commitments instead.
 	CommitmentDuration *types.BillingPeriod `json:"commitment_duration,omitempty"`
 
-	OverageFactor    *decimal.Decimal   `json:"overage_factor,omitempty" swaggertype:"string"`
-	EnableTrueUp     bool               `json:"enable_true_up"`
+	// Deprecated: use POST /commitments instead.
+	OverageFactor *decimal.Decimal `json:"overage_factor,omitempty" swaggertype:"string"`
+
+	// Deprecated: use POST /commitments instead.
+	EnableTrueUp bool `json:"enable_true_up"`
+
 	TaxRateOverrides []*TaxRateOverride `json:"tax_rate_overrides,omitempty"`
 
 	// SubscriptionCoupons is the preferred way to attach coupons at creation.
@@ -427,19 +459,40 @@ type SubscriptionCreationConfig struct {
 	// Deprecated: use SubscriptionCoupons instead.
 	LineItemCoupons map[string][]string `json:"line_item_coupons,omitempty"`
 
-	// LineItemCommitments sets per-line-item commitment config, keyed by price_id.
+	// Deprecated: use POST /commitments instead.
 	LineItemCommitments map[string]*LineItemCommitmentConfig `json:"line_item_commitments,omitempty" validate:"omitempty,dive"`
 
 	// OverrideLineItems overrides specific plan prices for this subscription.
-	OverrideLineItems    []OverrideLineItemRequest       `json:"override_line_items,omitempty" validate:"omitempty,dive"`
-	OverrideEntitlements []OverrideEntitlementRequest    `json:"override_entitlements,omitempty" validate:"omitempty,dive"`
-	Addons               []AddAddonToSubscriptionRequest `json:"addons,omitempty" validate:"omitempty,dive"`
+	OverrideLineItems    []OverrideLineItemRequest    `json:"override_line_items,omitempty" validate:"omitempty,dive"`
+	OverrideEntitlements []OverrideEntitlementRequest `json:"override_entitlements,omitempty" validate:"omitempty,dive"`
+	// SubscriptionEntitlementGrants are dollar entitlement grants shared by every usage line, created with the subscription.
+	SubscriptionEntitlementGrants []CreateSubscriptionEntitlementGrantRequest `json:"subscription_entitlement_grants,omitempty" validate:"omitempty,dive"`
+	Addons                        []AddAddonToSubscriptionRequest             `json:"addons,omitempty" validate:"omitempty,dive"`
 	// LineItems are extra (non-plan) line items added at creation.
 	LineItems []CreateSubscriptionLineItemRequest `json:"line_items,omitempty" validate:"omitempty,dive"`
 	Phases    []SubscriptionPhaseCreateRequest    `json:"phases,omitempty" validate:"omitempty,dive"`
 }
 
+func (c *SubscriptionCreationConfig) ApplyDefaults() {
+	if c == nil {
+		return
+	}
+	applyLineItemCommitmentDefaults(c.LineItemCommitments)
+	for i := range c.Addons {
+		c.Addons[i].ApplyDefaults()
+	}
+	for i := range c.LineItems {
+		c.LineItems[i].ApplyDefaults()
+	}
+}
+
 func (c *SubscriptionCreationConfig) Validate() error {
+	if len(c.Addons) > 0 {
+		if err := ValidateAddonBatch(lo.ToSlicePtr(c.Addons), nil); err != nil {
+			return err
+		}
+	}
+
 	if c.CommitmentAmount != nil && c.CommitmentAmount.LessThan(decimal.Zero) {
 		return ierr.NewError("commitment_amount must be non-negative").
 			WithHint("Commitment amount must be greater than or equal to 0").
@@ -517,6 +570,39 @@ func (c *SubscriptionCreationConfig) Validate() error {
 	return nil
 }
 
+// InlineFXRate is one subscription-scope rate created with the subscription. The pair is the
+// subscription currency to the invoicing customer's billing currency; the window is [start_date, end_date).
+type InlineFXRate struct {
+	Rate      decimal.Decimal `json:"rate" swaggertype:"string"`
+	StartDate *time.Time      `json:"start_date,omitempty"`
+	EndDate   *time.Time      `json:"end_date,omitempty"`
+}
+
+// validateInlineFXRates checks each rate and window, and that no two windows overlap.
+func validateInlineFXRates(rates []InlineFXRate) error {
+	for i, r := range rates {
+		if !r.Rate.IsPositive() {
+			return ierr.NewErrorf("fx_rates[%d].rate must be greater than zero", i).
+				WithHint("Provide a positive exchange rate for every fx_rates entry.").
+				Mark(ierr.ErrValidation)
+		}
+		if r.StartDate != nil && r.EndDate != nil && !r.StartDate.Before(*r.EndDate) {
+			return ierr.NewErrorf("fx_rates[%d].start_date must be before end_date", i).
+				WithHint("The start of a validity window must be before its end.").
+				Mark(ierr.ErrValidation)
+		}
+		for j := 0; j < i; j++ {
+			if types.FXRateWindowsOverlap(rates[j].StartDate, rates[j].EndDate, r.StartDate, r.EndDate) {
+				return ierr.NewErrorf("fx_rates[%d] and fx_rates[%d] overlap", j, i).
+					WithHint("Each fx_rates entry must cover a separate period.").
+					WithReportableDetails(map[string]any{"first_index": j, "second_index": i}).
+					Mark(ierr.ErrValidation)
+			}
+		}
+	}
+	return nil
+}
+
 type CreateSubscriptionRequest struct {
 	// ID is pre-generated for internal use (e.g. Paddle mapping before write). Never from external JSON.
 	// TODO: Remove once plan-change integration carryover is handled generically.
@@ -526,11 +612,15 @@ type CreateSubscriptionRequest struct {
 	CustomerID         string `json:"customer_id"`
 	ExternalCustomerID string `json:"external_customer_id"`
 
-	PlanID    string     `json:"plan_id" validate:"required"`
-	Currency  string     `json:"currency" validate:"required,len=3"`
-	LookupKey string     `json:"lookup_key"`
-	StartDate *time.Time `json:"start_date,omitempty"`
-	EndDate   *time.Time `json:"end_date,omitempty"`
+	PlanID    string `json:"plan_id" validate:"required"`
+	Currency  string `json:"currency" validate:"required,len=3"`
+	LookupKey string `json:"lookup_key"`
+
+	// FxRates sets subscription-scope rates to the invoicing customer's billing currency, one per
+	// non-overlapping window. Rejected when nothing needs converting or the pair has no tenant rate.
+	FxRates   []InlineFXRate `json:"fx_rates,omitempty"`
+	StartDate *time.Time     `json:"start_date,omitempty"`
+	EndDate   *time.Time     `json:"end_date,omitempty"`
 
 	// TrialStart/TrialEnd are for internal integrations (e.g. Stripe sync); not accepted from public JSON.
 	TrialStart *time.Time `json:"-"`
@@ -565,6 +655,9 @@ type CreateSubscriptionRequest struct {
 	SubscriptionStatus types.SubscriptionStatus `json:"subscription_status,omitempty"`
 	PaymentTerms       *types.PaymentTerms      `json:"payment_terms,omitempty"`
 
+	// Settings overrides the customer and environment settings for this subscription.
+	Settings *types.SettingsOverride `json:"settings,omitempty"`
+
 	// AutoInvoiceThreshold triggers a mid-period invoice when usage (in subscription currency) exceeds this amount.
 	// Standalone subscriptions only; all plan prices must be usage-based. Immutable after creation.
 	AutoInvoiceThreshold *decimal.Decimal `json:"auto_invoice_threshold,omitempty" swaggertype:"string"`
@@ -591,6 +684,10 @@ type CreateSubscriptionRequest struct {
 
 	Checkout *CheckoutParams `json:"checkout,omitempty"`
 
+	// Commitments are created with the subscription. subscription_id, and entity_id on a subscription scope,
+	// are set server-side.
+	Commitments []CreateCommitmentRequest `json:"commitments,omitempty"`
+
 	SubscriptionCreationConfig
 }
 
@@ -614,12 +711,6 @@ func (r *AddAddonRequest) Validate() error {
 	}
 
 	if r.Checkout != nil {
-		if len(r.OverrideLineItems) > 0 {
-			return ierr.NewError("override_line_items is not supported with checkout").
-				WithHint("Remove checkout to use override_line_items, or remove override_line_items to gate this addon behind payment").
-				Mark(ierr.ErrValidation)
-		}
-
 		if len(r.LineItemCommitments) > 0 {
 			return ierr.NewError("line_item_commitments is not supported with checkout").
 				WithHint("Remove checkout to use line_item_commitments, or remove line_item_commitments to gate this addon behind payment").
@@ -636,15 +727,34 @@ type RemoveAddonRequest struct {
 	ProrationBehavior  types.ProrationBehavior `json:"proration_behavior,omitempty"`
 	// EffectiveDate defaults to period end when nil; mid-period with create_prorations issues a wallet credit.
 	EffectiveDate *time.Time `json:"effective_date,omitempty"`
+	// ChangeAt names when the removal applies without computing a date. Mutually exclusive
+	// with EffectiveDate; omit both to remove at period end.
+	ChangeAt *types.ScheduleType `json:"change_at,omitempty"`
 
 	// PreviewOnly quotes the removal without writing anything. Server-set: callers reach it
 	// through the preview endpoint, never by sending it.
 	PreviewOnly bool `json:"-"`
+
+	// SkipPendingCheckoutGuard lets a checkout completion apply the removals its own pending
+	// session gated. Server-set; never sent by callers.
+	SkipPendingCheckoutGuard bool `json:"-"`
 }
 
 func (r *RemoveAddonRequest) Validate() error {
 	if err := validator.ValidateRequest(r); err != nil {
 		return err
+	}
+
+	if r.ChangeAt != nil {
+		if err := r.ChangeAt.Validate(); err != nil {
+			return err
+		}
+		if r.EffectiveDate != nil {
+			return ierr.NewError("change_at and effective_date are mutually exclusive").
+				WithHint("Provide change_at for immediate or end_of_period, or effective_date for any other date").
+				WithReportableDetails(map[string]any{"addon_association_id": r.AddonAssociationID}).
+				Mark(ierr.ErrValidation)
+		}
 	}
 	if r.ProrationBehavior != "" {
 		if err := r.ProrationBehavior.Validate(); err != nil {
@@ -655,12 +765,19 @@ func (r *RemoveAddonRequest) Validate() error {
 }
 
 type UpdateSubscriptionRequest struct {
-	Status            types.SubscriptionStatus `json:"status"`
-	CancelAt          *time.Time               `json:"cancel_at,omitempty"`
-	CancelAtPeriodEnd bool                     `json:"cancel_at_period_end,omitempty"`
+	Status   types.SubscriptionStatus `json:"status"`
+	CancelAt *time.Time               `json:"cancel_at,omitempty"`
+	// Pointer so omitting the field leaves the stored value unchanged; sending it sets the flag.
+	CancelAtPeriodEnd *bool `json:"cancel_at_period_end,omitempty"`
 
 	// ParentSubscriptionID sets or clears the parent subscription. Omit to leave unchanged; send "" to clear.
 	ParentSubscriptionID *string `json:"parent_subscription_id,omitempty"`
+
+	// ProrationBehavior updates the stored behavior. Omit to leave it unchanged.
+	ProrationBehavior *types.ProrationBehavior `json:"proration_behavior,omitempty"`
+
+	// Settings merges into the subscription's setting overrides when provided; send {} to inherit.
+	Settings *types.SettingsOverride `json:"settings,omitempty"`
 }
 
 // Validate checks UpdateSubscriptionRequest fields for basic structural validity.
@@ -668,6 +785,12 @@ func (r *UpdateSubscriptionRequest) Validate() error {
 
 	if err := validator.ValidateRequest(r); err != nil {
 		return err
+	}
+
+	if r.ProrationBehavior != nil {
+		if err := r.ProrationBehavior.Validate(); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -683,7 +806,10 @@ type CancelSubscriptionRequest struct {
 	CancellationType types.CancellationType `json:"cancellation_type" validate:"required"`
 
 	// CancelImmediatelyInvoicePolicy controls whether to generate a final invoice on immediate cancellation. Defaults to skip.
-	CancelImmediatelyInvoicePolicy types.CancelImmediatelyInvoicePolicy `json:"cancel_immediately_inovice_policy,omitempty"`
+	CancelImmediatelyInvoicePolicy types.CancelImmediatelyInvoicePolicy `json:"cancel_immediately_invoice_policy,omitempty"`
+
+	// Deprecated: misspelled key still accepted from older clients; Validate copies it into CancelImmediatelyInvoicePolicy.
+	CancelImmediatelyInovicePolicy types.CancelImmediatelyInvoicePolicy `json:"cancel_immediately_inovice_policy,omitempty" swaggerignore:"true"`
 
 	// Reason for cancellation (for audit and business intelligence)
 	Reason string `json:"reason,omitempty"`
@@ -720,6 +846,25 @@ type CancelSubscriptionResponse struct {
 	ProcessedAt time.Time `json:"processed_at"`
 }
 
+// ProrationSettings decides whether a change prorates each grant type.
+type ProrationSettings struct {
+	CreditGrantBehavior      types.ProrationBehavior `json:"credit_grant_behavior,omitempty"`
+	EntitlementGrantBehavior types.ProrationBehavior `json:"entitlement_grant_behavior,omitempty"`
+}
+
+// NewProrationSettings applies one behavior to every grant type.
+func NewProrationSettings(behavior types.ProrationBehavior) ProrationSettings {
+	return ProrationSettings{CreditGrantBehavior: behavior, EntitlementGrantBehavior: behavior}
+}
+
+// WithDefault fills each unset behavior with defaultBehavior.
+func (p ProrationSettings) WithDefault(defaultBehavior types.ProrationBehavior) ProrationSettings {
+	return ProrationSettings{
+		CreditGrantBehavior:      lo.CoalesceOrEmpty(p.CreditGrantBehavior, defaultBehavior),
+		EntitlementGrantBehavior: lo.CoalesceOrEmpty(p.EntitlementGrantBehavior, defaultBehavior),
+	}
+}
+
 // ProrationDetail provides line-item level proration information
 type ProrationDetail struct {
 	LineItemID     string          `json:"line_item_id"`
@@ -754,6 +899,9 @@ func (r *CancelSubscriptionRequest) Validate() error {
 	if r.ProrationBehavior == "" {
 		r.ProrationBehavior = types.ProrationBehaviorNone
 	}
+	if r.CancelImmediatelyInvoicePolicy == "" {
+		r.CancelImmediatelyInvoicePolicy = r.CancelImmediatelyInovicePolicy
+	}
 	// Set default cancel immediately invoice policy if not provided or empty (default: skip = do not generate invoice)
 	if r.CancelImmediatelyInvoicePolicy == "" {
 		r.CancelImmediatelyInvoicePolicy = types.CancelImmediatelyInvoicePolicySkip
@@ -771,7 +919,7 @@ func (r *CancelSubscriptionRequest) Validate() error {
 	}
 
 	if r.CancellationType == types.CancellationTypeImmediate && r.CancelAt != nil {
-		now := time.Now().UTC()
+		now := clock.Now()
 		if r.CancelAt.After(now) {
 			return ierr.NewError("cancel_at cannot be a future date for immediate cancellation").
 				WithHint("Use cancellation_type 'scheduled_date' to schedule a future cancellation").
@@ -828,6 +976,9 @@ type SubscriptionResponse struct {
 	Entitlements []*AggregatedFeature `json:"entitlements,omitempty"`
 
 	CheckoutSession *CheckoutSessionResponse `json:"checkout_session,omitempty"`
+
+	// Commitments are the commitments created with the subscription; set on create only.
+	Commitments []*CommitmentResponse `json:"commitments,omitempty"`
 }
 
 // ListSubscriptionsResponse represents the response for listing subscriptions
@@ -860,10 +1011,29 @@ type SubscriptionResponseV2 struct {
 	// Pauses are included when subscription has pause status
 	Pauses []*subscription.SubscriptionPause `json:"pauses,omitempty"`
 
+	// Commitments are included when "commitments" is in expand parameter
+	Commitments []*CommitmentResponse `json:"commitments,omitempty"`
+
 	// PlanPricesOutOfSync is true when the subscription's synced_price_sequence
 	// is behind the plan's current max prices.sequence — i.e. plan-price
 	// changes have not yet been reconciled into this subscription's line items.
 	PlanPricesOutOfSync bool `json:"plan_prices_out_of_sync"`
+}
+
+// ApplyDefaults fills the creation config's defaults, starts the subscription now unless given a start, and puts its
+// dates on whole seconds like every billing period edge.
+func (r *CreateSubscriptionRequest) ApplyDefaults() {
+	r.SubscriptionCreationConfig.ApplyDefaults()
+
+	r.StartDate = types.WholeSecondPtr(lo.CoalesceOrEmpty(r.StartDate, lo.ToPtr(clock.Now())))
+	r.EndDate = types.WholeSecondPtr(r.EndDate)
+	r.BillingAnchor = types.WholeSecondPtr(r.BillingAnchor)
+	r.TrialStart = types.WholeSecondPtr(r.TrialStart)
+	r.TrialEnd = types.WholeSecondPtr(r.TrialEnd)
+	for i := range r.Phases {
+		r.Phases[i].StartDate = r.Phases[i].StartDate.Truncate(time.Second)
+		r.Phases[i].EndDate = types.WholeSecondPtr(r.Phases[i].EndDate)
+	}
 }
 
 func (r *CreateSubscriptionRequest) validateCheckoutCompatibility() error {
@@ -915,6 +1085,36 @@ func (r *CreateSubscriptionRequest) validateCheckoutCompatibility() error {
 	return nil
 }
 
+// validateCommitments checks each inline commitment's shape on a copy, so no write happens for a bad request.
+// The subscription ID, unknown until create, stands in as "pending".
+func (r *CreateSubscriptionRequest) validateCommitments() error {
+	idempotencyKeys := make(map[string]bool, len(r.Commitments))
+	for i := range r.Commitments {
+		c := r.Commitments[i]
+		c.SubscriptionID = "pending"
+		if c.Scope.EntityType == types.CommitmentScopeSubscription && c.Scope.EntityID == "" {
+			c.Scope.EntityID = "pending"
+		}
+
+		c.ApplyDefaults()
+		if err := c.Validate(); err != nil {
+			return err
+		}
+
+		if c.IdempotencyKey == nil {
+			continue
+		}
+
+		if idempotencyKeys[*c.IdempotencyKey] {
+			return ierr.Validationf("commitments carry the idempotency_key %s more than once", *c.IdempotencyKey)
+		}
+
+		idempotencyKeys[*c.IdempotencyKey] = true
+	}
+
+	return nil
+}
+
 func (r *CreateSubscriptionRequest) Validate() error {
 	err := validator.ValidateRequest(r)
 	if err != nil {
@@ -925,9 +1125,19 @@ func (r *CreateSubscriptionRequest) Validate() error {
 		return err
 	}
 
+	if len(r.SubscriptionEntitlementGrants) > 0 && len(r.Commitments) > 0 {
+		return ierr.NewError("subscription_entitlement_grants cannot be combined with commitments").
+			WithHint("A subscription with a commitment cannot carry a subscription entitlement grant.").
+			Mark(ierr.ErrValidation)
+	}
+
 	if r.OpeningInvoiceAdjustmentAmount != nil && r.OpeningInvoiceAdjustmentAmount.IsNegative() {
 		return ierr.NewError("opening invoice adjustment amount must be >= 0").
 			Mark(ierr.ErrValidation)
+	}
+
+	if err := validateInlineFXRates(r.FxRates); err != nil {
+		return err
 	}
 
 	if err := r.LineItemGrouping.Validate(); err != nil {
@@ -940,6 +1150,10 @@ func (r *CreateSubscriptionRequest) Validate() error {
 				"auto_invoice_threshold": r.AutoInvoiceThreshold.String(),
 			}).
 			Mark(ierr.ErrValidation)
+	}
+
+	if err := r.validateCommitments(); err != nil {
+		return err
 	}
 
 	if r.IncludePriceIDs != nil {
@@ -1055,12 +1269,12 @@ func (r *CreateSubscriptionRequest) Validate() error {
 
 	// Set default start date if not provided
 	if r.StartDate == nil {
-		now := time.Now().UTC()
+		now := clock.Now()
 		r.StartDate = &now
 	}
 
-	if r.EndDate != nil && r.EndDate.Before(*r.StartDate) {
-		return ierr.NewError("end_date cannot be before start_date").
+	if r.EndDate != nil && !r.EndDate.After(*r.StartDate) {
+		return ierr.NewError("end_date must be after start_date").
 			WithHint("End date must be after start date").
 			WithReportableDetails(map[string]interface{}{
 				"start_date": *r.StartDate,
@@ -1301,12 +1515,12 @@ func (r *CreateSubscriptionRequest) validateShouldAllowProrationOnStartDate(requ
 	// If the start date is before the current date and proration mode is active, return an error
 	// This prevents creating subscriptions with backdated start dates that would trigger proration
 
-	if request.Workflow == lo.ToPtr(types.TemporalSubscriptionCreationWorkflow) {
+	if lo.FromPtr(request.Workflow) == types.TemporalSubscriptionCreationWorkflow {
 		return nil
 	}
 
 	// Compare only the date portions (ignore time) - don't allow before current day
-	now := time.Now().UTC()
+	now := clock.Now()
 	startDateOnly := time.Date(request.StartDate.Year(), request.StartDate.Month(), request.StartDate.Day(), 0, 0, 0, 0, time.UTC)
 	nowDateOnly := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 
@@ -1442,6 +1656,7 @@ func (r *CreateSubscriptionRequest) ToSubscription(ctx context.Context) *subscri
 		GatewayPaymentMethodID: r.GatewayPaymentMethodID,
 		ParentSubscriptionID:   parentSubscriptionID,
 		PaymentTerms:           r.PaymentTerms,
+		Settings:               NormalizeSettingsOverride(r.Settings),
 		SubscriptionType:       subscriptionType,
 	}
 
@@ -1528,6 +1743,34 @@ type OverrideLineItemRequest struct {
 	PriceUnitTiers []CreatePriceTier `json:"price_unit_tiers,omitempty"`
 }
 
+// CreateSubscriptionEntitlementGrantRequest is a subscription entitlement grant created together with its subscription.
+type CreateSubscriptionEntitlementGrantRequest struct {
+	GrantQuota              *decimal.Decimal                         `json:"grant_quota" swaggertype:"string" validate:"required"`
+	GrantDurationUnit       types.EntitlementGrantDurationUnit       `json:"grant_duration_unit" validate:"required"`
+	GrantDurationValue      *int                                     `json:"grant_duration_value,omitempty"`
+	GrantAllocationBehavior types.EntitlementGrantAllocationBehavior `json:"grant_allocation_behavior,omitempty"`
+	AggregationMode         types.EntitlementAggregationMode         `json:"aggregation_mode,omitempty"`
+	// StartDate defaults to the subscription's start; EndDate leaves the grant open.
+	StartDate *time.Time `json:"start_date,omitempty"`
+	EndDate   *time.Time `json:"end_date,omitempty"`
+}
+
+// ToCreateEntitlementRequest is the POST /entitlements request for this grant on the subscription.
+func (r CreateSubscriptionEntitlementGrantRequest) ToCreateEntitlementRequest(subscriptionID string) CreateEntitlementRequest {
+	return CreateEntitlementRequest{
+		StartDate:               r.StartDate,
+		EndDate:                 r.EndDate,
+		EntityType:              types.ENTITLEMENT_ENTITY_TYPE_SUBSCRIPTION,
+		EntityID:                subscriptionID,
+		GrantMeasure:            types.EntitlementGrantMeasureAmount,
+		GrantQuota:              r.GrantQuota,
+		GrantDurationUnit:       r.GrantDurationUnit,
+		GrantDurationValue:      r.GrantDurationValue,
+		GrantAllocationBehavior: r.GrantAllocationBehavior,
+		AggregationMode:         r.AggregationMode,
+	}
+}
+
 // OverrideEntitlementRequest allows overriding entitlement values for a subscription
 type OverrideEntitlementRequest struct {
 	// EntitlementID references the plan/addon entitlement to override
@@ -1545,6 +1788,18 @@ type OverrideEntitlementRequest struct {
 
 	// ConfigValue is the config value for config features
 	ConfigValue map[string]interface{} `json:"config_value,omitempty"`
+
+	GrantConfigPatch
+}
+
+type GrantConfigPatch struct {
+	GrantMeasure            *types.EntitlementGrantMeasure            `json:"grant_measure,omitempty"`
+	GrantDurationValue      *int                                      `json:"grant_duration_value,omitempty"`
+	GrantDurationUnit       *types.EntitlementGrantDurationUnit       `json:"grant_duration_unit,omitempty"`
+	GrantAllocationBehavior *types.EntitlementGrantAllocationBehavior `json:"grant_allocation_behavior,omitempty"`
+	GrantQuota              *decimal.Decimal                          `json:"grant_quota,omitempty" swaggertype:"string"`
+	AggregationMode         *types.EntitlementAggregationMode         `json:"aggregation_mode,omitempty"`
+	GrantUnlimited          *bool                                     `json:"grant_unlimited,omitempty"`
 }
 
 // Validate validates the entitlement override request
@@ -1552,6 +1807,13 @@ func (r *OverrideEntitlementRequest) Validate() error {
 	if r.EntitlementID == "" {
 		return ierr.NewError("entitlement_id is required").
 			WithHint("Please provide the entitlement ID to override").
+			Mark(ierr.ErrValidation)
+	}
+
+	if lo.FromPtr(r.GrantUnlimited) && r.GrantQuota != nil {
+		return ierr.NewError("grant_quota cannot be set on an unlimited allowance").
+			WithHint("Remove grant_quota, or drop grant_unlimited").
+			WithReportableDetails(map[string]interface{}{"entitlement_id": r.EntitlementID}).
 			Mark(ierr.ErrValidation)
 	}
 
@@ -1871,7 +2133,8 @@ func (r *OverrideLineItemRequest) Validate(
 		}
 	}
 
-	return nil
+	return validateBillingModelChange(originalPrice.Price, r.BillingModel, r.TierMode,
+		r.Amount != nil || r.PriceUnitAmount != nil, len(r.Tiers) > 0 || len(r.PriceUnitTiers) > 0)
 }
 
 // ToSubscriptionLineItem converts a request to a domain subscription line item
@@ -1919,6 +2182,8 @@ type GetUsageBySubscriptionRequest struct {
 	// Source indicates the caller context. When "invoice_creation", ClickHouse queries use FINAL.
 	// Optional; omit for default (no FINAL).
 	Source string `json:"-"`
+	// LineItems are the active line items at StartTime; empty loads them.
+	LineItems []*subscription.SubscriptionLineItem `json:"-"`
 }
 
 type GetUsageBySubscriptionResponse struct {
@@ -1933,6 +2198,38 @@ type GetUsageBySubscriptionResponse struct {
 	CommitmentUtilized float64                              `json:"commitment_utilized,omitempty"` // Amount of commitment used
 	OverageAmount      float64                              `json:"overage_amount,omitempty"`      // Amount charged at overage rate
 	HasOverage         bool                                 `json:"has_overage"`                   // Whether any usage exceeded commitment
+	// Commitments is the per-commitment usage breakdown for the window; nil when commitments v2 is off or none apply.
+	Commitments []*CommitmentUsageBreakdown `json:"commitments,omitempty"`
+}
+
+// CommitmentUsageValue pairs a capacity quantity with its money value: meter units for quantity
+// commitments, equal to the amount for amount commitments, so used/committed is always a utilization ratio.
+type CommitmentUsageValue struct {
+	Quantity decimal.Decimal `json:"quantity" swaggertype:"string"`
+	Amount   decimal.Decimal `json:"amount" swaggertype:"string"`
+}
+
+// CommitmentUsageBreakdown is one commitment's usage against its capacity for the queried window,
+// projected to the window's end the way the period invoice bills it.
+type CommitmentUsageBreakdown struct {
+	CommitmentID string                      `json:"commitment_id"`
+	InvoiceLabel string                      `json:"invoice_label"`
+	Type         types.CommitmentType        `json:"type"`
+	Measurement  types.CommitmentMeasurement `json:"measurement"`
+	Binding      bool                        `json:"binding"`
+	Currency     string                      `json:"currency"`
+	// AppliesFrom/To is the stretch of the queried window the commitment covers; usage outside it
+	// bills as overage and is not counted here.
+	AppliesFrom time.Time `json:"applies_from" format:"date-time"`
+	AppliesTo   time.Time `json:"applies_to" format:"date-time"`
+	// Committed is the full capacity for the stretch; its amount is the floor a binding commitment owes.
+	Committed CommitmentUsageValue `json:"committed"`
+	// Used is the capacity consumed so far and the value those units bill within the commitment.
+	Used CommitmentUsageValue `json:"used"`
+	// Unused is the remaining capacity; for a binding commitment its amount is the true-up still owed.
+	Unused CommitmentUsageValue `json:"unused"`
+	// BilledAmount is what the stretch bills for this commitment: used plus, when binding, the true-up.
+	BilledAmount decimal.Decimal `json:"billed_amount" swaggertype:"string"`
 }
 
 type SubscriptionUsageByMetersResponse struct {

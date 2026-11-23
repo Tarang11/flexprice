@@ -51,65 +51,73 @@ type RedisCache interface {
 	IsRedisCache() bool
 
 	ForceCacheGetWithTTL(ctx context.Context, key string) (interface{}, time.Duration, bool)
+
+	// GetBulk retrieves many keys in one round trip, returning the values
+	// found (keyed by the original key) and the keys not found — callers
+	// fetch those from the DB and Set them back. A disabled cache reports
+	// every key missing.
+	GetBulk(ctx context.Context, keys []string) (found map[string]interface{}, missing []string)
 }
 
 // Predefined cache key prefixes for different entity types
 const (
-	PrefixSecret                   = "secret:v1:"
-	PrefixCustomer                 = "customer:v1:"
-	PrefixUser                     = "user:v1:"
-	PrefixTenant                   = "tenant:v1:"
-	PrefixPlan                     = "plan:v1:"
-	PrefixSubscription             = "subscription:v1:"
-	PrefixPrice                    = "price:v1:"
-	PrefixMeter                    = "meter:v1:"
-	PrefixEvent                    = "event:v1:"
-	PrefixWallet                   = "wallet:v1:"
-	PrefixInvoice                  = "invoice:v1:"
-	PrefixFeature                  = "feature:v1:"
-	PrefixEntitlement              = "entitlement:v1:"
-	PrefixPayment                  = "payment:v1:"
-	PrefixPaymentMethod            = "payment_method:v1:"
-	PrefixCreditGrantApplication   = "creditgrantapplication:v1:"
-	PrefixCreditNote               = "creditnote:v1:"
-	PrefixTaxRate                  = "taxrate:v1:"
-	PrefixTaxAssociation           = "taxassociation:v1:"
-	PrefixTaxApplied               = "taxapplied:v1:"
-	PrefixCoupon                   = "coupon:v1:"
-	PrefixCouponAssociation        = "couponassociation:v1:"
-	PrefixCouponApplication        = "couponapplication:v1:"
-	PrefixAddon                    = "addon:v1:"
-	PrefixAddonAssociation         = "addonassociation:v1:"
-	PrefixEntityIntegrationMapping = "entity_integration_mapping:v1:"
-	PrefixConnection               = "connection:v1:"
-	PrefixSettings                 = "settings:v1:"
-	PrefixEnvironment              = "environment:v1:"
-	PrefixCreditGrant              = "creditgrant:v1:"
-	PrefixGroup                    = "group:v1:"
-	PrefixSubscriptionLineItem     = "subscription_line_item:v1:"
-	PrefixInvoiceLineItem          = "invoice_line_item:v1:"
-	PrefixWalletAlertThrottle      = "wallet_alert_throttle:v1:"
-	PrefixUsageAlertSchedule       = "usage_alert_schedule:v1:"
-	PrefixSettingsByKey            = "settings_by_key:v1:"
-	PrefixCostsheet                = "costsheet:v1:"
-	PrefixPriceUnit                = "price_unit:v1:"
-	PrefixWalletRealTimeBalance    = "wallet_realtime_balance:v1:"
-	PrefixWorkflowExecution        = "workflow_execution:v1:"
-	// PrefixPriceSyncLock is the Redis key prefix for plan-level price sync lock (used with planID).
-	// Used by both API (acquire) and Temporal activity (release); do not change without updating both.
-	PrefixPriceSyncLock              = "price_sync:plan:"
+	PrefixSecret                     = "secret:v1:"
+	PrefixCustomer                   = "customer:v1:"
+	PrefixUser                       = "user:v1:"
+	PrefixTenant                     = "tenant:v1:"
+	PrefixPlan                       = "plan:v1:"
+	PrefixSubscription               = "subscription:v1:"
+	PrefixPrice                      = "price:v1:"
+	PrefixMeter                      = "meter:v1:"
+	PrefixEvent                      = "event:v1:"
+	PrefixWallet                     = "wallet:v1:"
+	PrefixInvoice                    = "invoice:v1:"
+	PrefixFeature                    = "feature:v1:"
+	PrefixEntitlement                = "entitlement:v1:"
+	PrefixPayment                    = "payment:v1:"
+	PrefixPaymentMethod              = "payment_method:v1:"
+	PrefixCreditGrantApplication     = "creditgrantapplication:v1:"
+	PrefixCreditNote                 = "creditnote:v1:"
+	PrefixTaxRate                    = "taxrate:v1:"
+	PrefixTaxAssociation             = "taxassociation:v1:"
+	PrefixTaxApplied                 = "taxapplied:v1:"
+	PrefixCoupon                     = "coupon:v1:"
+	PrefixCouponAssociation          = "couponassociation:v1:"
+	PrefixCouponApplication          = "couponapplication:v1:"
+	PrefixAddon                      = "addon:v1:"
+	PrefixAddonAssociation           = "addonassociation:v1:"
+	PrefixEntityIntegrationMapping   = "entity_integration_mapping:v1:"
+	PrefixConnection                 = "connection:v1:"
+	PrefixSettings                   = "settings:v1:"
+	PrefixEnvironment                = "environment:v1:"
+	PrefixCreditGrant                = "creditgrant:v1:"
+	PrefixGroup                      = "group:v1:"
+	PrefixSubscriptionLineItem       = "subscription_line_item:v1:"
+	PrefixInvoiceLineItem            = "invoice_line_item:v1:"
+	PrefixWalletAlertThrottle        = "wallet_alert_throttle:v1:"
+	PrefixUsageAlertSchedule         = "usage_alert_schedule:v1:"
+	PrefixSettingsByKey              = "settings_by_key:v1:"
+	PrefixCostsheet                  = "costsheet:v1:"
+	PrefixBillerTaxIDs               = "biller_tax_ids:v1:"
+	PrefixPriceUnit                  = "price_unit:v1:"
+	PrefixWalletRealTimeBalance      = "wallet_realtime_balance:v1:"
+	PrefixWorkflowExecution          = "workflow_execution:v1:"
 	PrefixRazorpayWebhookRefundLock  = "razorpay:webhook-refund:"
 	PrefixChargebeeWebhookRefundLock = "chargebee:webhook-refund:"
+	PrefixStripeWebhookRefundLock    = "stripe:webhook-refund:"
 	PrefixTabsInvoiceSyncLock        = "tabs:invoice_sync:"
 	// PrefixStripeCustomerSyncLock guards first-time Stripe customer creation for a
 	// FlexPrice customer (used with customerID) so concurrent callers cannot each
 	// create their own Stripe customer.
 	PrefixStripeCustomerSyncLock = "stripe:customer_sync:"
+	// PrefixCreditGrantApplyLock serializes credit grant application per customer.
+	PrefixCreditGrantApplyLock = "credit_grant:apply:"
 	// PrefixCheckoutPollLock debounces gateway reconciliation on the checkout read
 	// (used with the payment ID). Acquired and never released — TTL expiry is the window.
 	PrefixCheckoutPollLock     = "checkout:poll:"
 	PrefixPublishedConnections = "published_connections:"
 	PrefixMeterFeature         = "meter:feature:v1:"
+	PrefixReportResult         = "report_result:v1:"
 )
 
 // GenerateKey creates a cache key from a prefix and a set of parameters
@@ -120,8 +128,11 @@ func GenerateKey(ctx context.Context, prefix string, params ...any) string {
 	if ctx != nil {
 		tenantId := types.GetTenantID(ctx)
 		environmentId := types.GetEnvironmentID(ctx)
-		if tenantId != "" && environmentId != "" {
-			parts = append(parts, tenantId, environmentId)
+		if tenantId != "" {
+			parts = append(parts, tenantId)
+			if environmentId != "" {
+				parts = append(parts, environmentId)
+			}
 		}
 	}
 

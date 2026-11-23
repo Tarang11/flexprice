@@ -5,19 +5,23 @@ import (
 	"errors"
 	"time"
 
+	"github.com/flexprice/flexprice/internal/clock"
+
 	"entgo.io/ent/dialect/sql"
 	"entgo.io/ent/dialect/sql/sqljson"
+	"github.com/lib/pq"
+	"github.com/samber/lo"
+
 	"github.com/flexprice/flexprice/ent"
 	entCheckout "github.com/flexprice/flexprice/ent/checkoutsession"
 	"github.com/flexprice/flexprice/ent/predicate"
 	entSchema "github.com/flexprice/flexprice/ent/schema"
+	"github.com/flexprice/flexprice/internal/activity"
 	domainCheckout "github.com/flexprice/flexprice/internal/domain/checkout"
 	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/logger"
 	"github.com/flexprice/flexprice/internal/postgres"
 	"github.com/flexprice/flexprice/internal/types"
-	"github.com/lib/pq"
-	"github.com/samber/lo"
 )
 
 type checkoutSessionRepository struct {
@@ -116,7 +120,7 @@ func (r *checkoutSessionRepository) Get(ctx context.Context, id string) (*domain
 	}
 
 	SetSpanSuccess(span)
-	return fromEntCheckout(e), nil
+	return domainCheckout.FromEnt(e), nil
 }
 
 func (r *checkoutSessionRepository) Update(ctx context.Context, s *domainCheckout.CheckoutSession) error {
@@ -125,11 +129,12 @@ func (r *checkoutSessionRepository) Update(ctx context.Context, s *domainCheckou
 	span := StartRepositorySpan(ctx, "checkout_session", "update", map[string]interface{}{"id": s.ID})
 	defer FinishSpan(span)
 
-	n, err := r.client.Writer(ctx).CheckoutSession.Update().
+	rows, err := r.client.Writer(ctx).CheckoutSession.Update().
 		Where(
 			entCheckout.ID(s.ID),
 			entCheckout.TenantID(types.GetTenantID(ctx)),
 			entCheckout.EnvironmentID(types.GetEnvironmentID(ctx)),
+			entCheckout.CheckoutStatusIn(types.ActiveCheckoutStatuses()...),
 		).
 		SetStatus(string(s.Status)).
 		SetCheckoutStatus(s.CheckoutStatus).
@@ -142,16 +147,16 @@ func (r *checkoutSessionRepository) Update(ctx context.Context, s *domainCheckou
 		SetNillableCancelledAt(s.CancelledAt).
 		SetNillableFailureReason(s.FailureReason).
 		SetMetadata(map[string]string(s.Metadata)).
-		SetUpdatedAt(time.Now().UTC()).
+		SetUpdatedAt(clock.Now()).
 		SetUpdatedBy(types.GetUserID(ctx)).
-		Save(ctx)
+		SaveReturning(ctx)
 	if err != nil {
 		SetSpanError(span, err)
 		return ierr.WithError(err).WithHint("checkout session update failed").Mark(ierr.ErrDatabase)
 	}
-	if n == 0 {
+	if len(rows) == 0 {
 		return ierr.NewError("checkout session not found").
-			WithHintf("checkout session %s not found or already archived", s.ID).
+			WithHintf("checkout session %s not found, archived or already terminal", s.ID).
 			Mark(ierr.ErrNotFound)
 	}
 
@@ -189,7 +194,7 @@ func (r *checkoutSessionRepository) List(ctx context.Context, filter *types.Chec
 	SetSpanSuccess(span)
 	result := make([]*domainCheckout.CheckoutSession, len(entities))
 	for i, e := range entities {
-		result[i] = fromEntCheckout(e)
+		result[i] = domainCheckout.FromEnt(e)
 	}
 	return result, nil
 }
@@ -253,7 +258,7 @@ func (r *checkoutSessionRepository) GetByIdempotencyKey(ctx context.Context, key
 	}
 
 	SetSpanSuccess(span)
-	return fromEntCheckout(e), nil
+	return domainCheckout.FromEnt(e), nil
 }
 
 func (r *checkoutSessionRepository) GetByCheckoutInvoiceID(ctx context.Context, invoiceID string) (*domainCheckout.CheckoutSession, error) {
@@ -281,7 +286,36 @@ func (r *checkoutSessionRepository) GetByCheckoutInvoiceID(ctx context.Context, 
 	}
 
 	SetSpanSuccess(span)
-	return fromEntCheckout(e), nil
+	return domainCheckout.FromEnt(e), nil
+}
+
+func (r *checkoutSessionRepository) GetSessionByPaymentID(ctx context.Context, paymentID string) (*domainCheckout.CheckoutSession, error) {
+	span := StartRepositorySpan(ctx, "checkout_session", "get_session_by_payment_id", map[string]interface{}{
+		"payment_id": paymentID,
+	})
+	defer FinishSpan(span)
+
+	// No CheckoutStatus filter here — only the row status (soft-delete) is pinned.
+	e, err := r.client.Reader(ctx).CheckoutSession.Query().
+		Where(
+			entCheckout.CheckoutPaymentIDEQ(paymentID),
+			entCheckout.TenantID(types.GetTenantID(ctx)),
+			entCheckout.EnvironmentID(types.GetEnvironmentID(ctx)),
+			entCheckout.StatusEQ(string(types.StatusPublished)),
+		).
+		Order(ent.Desc(entCheckout.FieldCreatedAt)).
+		First(ctx)
+	if err != nil {
+		if ent.IsNotFound(err) {
+			SetSpanSuccess(span)
+			return nil, nil
+		}
+		SetSpanError(span, err)
+		return nil, ierr.WithError(err).WithHint("get checkout session by payment failed").Mark(ierr.ErrDatabase)
+	}
+
+	SetSpanSuccess(span)
+	return domainCheckout.FromEnt(e), nil
 }
 
 func (r *checkoutSessionRepository) Delete(ctx context.Context, id string) error {
@@ -290,16 +324,17 @@ func (r *checkoutSessionRepository) Delete(ctx context.Context, id string) error
 	span := StartRepositorySpan(ctx, "checkout_session", "delete", map[string]interface{}{"id": id})
 	defer FinishSpan(span)
 
-	n, err := r.client.Writer(ctx).CheckoutSession.Update().
+	ctx = activity.WithAction(ctx, id, activity.CheckoutSessionArchived)
+	rows, err := r.client.Writer(ctx).CheckoutSession.Update().
 		Where(
 			entCheckout.ID(id),
 			entCheckout.TenantID(types.GetTenantID(ctx)),
 			entCheckout.EnvironmentID(types.GetEnvironmentID(ctx)),
 		).
 		SetStatus(string(types.StatusArchived)).
-		SetUpdatedAt(time.Now().UTC()).
+		SetUpdatedAt(clock.Now()).
 		SetUpdatedBy(types.GetUserID(ctx)).
-		Save(ctx)
+		SaveReturning(ctx)
 	if err != nil {
 		SetSpanError(span, err)
 		return ierr.WithError(err).
@@ -307,7 +342,7 @@ func (r *checkoutSessionRepository) Delete(ctx context.Context, id string) error
 			WithReportableDetails(map[string]any{"id": id}).
 			Mark(ierr.ErrDatabase)
 	}
-	if n == 0 {
+	if len(rows) == 0 {
 		return ierr.NewError("checkout session not found").
 			WithHintf("checkout session %s not found or already archived", id).
 			Mark(ierr.ErrNotFound)
@@ -323,7 +358,7 @@ func (r *checkoutSessionRepository) MarkCompleted(ctx context.Context, sessionID
 	span := StartRepositorySpan(ctx, "checkout_session", "mark_completed", map[string]interface{}{"id": sessionID})
 	defer FinishSpan(span)
 
-	n, err := r.client.Writer(ctx).CheckoutSession.Update().
+	rows, err := r.client.Writer(ctx).CheckoutSession.Update().
 		Where(
 			entCheckout.ID(sessionID),
 			entCheckout.TenantID(types.GetTenantID(ctx)),
@@ -333,19 +368,19 @@ func (r *checkoutSessionRepository) MarkCompleted(ctx context.Context, sessionID
 		SetCheckoutStatus(types.CheckoutStatusCompleted).
 		SetCompletedAt(completedAt).
 		SetProviderResult(providerResult).
-		SetUpdatedAt(time.Now().UTC()).
+		SetUpdatedAt(clock.Now()).
 		SetUpdatedBy(types.GetUserID(ctx)).
-		Save(ctx)
+		SaveReturning(ctx)
 	if err != nil {
 		SetSpanError(span, err)
 		return false, ierr.WithError(err).WithHint("failed to mark checkout session completed").Mark(ierr.ErrDatabase)
 	}
 
 	SetSpanSuccess(span)
-	return n > 0, nil
+	return len(rows) > 0, nil
 }
 
-func (r *checkoutSessionRepository) MarkTerminal(ctx context.Context, sessionID string, status types.CheckoutStatus, failureReason *string) (bool, error) {
+func (r *checkoutSessionRepository) MarkTerminal(ctx context.Context, sessionID string, status types.CheckoutStatus, failureReason *string, cancelled bool) (bool, error) {
 	if status != types.CheckoutStatusExpired && status != types.CheckoutStatusFailed {
 		return false, ierr.NewError("invalid terminal checkout status").
 			WithHint("MarkTerminal accepts expired or failed").
@@ -368,20 +403,23 @@ func (r *checkoutSessionRepository) MarkTerminal(ctx context.Context, sessionID 
 			entCheckout.CheckoutStatusIn(types.ActiveCheckoutStatuses()...),
 		).
 		SetCheckoutStatus(status).
-		SetUpdatedAt(time.Now().UTC()).
+		SetUpdatedAt(clock.Now()).
 		SetUpdatedBy(types.GetUserID(ctx))
 	if failureReason != nil {
 		q = q.SetFailureReason(*failureReason)
 	}
+	if cancelled {
+		q = q.SetCancelledAt(clock.Now())
+	}
 
-	n, err := q.Save(ctx)
+	rows, err := q.SaveReturning(ctx)
 	if err != nil {
 		SetSpanError(span, err)
 		return false, ierr.WithError(err).WithHint("failed to mark checkout session terminal").Mark(ierr.ErrDatabase)
 	}
 
 	SetSpanSuccess(span)
-	return n > 0, nil
+	return len(rows) > 0, nil
 }
 
 // ListExpiredCheckoutSessions returns active (initiated|pending) sessions whose ExpiresAt is before
@@ -413,7 +451,7 @@ func (r *checkoutSessionRepository) ListExpiredCheckoutSessions(ctx context.Cont
 	SetSpanSuccess(span)
 	result := make([]*domainCheckout.CheckoutSession, len(entities))
 	for i, e := range entities {
-		result[i] = fromEntCheckout(e)
+		result[i] = domainCheckout.FromEnt(e)
 	}
 	return result, nil
 }
@@ -490,6 +528,9 @@ func (o CheckoutSessionQueryOptions) applyEntityQueryOptions(_ context.Context, 
 	if f.ExpiresAtLT != nil {
 		query = query.Where(entCheckout.ExpiresAtLT(lo.FromPtr(f.ExpiresAtLT)))
 	}
+	if f.ExpiresAtGT != nil {
+		query = query.Where(entCheckout.ExpiresAtGT(lo.FromPtr(f.ExpiresAtGT)))
+	}
 	if len(f.CheckoutInvoiceIDs) > 0 {
 		query = query.Where(entCheckout.CheckoutInvoiceIDIn(f.CheckoutInvoiceIDs...))
 	}
@@ -519,46 +560,14 @@ func (o CheckoutSessionQueryOptions) applyEntityQueryOptions(_ context.Context, 
 						f.Configuration.SubscriptionID,
 						sqljson.Path("add_addon_params", "subscription_id"),
 					),
+					sqljson.ValueContains(
+						entCheckout.FieldConfiguration,
+						[]map[string]string{{"subscription_id": f.Configuration.SubscriptionID}},
+						sqljson.Path("add_addon_batch_params"),
+					),
 				))
 			}))
 		}
 	}
 	return query, nil
-}
-
-func fromEntCheckout(e *ent.CheckoutSession) *domainCheckout.CheckoutSession {
-	s := &domainCheckout.CheckoutSession{
-		ID:                    e.ID,
-		EnvironmentID:         e.EnvironmentID,
-		CustomerID:            e.CustomerID,
-		Action:                e.Action,
-		CheckoutStatus:        types.CheckoutStatus(e.CheckoutStatus),
-		PaymentProvider:       e.PaymentProvider,
-		CheckoutInvoiceID:     e.CheckoutInvoiceID,
-		CheckoutPaymentID:     e.CheckoutPaymentID,
-		Configuration:         domainCheckout.JSONBCheckoutConfiguration(e.Configuration),
-		PaymentProviderConfig: (*domainCheckout.JSONBCheckoutPaymentProviderConfig)(e.PaymentProviderConfig),
-		Result:                (*domainCheckout.JSONBCheckoutResult)(e.Result),
-		ProviderResult:        (*domainCheckout.JSONBCheckoutProviderResult)(e.ProviderResult),
-		IdempotencyKey:        e.IdempotencyKey,
-		SuccessURL:            e.SuccessURL,
-		FailureURL:            e.FailureURL,
-		CancelURL:             e.CancelURL,
-		CompletedAt:           e.CompletedAt,
-		CancelledAt:           e.CancelledAt,
-		FailureReason:         e.FailureReason,
-		Metadata:              types.Metadata(e.Metadata),
-		BaseModel: types.BaseModel{
-			TenantID:  e.TenantID,
-			Status:    types.Status(e.Status),
-			CreatedAt: e.CreatedAt,
-			UpdatedAt: e.UpdatedAt,
-			CreatedBy: e.CreatedBy,
-			UpdatedBy: e.UpdatedBy,
-		},
-	}
-	if e.ExpiresAt != nil {
-		s.ExpiresAt = *e.ExpiresAt
-	}
-	return s
 }

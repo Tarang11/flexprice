@@ -46,15 +46,20 @@ func (Entitlement) Fields() []ent.Field {
 				"postgres": "varchar(50)",
 			}).
 			Optional(),
+		// NULL for a subscription entitlement grant, which covers every feature on the subscription.
 		field.String("feature_id").
 			SchemaType(map[string]string{
 				"postgres": "varchar(50)",
 			}).
+			Optional().
+			Nillable().
 			NotEmpty(),
 		field.String("feature_type").
 			SchemaType(map[string]string{
 				"postgres": "varchar(50)",
 			}).
+			Optional().
+			Nillable().
 			NotEmpty().
 			GoType(types.FeatureType("")),
 		field.Bool("is_enabled").
@@ -116,7 +121,7 @@ func (Entitlement) Fields() []ent.Field {
 			Comment("How to anchor validFrom when opening a grant; meaningful for hour, day, and week duration units."),
 
 		field.Other("grant_quota", decimal.Decimal{}).
-			SchemaType(map[string]string{"postgres": "numeric(25,15)"}).
+			SchemaType(map[string]string{"postgres": "numeric(34,15)"}).
 			Optional().
 			Nillable(),
 
@@ -124,6 +129,12 @@ func (Entitlement) Fields() []ent.Field {
 			SchemaType(map[string]string{"postgres": "varchar(20)"}).
 			Default(string(types.EntitlementAggregationModeAdditive)).
 			GoType(types.EntitlementAggregationMode("")),
+
+		field.String("grant_scope").
+			SchemaType(map[string]string{"postgres": "varchar(20)"}).
+			Default(string(types.EntitlementGrantScopeFeature)).
+			GoType(types.EntitlementGrantScopeEntityType("")).
+			Comment("What the grant meters: one feature, or every usage line on the subscription."),
 	}
 }
 

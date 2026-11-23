@@ -60,10 +60,10 @@ jobs:
           persist-credentials: false
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
         with:
           # Skip GHA caching of Buildx binary.
           # No layer cache configured; builds from source.
@@ -74,7 +74,7 @@ jobs:
         # the GHCR :<sha> this pushes (promoted to :main post-approval), so a GHCR
         # failure on main must fail the build, not slip through silently.
         continue-on-error: ${{ github.ref_name != 'main' }}
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
         with:
           registry: ghcr.io
           username: ${{ vars.GHCR_USERNAME || github.actor }}
@@ -118,13 +118,16 @@ jobs:
 
       - name: Build & push image to GHCR
         id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: Dockerfile
           platforms: ${{ steps.image-tag.outputs.platforms }}
           push: true
           tags: ${{ steps.image-tag.outputs.ghcr_tags }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            GIT_SHA=${{ github.sha }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
@@ -199,6 +202,7 @@ jobs:
     runs-on: self-hosted
     outputs:
       targets: ${{ steps.config.outputs.targets }}
+      api_targets: ${{ steps.config.outputs.api_targets }}
       preprod_targets: ${{ steps.config.outputs.preprod_targets }}
       environment: ${{ steps.config.outputs.environment }}
       dry_run: ${{ steps.config.outputs.dry_run }}
@@ -228,11 +232,21 @@ jobs:
           # manual approval gate before the full production rollout.
           if [ -z "$TARGETS_JSON" ]; then
             PREPROD_TARGETS_JSON="[]"
+            API_TARGETS_JSON="[]"
           else
             PREPROD_TARGETS_JSON=$(echo "$TARGETS_JSON" | python3 -c "
           import json, sys
           targets = json.load(sys.stdin)
           print(json.dumps([t for t in targets if t.get('preprod_service')]))
+          ")
+            API_TARGETS_JSON=$(echo "$TARGETS_JSON" | python3 -c "
+          import json, sys
+          targets = json.load(sys.stdin)
+          print(json.dumps([
+              {'region': t['region'], 'cluster': t['cluster'], 'api_service': svc}
+              for t in targets
+              for svc in [t['api_service'], *t.get('extra_api_services', [])]
+          ]))
           ")
           fi
 
@@ -240,6 +254,10 @@ jobs:
           echo "targets<<TARGETS_EOF" >> $GITHUB_OUTPUT
           echo "$TARGETS_JSON" >> $GITHUB_OUTPUT
           echo "TARGETS_EOF" >> $GITHUB_OUTPUT
+
+          echo "api_targets<<API_TARGETS_EOF" >> $GITHUB_OUTPUT
+          echo "$API_TARGETS_JSON" >> $GITHUB_OUTPUT
+          echo "API_TARGETS_EOF" >> $GITHUB_OUTPUT
 
           echo "preprod_targets<<PREPROD_EOF" >> $GITHUB_OUTPUT
           echo "$PREPROD_TARGETS_JSON" >> $GITHUB_OUTPUT
@@ -303,6 +321,7 @@ jobs:
     # `vars` and not `env`: the env context is not available in a job-level `if`.
     if: >-
       ${{ always() &&
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/tags/v')) &&
           vars.DB_MIGRATIONS_ENABLED == 'true' &&
           github.event.inputs.skip_migrations != 'true' &&
           needs.build.result == 'success' &&
@@ -330,7 +349,7 @@ jobs:
           persist-credentials: false
 
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-cicd
           aws-region: ${{ matrix.target.region }}
@@ -363,6 +382,7 @@ jobs:
     # which registers a task definition referencing an image that was never pushed.
     if: >-
       ${{ always() &&
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/tags/v')) &&
           needs.build.result == 'success' &&
           needs.resolve-config.result == 'success' &&
           (needs.migrate.result == 'success' || needs.migrate.result == 'skipped') &&
@@ -375,22 +395,19 @@ jobs:
       max-parallel: 3
 
     steps:
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-cicd
-          aws-region: ${{ matrix.target.region }}
+          persist-credentials: false
 
-      - name: Deploy ECS Preprod service
-        uses: ./.github/actions/deploy-ecs-service
+      - name: Deploy ECS Preprod service (CodePipeline)
+        uses: ./.github/actions/deploy-codepipeline
         with:
-          cluster: ${{ matrix.target.cluster }}
-          region: ${{ matrix.target.region }}
-          service_name: ${{ matrix.target.preprod_service }}
+          role_arn: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ fromJson(vars.ECS_CODEPIPELINE).role }}
+          region: ${{ fromJson(vars.ECS_CODEPIPELINE).region }}
+          bucket: ${{ fromJson(vars.ECS_CODEPIPELINE).preprod_pipeline }}-${{ secrets.AWS_ACCOUNT_ID }}
+          pipeline: ${{ fromJson(vars.ECS_CODEPIPELINE).preprod_pipeline }}
+          container: main
           image: ${{ needs.build.outputs.image || format('{0}:{1}', env.GHCR_IMAGE, github.sha) }}
-          ecr_repo_prefix: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}
-          ghcr_repo_prefix: ${{ env.GHCR_IMAGE }}
-          ghcr_credentials_arn: ${{ vars.ECS_GHCR_PULL_CREDENTIALS_ARN }}
           dry_run: ${{ needs.resolve-config.outputs.dry_run }}
 
   # ──────────────────────────────────────────────────────────────────────────
@@ -452,14 +469,14 @@ jobs:
       packages: write # GHCR imagetools push
     steps:
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
         with:
           registry: ghcr.io
           username: ${{ vars.GHCR_USERNAME || github.actor }}
           password: ${{ secrets.GHCR_PUBLISH_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
         with:
           # Skip GHA caching of Buildx binary.
           # No layer cache configured; builds from source.
@@ -478,128 +495,34 @@ jobs:
             --tag "${GHCR_IMAGE}:main" \
             "${GHCR_IMAGE}:${GITHUB_SHA}"
 
-  # ──────────────────────────────────────────────────────────────────────────
-  # Jobs 5a–5c: Deploy API, Consumer, Worker — one job per service type,
-  # each with matrix over targets (regions). Runs in parallel for faster deploys
-  # and smaller, trackable steps. max-parallel limits concurrent load on runners.
-  #
-  # Each target matrix entry: region, cluster, api_service, consumer_service, worker_service.
-  # Task definition family is derived at runtime from the ECS service.
-  # DRY RUN: composite action prints plan only, no register/update-service.
-  # ──────────────────────────────────────────────────────────────────────────
-  deploy-api:
-    name: Deploy API (${{ strategy.job-index }})
+  # api, consumer, worker in one CodePipeline run.
+  deploy-backend-codepipeline:
+    name: Deploy API, Consumer, Worker (CodePipeline)
     needs: [build, resolve-config, migrate, approval-gate]
-    # production: requires the approval-gate to have been approved
-    # dry-run: bypasses the gate; composite action prints plan only
     if: >-
       ${{ always() &&
           needs.build.result == 'success' &&
           needs.resolve-config.result == 'success' &&
+          needs.resolve-config.outputs.targets != '[]' &&
           (needs.migrate.result == 'success' || needs.migrate.result == 'skipped') &&
           (needs.resolve-config.outputs.environment != 'production' ||
            needs.resolve-config.outputs.dry_run == 'true' ||
            needs.approval-gate.result == 'success') }}
     runs-on: self-hosted
-    strategy:
-      matrix:
-        target: ${{ fromJson(needs.resolve-config.outputs.targets) }}
-      fail-fast: false
-      max-parallel: 3
+    timeout-minutes: 80
 
     steps:
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-cicd
-          aws-region: ${{ matrix.target.region }}
+          persist-credentials: false
 
-      - name: Deploy ECS API service
-        uses: ./.github/actions/deploy-ecs-service
+      - name: Deploy via CodePipeline
+        uses: ./.github/actions/deploy-codepipeline
         with:
-          cluster: ${{ matrix.target.cluster }}
-          region: ${{ matrix.target.region }}
-          service_name: ${{ matrix.target.api_service }}
+          role_arn: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ fromJson(vars.ECS_CODEPIPELINE).role }}
+          region: ${{ fromJson(vars.ECS_CODEPIPELINE).region }}
+          bucket: ${{ fromJson(vars.ECS_CODEPIPELINE).backend_pipeline }}-${{ secrets.AWS_ACCOUNT_ID }}
+          pipeline: ${{ fromJson(vars.ECS_CODEPIPELINE).backend_pipeline }}
+          container: main
           image: ${{ needs.build.outputs.image || format('{0}:{1}', env.GHCR_IMAGE, github.sha) }}
-          ecr_repo_prefix: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}
-          ghcr_repo_prefix: ${{ env.GHCR_IMAGE }}
-          ghcr_credentials_arn: ${{ vars.ECS_GHCR_PULL_CREDENTIALS_ARN }}
-          dry_run: ${{ needs.resolve-config.outputs.dry_run }}
-
-  deploy-consumer:
-    name: Deploy Consumer (${{ strategy.job-index }})
-    needs: [build, resolve-config, migrate, approval-gate]
-    # production: requires the approval-gate to have been approved
-    # dry-run: bypasses the gate; composite action prints plan only
-    if: >-
-      ${{ always() &&
-          needs.build.result == 'success' &&
-          needs.resolve-config.result == 'success' &&
-          (needs.migrate.result == 'success' || needs.migrate.result == 'skipped') &&
-          (needs.resolve-config.outputs.environment != 'production' ||
-           needs.resolve-config.outputs.dry_run == 'true' ||
-           needs.approval-gate.result == 'success') }}
-    runs-on: self-hosted
-    strategy:
-      matrix:
-        target: ${{ fromJson(needs.resolve-config.outputs.targets) }}
-      fail-fast: false
-      max-parallel: 3
-
-    steps:
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6
-        with:
-          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-cicd
-          aws-region: ${{ matrix.target.region }}
-
-      - name: Deploy ECS Consumer service
-        uses: ./.github/actions/deploy-ecs-service
-        with:
-          cluster: ${{ matrix.target.cluster }}
-          region: ${{ matrix.target.region }}
-          service_name: ${{ matrix.target.consumer_service }}
-          image: ${{ needs.build.outputs.image || format('{0}:{1}', env.GHCR_IMAGE, github.sha) }}
-          ecr_repo_prefix: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}
-          ghcr_repo_prefix: ${{ env.GHCR_IMAGE }}
-          ghcr_credentials_arn: ${{ vars.ECS_GHCR_PULL_CREDENTIALS_ARN }}
-          dry_run: ${{ needs.resolve-config.outputs.dry_run }}
-
-  deploy-worker:
-    name: Deploy Worker (${{ strategy.job-index }})
-    needs: [build, resolve-config, migrate, approval-gate]
-    # production: requires the approval-gate to have been approved
-    # dry-run: bypasses the gate; composite action prints plan only
-    if: >-
-      ${{ always() &&
-          needs.build.result == 'success' &&
-          needs.resolve-config.result == 'success' &&
-          (needs.migrate.result == 'success' || needs.migrate.result == 'skipped') &&
-          (needs.resolve-config.outputs.environment != 'production' ||
-           needs.resolve-config.outputs.dry_run == 'true' ||
-           needs.approval-gate.result == 'success') }}
-    runs-on: self-hosted
-    strategy:
-      matrix:
-        target: ${{ fromJson(needs.resolve-config.outputs.targets) }}
-      fail-fast: false
-      max-parallel: 3
-
-    steps:
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6
-        with:
-          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-cicd
-          aws-region: ${{ matrix.target.region }}
-
-      - name: Deploy ECS Worker service
-        uses: ./.github/actions/deploy-ecs-service
-        with:
-          cluster: ${{ matrix.target.cluster }}
-          region: ${{ matrix.target.region }}
-          service_name: ${{ matrix.target.worker_service }}
-          image: ${{ needs.build.outputs.image || format('{0}:{1}', env.GHCR_IMAGE, github.sha) }}
-          ecr_repo_prefix: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}
-          ghcr_repo_prefix: ${{ env.GHCR_IMAGE }}
-          ghcr_credentials_arn: ${{ vars.ECS_GHCR_PULL_CREDENTIALS_ARN }}
           dry_run: ${{ needs.resolve-config.outputs.dry_run }}

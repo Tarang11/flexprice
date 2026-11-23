@@ -20,18 +20,24 @@ type EntitlementGrant struct {
 	ScopeEntityType     types.EntitlementGrantScopeEntityType `json:"scope_entity_type"`
 	ScopeEntityID       string                                `json:"scope_entity_id"`
 	Measure             types.EntitlementGrantMeasure         `json:"measure"`
+	Unlimited           bool                                  `json:"unlimited"`
 	Quota               decimal.Decimal                       `json:"quota"`
 	Usage               decimal.Decimal                       `json:"usage"`
 	ValidFrom           time.Time                             `json:"valid_from"`
 	ValidTo             time.Time                             `json:"valid_to"`
 	GrantStatus         types.EntitlementGrantStatus          `json:"grant_status"`
 	LastComputedAt      *time.Time                            `json:"last_computed_at,omitempty"`
-	// QuotaCrossedAt is set once, when the evaluator first sees usage >= quota
-	// It holds the evaluation time, not the exact event-level crossing.
+	// QuotaCrossedAt records the current exhaustion's evaluation time, not the exact
+	// event crossing. Recovery clears it so a later exhaustion records a new crossing.
 	QuotaCrossedAt *time.Time     `json:"quota_crossed_at,omitempty"`
 	Metadata       types.Metadata `json:"metadata,omitempty"`
 	EnvironmentID  string         `json:"environment_id"`
 	types.BaseModel
+}
+
+// IsSubscriptionScoped reports whether the grant covers every usage line on its subscription.
+func (g *EntitlementGrant) IsSubscriptionScoped() bool {
+	return g != nil && g.ScopeEntityType == types.EntitlementGrantScopeSubscription
 }
 
 func (g *EntitlementGrant) IsFeatureScoped() bool {
@@ -49,44 +55,62 @@ func (g *EntitlementGrant) FeatureID() string {
 	return g.ScopeEntityID
 }
 
-// Window returns the half-open [valid_from, valid_to) grant window.
-func (g *EntitlementGrant) Window() (time.Time, time.Time) {
+func (g *EntitlementGrant) GetID() string {
 	if g == nil {
-		return time.Time{}, time.Time{}
+		return ""
 	}
-	return g.ValidFrom, g.ValidTo
+
+	return g.ID
 }
 
-func (g *EntitlementGrant) IsExhausted() bool {
-	if g == nil {
+func (g *EntitlementGrant) IsExhausted(usage decimal.Decimal) bool {
+	if g == nil || g.Unlimited {
 		return false
 	}
-	return g.Usage.GreaterThanOrEqual(g.Quota)
+	if !g.Quota.IsPositive() {
+		return true
+	}
+	return usage.GreaterThanOrEqual(g.Quota)
 }
 
-// Overage is the non-negative excess of usage over quota.
+// Overage is the non-negative excess of the saved usage over quota.
 func (g *EntitlementGrant) Overage() decimal.Decimal {
 	if g == nil {
 		return decimal.Zero
 	}
-	over := g.Usage.Sub(g.Quota)
-	if over.IsNegative() {
-		return decimal.Zero
-	}
-	return over
+	return g.OverageOf(g.Usage)
 }
 
-// Remaining is the unspent balance, clamped at zero. The mirror of Overage: a window that
-// ran past its quota hands nothing forward, so debt never crosses into a successor.
-func (g *EntitlementGrant) Remaining() decimal.Decimal {
+// OverageOf is the non-negative excess of usage over quota; zero when unlimited.
+func (g *EntitlementGrant) OverageOf(usage decimal.Decimal) decimal.Decimal {
+	if g == nil || g.Unlimited {
+		return decimal.Zero
+	}
+	return decimal.Max(usage.Sub(g.Quota), decimal.Zero)
+}
+
+// Covered is how much of usage the grant covers: all of it when unlimited, otherwise up to the quota.
+func (g *EntitlementGrant) Covered(usage decimal.Decimal) decimal.Decimal {
+	usage = decimal.Max(usage, decimal.Zero)
 	if g == nil {
 		return decimal.Zero
 	}
+	if g.Unlimited {
+		return usage
+	}
+	return decimal.Min(usage, g.Quota)
+}
+
+func (g *EntitlementGrant) Remaining() (decimal.Decimal, bool) {
+	if g == nil || g.Unlimited {
+		return decimal.Zero, false
+	}
 	remaining := g.Quota.Sub(g.Usage)
 	if remaining.IsNegative() {
-		return decimal.Zero
+		// Exhausted, not unbounded: the ceiling exists, it has been passed.
+		return decimal.Zero, true
 	}
-	return remaining
+	return remaining, true
 }
 
 func (g *EntitlementGrant) Validate() error {
@@ -122,8 +146,9 @@ func (g *EntitlementGrant) Validate() error {
 			WithHint("Set measure to quantity or amount").
 			Mark(ierr.ErrValidation)
 	}
-	if !g.Quota.IsPositive() {
-		return ierr.NewError("quota must be positive").
+
+	if !g.Unlimited && g.Quota.IsNegative() {
+		return ierr.NewError("quota cannot be negative").
 			WithReportableDetails(map[string]interface{}{"quota": g.Quota.String()}).
 			Mark(ierr.ErrValidation)
 	}
@@ -162,6 +187,7 @@ func FromEnt(e *ent.EntitlementGrant) *EntitlementGrant {
 		ScopeEntityID:       e.ScopeEntityID,
 		Measure:             e.Measure,
 		Quota:               e.Quota,
+		Unlimited:           e.Unlimited,
 		Usage:               e.Usage,
 		ValidFrom:           e.ValidFrom,
 		ValidTo:             e.ValidTo,

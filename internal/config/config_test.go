@@ -3,6 +3,10 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/flexprice/flexprice/internal/types"
+	"github.com/stretchr/testify/assert"
 )
 
 // TestSAMLConfigValidate covers the boot-time gate. The alternative to failing
@@ -144,4 +148,156 @@ func TestValidateSAMLDependenciesRequiresSigningSecret(t *testing.T) {
 	if err := off.validateSAMLDependencies(); err != nil {
 		t.Errorf("a non-SAML deployment must not require a signing secret: %v", err)
 	}
+}
+
+func TestReportsConfig_Enabled(t *testing.T) {
+	assert.False(t, ReportsConfig{}.Enabled())
+	assert.False(t, ReportsConfig{Database: "d"}.Enabled())
+	assert.False(t, ReportsConfig{Username: "u"}.Enabled())
+	assert.True(t, ReportsConfig{Database: "d", Username: "u"}.Enabled())
+}
+
+func TestBillingConfig_IsSelfBillingEnabled(t *testing.T) {
+	full := BillingConfig{
+		Enabled:       true,
+		Region:        "us",
+		APIHost:       "https://api.flexprice.io/v1",
+		APIKey:        "sk",
+		DefaultPlanID: "plan_1",
+		DashboardURL:  "https://us.app.flexprice.io",
+	}
+	with := func(mut func(*BillingConfig)) BillingConfig {
+		c := full
+		mut(&c)
+		return c
+	}
+
+	tests := []struct {
+		name string
+		cfg  BillingConfig
+		want bool
+	}{
+		{"complete", full, true},
+		{"disabled", with(func(c *BillingConfig) { c.Enabled = false }), false},
+		{"no host", with(func(c *BillingConfig) { c.APIHost = "" }), false},
+		{"no key", with(func(c *BillingConfig) { c.APIKey = "" }), false},
+		{"no region", with(func(c *BillingConfig) { c.Region = "" }), false},
+		{"no plan", with(func(c *BillingConfig) { c.DefaultPlanID = "" }), false},
+		{"no dashboard", with(func(c *BillingConfig) { c.DashboardURL = "" }), false},
+		{"plain http host", with(func(c *BillingConfig) { c.APIHost = "http://api.flexprice.io/v1" }), false},
+		{"relative host", with(func(c *BillingConfig) { c.APIHost = "api.flexprice.io/v1" }), false},
+		{"http localhost", with(func(c *BillingConfig) { c.APIHost = "http://localhost:8080/v1" }), true},
+		{"http 127.0.0.1", with(func(c *BillingConfig) { c.APIHost = "http://127.0.0.1:8080/v1" }), true},
+		{"http ::1", with(func(c *BillingConfig) { c.APIHost = "http://[::1]:8080/v1" }), true},
+		{"explicit provider", with(func(c *BillingConfig) { c.PaymentProvider = types.CheckoutPaymentProviderRazorpay }), true},
+		{"unknown provider", with(func(c *BillingConfig) { c.PaymentProvider = "paypal" }), false},
+		{"legacy only", BillingConfig{TenantID: "t_billing", EnvironmentID: "env"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.cfg.IsSelfBillingEnabled())
+		})
+	}
+}
+
+func TestBillingConfig_CheckoutProvider(t *testing.T) {
+	assert.Equal(t, types.CheckoutPaymentProviderStripe, BillingConfig{}.CheckoutProvider())
+	assert.Equal(t, types.CheckoutPaymentProviderChargebee, BillingConfig{PaymentProvider: types.CheckoutPaymentProviderChargebee}.CheckoutProvider())
+}
+
+func TestBillingConfig_UsageLookback(t *testing.T) {
+	tests := []struct {
+		name  string
+		hours int
+		want  time.Duration
+	}{
+		{"unset_defaults_to_6h", 0, 6 * time.Hour},
+		{"configured", 12, 12 * time.Hour},
+		{"negative_defaults_to_6h", -1, 6 * time.Hour},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, BillingConfig{UsageLookbackHours: tt.hours}.UsageLookback())
+		})
+	}
+}
+
+func TestBillingConfig_IsBillingTenant(t *testing.T) {
+	assert.True(t, BillingConfig{TenantID: "t_b"}.IsBillingTenant("t_b"))
+	assert.False(t, BillingConfig{}.IsBillingTenant(""))
+	assert.False(t, BillingConfig{TenantID: "t_b"}.IsBillingTenant("t_x"))
+}
+
+func TestBillingConfig_HasSecureZapierWebhookURL(t *testing.T) {
+	tests := []struct {
+		url  string
+		want bool
+	}{
+		{"https://hooks.zapier.com/hooks/catch/1/abc/", true},
+		{"http://hooks.zapier.com/hooks/catch/1/abc/", false},
+		{"http://localhost:8080/hook", true},
+		{"http://127.0.0.1:8080/hook", true},
+		{"", false},
+		{"not a url", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.url, func(t *testing.T) {
+			assert.Equal(t, tt.want, BillingConfig{ZapierWebhookURL: tt.url}.HasSecureZapierWebhookURL())
+		})
+	}
+}
+
+// TestBillingPlanIDs_FromEnv proves a comma-separated FLEXPRICE_BILLING_PLAN_IDS becomes the list of offered plans.
+func TestBillingPlanIDs_FromEnv(t *testing.T) {
+	t.Setenv("FLEXPRICE_BILLING_ENABLED", "true")
+	t.Setenv("FLEXPRICE_BILLING_DEFAULT_PLAN_ID", "plan_1")
+	t.Setenv("FLEXPRICE_BILLING_PLAN_IDS", "plan_1,plan_2")
+
+	cfg, err := NewConfig()
+	if err != nil {
+		t.Fatalf("NewConfig() error: %v", err)
+	}
+	assert.Equal(t, []string{"plan_1", "plan_2"}, cfg.Billing.PlanIDs)
+	assert.Equal(t, "plan_1", cfg.Billing.DefaultPlanID)
+}
+
+func TestValidateEmail(t *testing.T) {
+	resend := Configuration{}
+	resend.Email.Enabled = true
+	resend.Email.Provider = "resend"
+	resend.Email.Resend.APIKey = "re_key"
+	resend.Email.Resend.WebhookSecret = "whsec_secret"
+	resend.Email.RegionTag = "us"
+	resend.Email.SenderDomain = "mail.flexprice.io"
+	resend.Email.SenderLocalPart = "invoices"
+	assert.NoError(t, resend.validateEmail())
+
+	for name, clear := range map[string]func(*Configuration){
+		"no api key":        func(c *Configuration) { c.Email.Resend.APIKey = "" },
+		"no webhook secret": func(c *Configuration) { c.Email.Resend.WebhookSecret = " " },
+		"no region tag":     func(c *Configuration) { c.Email.RegionTag = "" },
+		"no sender domain":  func(c *Configuration) { c.Email.SenderDomain = "" },
+		"unknown provider":  func(c *Configuration) { c.Email.Provider = "sendgrid" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := resend
+			clear(&cfg)
+			assert.Error(t, cfg.validateEmail())
+		})
+	}
+
+	local := Configuration{}
+	local.Email.Enabled = true
+	local.Email.Provider = "local"
+	local.Email.SenderDomain = "mail.flexprice.io"
+	local.Email.SenderLocalPart = "invoices"
+	t.Setenv("FLEXPRICE_ALLOW_INSECURE_DEFAULTS", "")
+	assert.Error(t, local.validateEmail(), "local provider must not start outside local runs")
+	t.Setenv("FLEXPRICE_ALLOW_INSECURE_DEFAULTS", "true")
+	assert.NoError(t, local.validateEmail())
+
+	// email.enabled without a provider leaves customer emails off and requires nothing.
+	off := Configuration{}
+	off.Email.Enabled = true
+	assert.NoError(t, off.validateEmail())
 }

@@ -90,6 +90,7 @@ type CheckoutPaymentProvider string
 const (
 	CheckoutPaymentProviderRazorpay  CheckoutPaymentProvider = "razorpay"
 	CheckoutPaymentProviderChargebee CheckoutPaymentProvider = "chargebee"
+	CheckoutPaymentProviderStripe    CheckoutPaymentProvider = "stripe"
 )
 
 func (p CheckoutPaymentProvider) String() string { return string(p) }
@@ -98,10 +99,11 @@ func (p CheckoutPaymentProvider) Validate() error {
 	allowed := []CheckoutPaymentProvider{
 		CheckoutPaymentProviderRazorpay,
 		CheckoutPaymentProviderChargebee,
+		CheckoutPaymentProviderStripe,
 	}
 	if p != "" && !lo.Contains(allowed, p) {
 		return ierr.NewError("invalid checkout payment provider").
-			WithHint("Allowed values: razorpay, chargebee").
+			WithHint("Allowed values: razorpay, chargebee, stripe").
 			WithReportableDetails(map[string]any{"allowed_values": allowed}).
 			Mark(ierr.ErrValidation)
 	}
@@ -115,6 +117,8 @@ func (p CheckoutPaymentProvider) ToPaymentGateway() (PaymentGatewayType, bool) {
 		return PaymentGatewayTypeRazorpay, true
 	case CheckoutPaymentProviderChargebee:
 		return PaymentGatewayTypeChargebee, true
+	case CheckoutPaymentProviderStripe:
+		return PaymentGatewayTypeStripe, true
 	default:
 		return "", false
 	}
@@ -128,6 +132,8 @@ func CheckoutProviderFromGateway(g PaymentGatewayType) (CheckoutPaymentProvider,
 		return CheckoutPaymentProviderRazorpay, true
 	case PaymentGatewayTypeChargebee:
 		return CheckoutPaymentProviderChargebee, true
+	case PaymentGatewayTypeStripe:
+		return CheckoutPaymentProviderStripe, true
 	default:
 		return "", false
 	}
@@ -146,6 +152,10 @@ func (p CheckoutPaymentProvider) LinkExpiry() time.Duration {
 		// cannot shorten either. Sized so SessionExpiry lands on the 30m intent rather
 		// than past it: an abandoned session must die before the intent's fund hold does.
 		return 25 * time.Minute
+	case CheckoutPaymentProviderStripe:
+		// Stripe rejects an expires_at under 30m, so asking for exactly 30 sits on the
+		// floor and arrives under it. Leave headroom rather than race the boundary.
+		return 35 * time.Minute
 	default:
 		return 30 * time.Minute
 	}
@@ -159,10 +169,58 @@ func (p CheckoutPaymentProvider) SessionGrace() time.Duration {
 	return 5 * time.Minute
 }
 
+// ClosesLinkOnSessionEnd reports whether a session that ends unpaid closes its provider link,
+// so the customer cannot pay after the session is gone.
+func (p CheckoutPaymentProvider) ClosesLinkOnSessionEnd() bool {
+	return p == CheckoutPaymentProviderStripe
+}
+
+// SavedMethodSettlement is how long a charge on a saved method can take to settle.
+// Razorpay debits a mandate 24-36h after the pre-debit notice, and eNACH takes up to 2 working days more; zero means it settles at once.
+func (p CheckoutPaymentProvider) SavedMethodSettlement(method PaymentMethodType) time.Duration {
+	switch {
+	case p == CheckoutPaymentProviderRazorpay && method == PaymentMethodTypeENACH:
+		return 7 * 24 * time.Hour
+	case p == CheckoutPaymentProviderRazorpay:
+		return 72 * time.Hour
+	default:
+		return 0
+	}
+}
+
 // SessionExpiry is the link's lifetime plus the grace window, derived from LinkExpiry
 // so the two cannot drift apart.
 func (p CheckoutPaymentProvider) SessionExpiry() time.Duration {
 	return p.LinkExpiry() + p.SessionGrace()
+}
+
+// ValidateLinkExpiry rejects a link expiry shorter than the provider default.
+func (p CheckoutPaymentProvider) ValidateLinkExpiry(cfg *CheckoutPaymentProviderConfig) error {
+	if cfg == nil || !cfg.LinkExpiry.IsSet() {
+		return nil
+	}
+	expiry, err := cfg.LinkExpiry.ToDuration()
+	if err != nil {
+		return err
+	}
+	if expiry < p.LinkExpiry() {
+		return ierr.NewError("link_expiry is too short").
+			WithHintf("link_expiry must be at least %s for %s", p.LinkExpiry(), p).
+			Mark(ierr.ErrValidation)
+	}
+	return nil
+}
+
+// ResolveSessionExpiry is SessionExpiry with the checkout's link expiry override applied.
+func (p CheckoutPaymentProvider) ResolveSessionExpiry(cfg *CheckoutPaymentProviderConfig) time.Duration {
+	if cfg == nil || !cfg.LinkExpiry.IsSet() {
+		return p.SessionExpiry()
+	}
+	expiry, err := cfg.LinkExpiry.ToDuration()
+	if err != nil {
+		return p.SessionExpiry()
+	}
+	return expiry + p.SessionGrace()
 }
 
 type PaymentActionType string
@@ -201,6 +259,7 @@ type CheckoutSessionFilter struct {
 	PaymentProviders   []CheckoutPaymentProvider    `json:"payment_providers,omitempty"`
 	CheckoutStatuses   []CheckoutStatus             `json:"checkout_statuses,omitempty"`
 	ExpiresAtLT        *time.Time                   `json:"expires_at_lt,omitempty"`
+	ExpiresAtGT        *time.Time                   `json:"expires_at_gt,omitempty"`
 	CheckoutInvoiceIDs []string                     `json:"checkout_invoice_ids,omitempty"`
 	CheckoutPaymentIDs []string                     `json:"checkout_payment_ids,omitempty"`
 	Configuration      *CheckoutConfigurationFilter `json:"configuration,omitempty"`

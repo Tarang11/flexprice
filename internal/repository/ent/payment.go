@@ -3,20 +3,24 @@ package ent
 import (
 	"context"
 	"errors"
-	"time"
+
+	"github.com/flexprice/flexprice/internal/clock"
+	"github.com/samber/lo"
+
+	"github.com/lib/pq"
 
 	"github.com/flexprice/flexprice/ent"
 	"github.com/flexprice/flexprice/ent/payment"
 	"github.com/flexprice/flexprice/ent/paymentattempt"
 	"github.com/flexprice/flexprice/ent/predicate"
 	entSchema "github.com/flexprice/flexprice/ent/schema"
+	"github.com/flexprice/flexprice/internal/activity"
 	"github.com/flexprice/flexprice/internal/cache"
 	domainPayment "github.com/flexprice/flexprice/internal/domain/payment"
 	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/logger"
 	"github.com/flexprice/flexprice/internal/postgres"
 	"github.com/flexprice/flexprice/internal/types"
-	"github.com/lib/pq"
 )
 
 type paymentRepository struct {
@@ -62,34 +66,35 @@ func (r *paymentRepository) Create(ctx context.Context, p *domainPayment.Payment
 
 	// Not a loop var; local var shadowing package import, used synchronously below.
 	payment, err := client.Payment.Create(). // nosemgrep: trailofbits.go.invalid-usage-of-modified-variable.invalid-usage-of-modified-variable
-		SetID(p.ID).
-		SetIdempotencyKey(p.IdempotencyKey).
-		SetDestinationType(string(p.DestinationType)).
-		SetDestinationID(p.DestinationID).
-		SetPaymentMethodType(string(p.PaymentMethodType)).
-		SetPaymentMethodID(p.PaymentMethodID).
-		SetNillablePaymentGateway(p.PaymentGateway).
-		SetNillableGatewayPaymentID(p.GatewayPaymentID).
-		SetNillableGatewayTrackingID(p.GatewayTrackingID).
-		SetGatewayMetadata(p.GatewayMetadata).
-		SetAmount(p.Amount).
-		SetCurrency(p.Currency).
-		SetPaymentStatus(string(p.PaymentStatus)).
-		SetTrackAttempts(p.TrackAttempts).
-		SetMetadata(p.Metadata).
-		SetNillableSucceededAt(p.SucceededAt).
-		SetNillableFailedAt(p.FailedAt).
-		SetNillableRefundedAt(p.RefundedAt).
-		SetNillableVoidedAt(p.VoidedAt).
-		SetNillableErrorMessage(p.ErrorMessage).
-		SetNillableRecordedAt(p.RecordedAt).
-		SetTenantID(p.TenantID).
-		SetCreatedAt(p.CreatedAt).
-		SetUpdatedAt(p.UpdatedAt).
-		SetCreatedBy(p.CreatedBy).
-		SetUpdatedBy(p.UpdatedBy).
-		SetEnvironmentID(p.EnvironmentID).
-		Save(ctx)
+							SetID(p.ID).
+							SetIdempotencyKey(p.IdempotencyKey).
+							SetDestinationType(string(p.DestinationType)).
+							SetDestinationID(p.DestinationID).
+							SetPaymentMethodType(string(p.PaymentMethodType)).
+							SetPaymentMethodID(p.PaymentMethodID).
+							SetNillablePaymentGateway(p.PaymentGateway).
+							SetNillableGatewayPaymentID(p.GatewayPaymentID).
+							SetNillableConnectionID(p.ConnectionID).
+							SetNillableGatewayTrackingID(p.GatewayTrackingID).
+							SetGatewayMetadata(p.GatewayMetadata).
+							SetAmount(p.Amount).
+							SetCurrency(p.Currency).
+							SetPaymentStatus(string(p.PaymentStatus)).
+							SetTrackAttempts(p.TrackAttempts).
+							SetMetadata(p.Metadata).
+							SetNillableSucceededAt(p.SucceededAt).
+							SetNillableFailedAt(p.FailedAt).
+							SetNillableRefundedAt(p.RefundedAt).
+							SetNillableVoidedAt(p.VoidedAt).
+							SetNillableErrorMessage(p.ErrorMessage).
+							SetNillableRecordedAt(p.RecordedAt).
+							SetTenantID(p.TenantID).
+							SetCreatedAt(p.CreatedAt).
+							SetUpdatedAt(p.UpdatedAt).
+							SetCreatedBy(p.CreatedBy).
+							SetUpdatedBy(p.UpdatedBy).
+							SetEnvironmentID(p.EnvironmentID).
+							Save(ctx)
 
 	if err != nil {
 		SetSpanError(span, err)
@@ -226,7 +231,7 @@ func (r *paymentRepository) ListScopedByDestinationStatusGateway(ctx context.Con
 	defer FinishSpan(span)
 
 	const query = `
-		SELECT id, tenant_id, environment_id, gateway_payment_id
+		SELECT id, tenant_id, environment_id, gateway_payment_id, payment_method_type
 		FROM payments
 		WHERE destination_type = $1
 		  AND payment_status   = $2
@@ -248,7 +253,7 @@ func (r *paymentRepository) ListScopedByDestinationStatusGateway(ctx context.Con
 	var result []domainPayment.ScopedPayment
 	for rows.Next() {
 		var row domainPayment.ScopedPayment
-		if err := rows.Scan(&row.PaymentID, &row.TenantID, &row.EnvironmentID, &row.GatewayPaymentID); err != nil {
+		if err := rows.Scan(&row.PaymentID, &row.TenantID, &row.EnvironmentID, &row.GatewayPaymentID, &row.PaymentMethodType); err != nil {
 			SetSpanError(span, err)
 			return nil, ierr.WithError(err).WithHint("failed to scan scoped payment row").Mark(ierr.ErrDatabase)
 		}
@@ -328,7 +333,7 @@ func (r *paymentRepository) update(ctx context.Context, p *domainPayment.Payment
 		predicates = append(predicates, payment.PaymentStatus(string(*expectedStatus)))
 	}
 
-	affected, err := client.Payment.Update().
+	update := client.Payment.Update().
 		Where(predicates...).
 		SetPaymentStatus(string(p.PaymentStatus)).
 		SetPaymentMethodID(p.PaymentMethodID).
@@ -339,14 +344,20 @@ func (r *paymentRepository) update(ctx context.Context, p *domainPayment.Payment
 		SetGatewayMetadata(p.GatewayMetadata).
 		SetTrackAttempts(p.TrackAttempts).
 		SetMetadata(p.Metadata).
-		SetUpdatedAt(time.Now().UTC()).
+		SetUpdatedAt(clock.Now()).
 		SetNillableRecordedAt(p.RecordedAt).
 		SetNillableSucceededAt(p.SucceededAt).
 		SetNillableFailedAt(p.FailedAt).
 		SetNillableRefundedAt(p.RefundedAt).
 		SetNillableVoidedAt(p.VoidedAt).
-		SetNillableErrorMessage(p.ErrorMessage).
-		Save(ctx)
+		SetNillableErrorMessage(p.ErrorMessage)
+	if p.ConnectionID != nil {
+		update.SetConnectionID(*p.ConnectionID)
+	} else {
+		update.ClearConnectionID()
+	}
+
+	affected, err := update.SaveReturning(ctx)
 
 	if err != nil {
 		SetSpanError(span, err)
@@ -362,7 +373,7 @@ func (r *paymentRepository) update(ctx context.Context, p *domainPayment.Payment
 	// so this count is the only signal that the write did not land — without it
 	// an unknown ID, or one belonging to another tenant, returns success having
 	// changed nothing.
-	if affected == 0 {
+	if len(affected) == 0 {
 		// With a status predicate, the row may well exist and simply have moved
 		// to a different status between the caller's read and this write.
 		// Reported as a conflict so the caller re-reads rather than treating the
@@ -412,6 +423,7 @@ func (r *paymentRepository) delete(ctx context.Context, id string, expectedStatu
 	})
 	defer FinishSpan(span)
 
+	ctx = activity.WithAction(ctx, id, activity.PaymentArchived)
 	client := r.client.Writer(ctx)
 
 	r.log.Debug(ctx, "deleting payment",
@@ -432,8 +444,8 @@ func (r *paymentRepository) delete(ctx context.Context, id string, expectedStatu
 		Where(predicates...).
 		SetStatus(string(types.StatusArchived)).
 		SetUpdatedBy(types.GetUserID(ctx)).
-		SetUpdatedAt(time.Now().UTC()).
-		Save(ctx)
+		SetUpdatedAt(clock.Now()).
+		SaveReturning(ctx)
 
 	if err != nil {
 		SetSpanError(span, err)
@@ -447,7 +459,7 @@ func (r *paymentRepository) delete(ctx context.Context, id string, expectedStatu
 
 	// As in update: zero rows affected is the only signal that nothing was
 	// archived, since a bulk update does not report a missing row as an error.
-	if affected == 0 {
+	if len(affected) == 0 {
 		var mutationErr error
 		if expectedStatus != nil {
 			mutationErr = ierr.NewError("payment status changed during delete").
@@ -572,6 +584,7 @@ func (r *paymentRepository) CreateAttempt(ctx context.Context, a *domainPayment.
 	}
 
 	*a = *domainPayment.FromEntAttempt(attempt)
+	r.DeleteCache(ctx, a.PaymentID)
 	return nil
 }
 
@@ -645,7 +658,7 @@ func (r *paymentRepository) UpdateAttempt(ctx context.Context, a *domainPayment.
 		SetNillableGatewayAttemptID(a.GatewayAttemptID).
 		SetNillableErrorMessage(a.ErrorMessage).
 		SetMetadata(a.Metadata).
-		SetUpdatedAt(time.Now().UTC()).
+		SetUpdatedAt(clock.Now()).
 		Save(ctx)
 
 	if err != nil {
@@ -817,6 +830,9 @@ func (o PaymentQueryOptions) applyEntityQueryOptions(_ context.Context, f *types
 	if f.DestinationID != nil {
 		query = query.Where(payment.DestinationID(*f.DestinationID))
 	}
+	if len(f.DestinationIDs) > 0 {
+		query = query.Where(payment.DestinationIDIn(f.DestinationIDs...))
+	}
 
 	// Apply payment method type filter if specified
 	if f.PaymentMethodType != nil {
@@ -826,6 +842,9 @@ func (o PaymentQueryOptions) applyEntityQueryOptions(_ context.Context, f *types
 	// Apply payment status filter if specified
 	if f.PaymentStatus != nil {
 		query = query.Where(payment.PaymentStatus(*f.PaymentStatus))
+	}
+	if len(f.PaymentStatuses) > 0 {
+		query = query.Where(payment.PaymentStatusIn(lo.Map(f.PaymentStatuses, func(s types.PaymentStatus, _ int) string { return string(s) })...))
 	}
 
 	// Apply payment gateway filter if specified
@@ -846,6 +865,10 @@ func (o PaymentQueryOptions) applyEntityQueryOptions(_ context.Context, f *types
 	// Apply gateway tracking ID filter if specified
 	if f.GatewayTrackingID != nil {
 		query = query.Where(payment.GatewayTrackingID(*f.GatewayTrackingID))
+	}
+
+	if f.UpdatedAtGTE != nil {
+		query = query.Where(payment.UpdatedAtGTE(*f.UpdatedAtGTE))
 	}
 
 	// Apply time range filters if specified
@@ -897,4 +920,25 @@ func (r *paymentRepository) DeleteCache(ctx context.Context, paymentID string) {
 
 	cacheKey := cache.GenerateKey(ctx, cache.PrefixPayment, paymentID)
 	r.redisCache.Delete(ctx, cacheKey)
+}
+
+// GetLinkedCustomerID returns the paid invoice's customer, or the customer a payment is made for.
+func (r *paymentRepository) GetLinkedCustomerID(ctx context.Context, id string) (string, error) {
+	return linkedCustomerID(ctx, "payment", id, func(ctx context.Context) (string, error) {
+		client := r.client.Reader(ctx)
+		p, err := client.Payment.Query().
+			Where(payment.ID(id), payment.TenantID(types.GetTenantID(ctx)), payment.EnvironmentID(types.GetEnvironmentID(ctx))).
+			Select(payment.FieldDestinationType, payment.FieldDestinationID).
+			Only(ctx)
+		if err != nil {
+			return "", err
+		}
+		switch types.PaymentDestinationType(p.DestinationType) {
+		case types.PaymentDestinationTypeInvoice:
+			return invoiceCustomerID(ctx, client, p.DestinationID)
+		case types.PaymentDestinationTypeCustomer:
+			return p.DestinationID, nil
+		}
+		return "", nil
+	})
 }

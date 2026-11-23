@@ -4,14 +4,20 @@ import (
 	"context"
 	"time"
 
-	"github.com/flexprice/flexprice/internal/logger"
-	"github.com/flexprice/flexprice/internal/ee/service"
-	cronModels "github.com/flexprice/flexprice/internal/temporal/models"
-	"github.com/flexprice/flexprice/internal/types"
+	"github.com/flexprice/flexprice/internal/clock"
+
 	"github.com/samber/lo"
 	"github.com/shopspring/decimal"
 	"go.temporal.io/sdk/activity"
+
+	"github.com/flexprice/flexprice/internal/ee/service"
+	"github.com/flexprice/flexprice/internal/logger"
+	cronModels "github.com/flexprice/flexprice/internal/temporal/models"
+	"github.com/flexprice/flexprice/internal/types"
 )
+
+// maxCreditsPerExpiryRun caps the credits one run settles; the 15-minute schedule picks up the rest.
+const maxCreditsPerExpiryRun = 200
 
 // WalletCreditExpiryActivities wraps wallet credit expiry logic.
 type WalletCreditExpiryActivities struct {
@@ -35,12 +41,12 @@ func NewWalletCreditExpiryActivities(
 	}
 }
 
-// ExpireCreditsActivity finds and expires credits that have passed their expiry date across all tenants.
-// Logic matches internal/api/cron.WalletCronHandler.ExpireCredits (no-limit tx filter, up to 1000 envs per tenant).
+// ExpireCreditsActivity finds and expires credits that have passed their expiry date across all tenants,
+// up to maxCreditsPerExpiryRun per run.
 func (a *WalletCreditExpiryActivities) ExpireCreditsActivity(ctx context.Context) (*cronModels.WalletCreditExpiryWorkflowResult, error) {
 	log := activity.GetLogger(ctx)
 	log.Info("Starting wallet credit expiry activity")
-	a.logger.Info(ctx, "starting credit expiry cron job", "time", time.Now().UTC().Format(time.RFC3339))
+	a.logger.Info(ctx, "starting credit expiry cron job", "time", clock.Now().Format(time.RFC3339))
 
 	tenants, err := a.tenantService.GetAllTenants(ctx)
 	if err != nil {
@@ -48,16 +54,13 @@ func (a *WalletCreditExpiryActivities) ExpireCreditsActivity(ctx context.Context
 		return nil, err
 	}
 
-	// Create filter to find expired credits (expired at least 6 hours ago - grace period after expiry).
-	filter := types.NewNoLimitWalletTransactionFilter()
-	filter.Type = lo.ToPtr(types.TransactionTypeCredit)
-	filter.TransactionStatus = lo.ToPtr(types.TransactionStatusCompleted)
-	filter.ExpiryDateBefore = lo.ToPtr(time.Now().UTC().Add(-6 * time.Hour))
-	filter.CreditsAvailableGT = lo.ToPtr(decimal.Zero)
-
 	result := &cronModels.WalletCreditExpiryWorkflowResult{}
 
+	remaining := maxCreditsPerExpiryRun
 	for _, tenant := range tenants {
+		if remaining == 0 {
+			break
+		}
 		tenantCtx := context.WithValue(ctx, types.CtxTenantID, tenant.ID)
 		envFilter := types.GetDefaultFilter()
 		envFilter.Limit = 1000
@@ -68,7 +71,20 @@ func (a *WalletCreditExpiryActivities) ExpireCreditsActivity(ctx context.Context
 		}
 
 		for _, environment := range environments.Environments {
+			if remaining == 0 {
+				break
+			}
 			envCtx := context.WithValue(tenantCtx, types.CtxEnvironmentID, environment.ID)
+
+			cutoff := a.walletService.CreditExpiryCutoff()
+			filter := types.NewWalletTransactionFilter()
+			filter.Limit = lo.ToPtr(remaining)
+			filter.Type = lo.ToPtr(types.TransactionTypeCredit)
+			filter.TransactionStatus = lo.ToPtr(types.TransactionStatusCompleted)
+			filter.ExpiryDateBefore = lo.ToPtr(cutoff)
+			filter.CreditsAvailableGT = lo.ToPtr(decimal.Zero)
+			// Earliest expiry first, so a later credit can't take usage an earlier one could pay.
+			filter.Sort = []*types.SortCondition{{Field: "expiry_date", Direction: types.SortDirectionAsc}}
 
 			transactions, err := a.walletService.ListWalletTransactionsByFilter(envCtx, filter)
 			if err != nil {
@@ -78,10 +94,13 @@ func (a *WalletCreditExpiryActivities) ExpireCreditsActivity(ctx context.Context
 
 			a.logger.Debug(ctx, "found expired credits", "count", len(transactions.Items))
 
-			for i, tx := range transactions.Items {
-				if i%100 == 0 {
-					activity.RecordHeartbeat(ctx, "processed tenant "+tenant.ID+" env "+environment.ID)
+			for _, tx := range transactions.Items {
+				// Stop on cancel or timeout instead of failing every remaining credit.
+				if err := ctx.Err(); err != nil {
+					return nil, err
 				}
+				activity.RecordHeartbeat(ctx, "processing tenant "+tenant.ID+" env "+environment.ID)
+				remaining--
 				result.Total++
 
 				txCtx := context.WithValue(envCtx, types.CtxUserID, tx.CreatedBy)
@@ -91,17 +110,11 @@ func (a *WalletCreditExpiryActivities) ExpireCreditsActivity(ctx context.Context
 					result.Failed++
 					continue
 				}
-				if expireResult.Expired {
+				if expireResult.Expired || expireResult.Applied.IsPositive() {
 					result.Succeeded++
 					a.logger.Info(ctx, "expired credits successfully",
-						"transaction_id", tx.ID, "wallet_id", tx.WalletID, "amount", tx.CreditsAvailable)
-					continue
-				}
-				switch expireResult.SkipReason {
-				case types.CreditExpirySkipReasonActiveSubscription:
-					result.SkippedDueToActiveSubscription++
-				case types.CreditExpirySkipReasonActiveInvoice:
-					result.SkippedDueToActiveInvoice++
+						"transaction_id", tx.ID, "wallet_id", tx.WalletID, "amount", tx.CreditsAvailable,
+						"applied_to_invoices", expireResult.Applied)
 				}
 			}
 		}

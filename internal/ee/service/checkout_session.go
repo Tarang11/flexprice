@@ -5,14 +5,29 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/flexprice/flexprice/internal/clock"
+
+	"github.com/flexprice/flexprice/internal/activity"
+	"github.com/flexprice/flexprice/internal/domain/addonassociation"
+
+	"github.com/samber/lo"
+
 	"github.com/flexprice/flexprice/internal/api/dto"
 	domainCheckout "github.com/flexprice/flexprice/internal/domain/checkout"
 	"github.com/flexprice/flexprice/internal/domain/invoice"
 	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/interfaces"
+	"github.com/flexprice/flexprice/internal/metrics"
 	"github.com/flexprice/flexprice/internal/types"
 	webhookDto "github.com/flexprice/flexprice/internal/webhook/dto"
-	"github.com/samber/lo"
+)
+
+// Checkout charge modes, a metrics label; "none" means the gateway was not contacted yet.
+const (
+	chargeModeNone        = "none"
+	chargeModeAutoCharge  = "auto_charge"
+	chargeModeAuthLink    = "auth_link"
+	chargeModePaymentLink = "payment_link"
 )
 
 type CheckoutSessionService = interfaces.CheckoutSessionService
@@ -23,6 +38,48 @@ type checkoutSessionService struct {
 
 func NewCheckoutSessionService(params ServiceParams) interfaces.CheckoutSessionService {
 	return &checkoutSessionService{ServiceParams: params}
+}
+
+// pendingCheckoutSessions returns the subscription's payment-gated changes that are still open.
+func pendingCheckoutSessions(ctx context.Context, sp ServiceParams, subscriptionID string) ([]*domainCheckout.CheckoutSession, error) {
+	return sp.CheckoutSessionRepo.List(ctx, &types.CheckoutSessionFilter{
+		QueryFilter:      types.NewNoLimitPublishedQueryFilter(),
+		Actions:          []types.CheckoutAction{types.CheckoutActionModifySubscription, types.CheckoutActionAddAddon},
+		CheckoutStatuses: []types.CheckoutStatus{types.CheckoutStatusInitiated, types.CheckoutStatusPending},
+		Configuration:    &types.CheckoutConfigurationFilter{SubscriptionID: subscriptionID},
+	})
+}
+
+// ensureNoPendingCheckoutSession rejects a second payment-gated change while one is still open.
+func ensureNoPendingCheckoutSession(ctx context.Context, sp ServiceParams, subscriptionID string) error {
+	existing, err := pendingCheckoutSessions(ctx, sp, subscriptionID)
+	if err != nil {
+		return err
+	}
+	if len(existing) == 0 {
+		return nil
+	}
+
+	return ierr.NewError("a pending checkout session already exists for this subscription").
+		WithHint("Complete or cancel the existing checkout before starting another payment-gated change").
+		WithReportableDetails(map[string]any{
+			"subscription_id":     subscriptionID,
+			"checkout_session_id": existing[0].ID,
+		}).
+		Mark(ierr.ErrAlreadyExists)
+}
+
+// openCheckoutSessionIDs returns the ids of the customer's checkout sessions that are still open.
+func openCheckoutSessionIDs(ctx context.Context, sp ServiceParams, customerID string) ([]string, error) {
+	sessions, err := sp.CheckoutSessionRepo.List(ctx, &types.CheckoutSessionFilter{
+		QueryFilter:      types.NewNoLimitQueryFilter(),
+		CustomerIDs:      []string{customerID},
+		CheckoutStatuses: types.ActiveCheckoutStatuses(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return lo.Map(sessions, func(sess *domainCheckout.CheckoutSession, _ int) string { return sess.ID }), nil
 }
 
 func (s *checkoutSessionService) Create(ctx context.Context, req dto.CreateCheckoutSessionRequest) (*dto.CheckoutSessionResponse, error) {
@@ -56,6 +113,10 @@ func (s *checkoutSessionService) Create(ctx context.Context, req dto.CreateCheck
 			WithReportableDetails(map[string]any{"customer_id": customer.ID, "status": customer.Status}).
 			Mark(ierr.ErrValidation)
 	}
+	ctx, err = s.scopeCheckout(ctx, customer.ID, req.PaymentProvider)
+	if err != nil {
+		return nil, err
+	}
 
 	session := req.ToCheckoutSession(ctx, customer.ID)
 
@@ -68,7 +129,7 @@ func (s *checkoutSessionService) Create(ctx context.Context, req dto.CreateCheck
 	if err := s.executeCheckoutAction(ctx, session); err != nil {
 		// Best-effort cleanup: archive entities + mark session failed.
 		// Log cleanup errors but return the original fulfillment error.
-		if cleanupErr := s.cleanupCheckoutSession(ctx, session, err); cleanupErr != nil {
+		if _, cleanupErr := s.terminateCheckoutSession(ctx, session, err, false); cleanupErr != nil {
 			s.Logger.Error(ctx, "checkout cleanup failed after fulfillment error",
 				"session_id", session.ID,
 				"error", cleanupErr,
@@ -79,6 +140,7 @@ func (s *checkoutSessionService) Create(ctx context.Context, req dto.CreateCheck
 	}
 
 	resp := s.toPollableResponse(ctx, session, false)
+	metrics.RecordCounter(ctx, metrics.CheckoutSessions, 1, checkoutMetricLabels(session, types.CheckoutStatusInitiated)...)
 	s.publishCheckoutEvent(ctx, resp, types.WebhookEventCheckoutSessionInitiated)
 	return resp, nil
 }
@@ -104,6 +166,24 @@ func (s *checkoutSessionService) Get(ctx context.Context, id string) (*dto.Check
 // Separate from Get because reconciliation contacts the gateway and can complete a
 // session: only a caller acting for the customer should trigger it. Internal readers
 // — the outbound webhook payload builder, for one — must use Get.
+func (s *checkoutSessionService) GetByPaymentID(ctx context.Context, paymentID string) (*dto.CheckoutSessionResponse, error) {
+	// An empty id is "not a checkout payment", not a bad request: webhook handlers
+	// pass whatever the gateway sent back and expect nil for anything unrelated.
+	if paymentID == "" {
+		return nil, nil
+	}
+
+	session, err := s.CheckoutSessionRepo.GetSessionByPaymentID(ctx, paymentID)
+	if err != nil {
+		return nil, err
+	}
+	if session == nil {
+		return nil, nil
+	}
+
+	return dto.ToCheckoutSessionResponse(session), nil
+}
+
 func (s *checkoutSessionService) GetAndReconcile(ctx context.Context, id string) (*dto.CheckoutSessionResponse, error) {
 	if id == "" {
 		return nil, ierr.NewError("id is required").
@@ -216,7 +296,7 @@ func (s *checkoutSessionService) Delete(ctx context.Context, id string) error {
 	// Archiving alone leaves checkout_status pending, so the row keeps holding its
 	// idempotency key and keeps blocking the per-wallet pending guard while being
 	// invisible to every service query. Reach a terminal state first.
-	if err := s.cleanupCheckoutSession(ctx, session, nil); err != nil {
+	if err := s.cleanupCheckoutSession(ctx, session, nil, false); err != nil {
 		return err
 	}
 
@@ -230,6 +310,7 @@ func (s *checkoutSessionService) Cancel(ctx context.Context, id string) (*dto.Ch
 			Mark(ierr.ErrValidation)
 	}
 
+	ctx = types.WithForceWriter(ctx)
 	session, err := s.CheckoutSessionRepo.Get(ctx, id)
 	if err != nil {
 		return nil, err
@@ -244,7 +325,20 @@ func (s *checkoutSessionService) Cancel(ctx context.Context, id string) (*dto.Ch
 		return s.toPollableResponse(ctx, session, false), nil
 	}
 
-	if err := s.cleanupCheckoutSession(ctx, session, nil); err != nil {
+	// Before expiry a paid session cannot be cancelled; after it, the payment is refunded as a late capture.
+	if paymentID := lo.FromPtr(session.CheckoutPaymentID); paymentID != "" && clock.Now().Before(session.ExpiresAt) {
+		p, err := s.PaymentRepo.Get(ctx, paymentID)
+		if err != nil && !ierr.IsNotFound(err) {
+			return nil, err
+		}
+		if p.IsPaymentPaid() {
+			return nil, ierr.NewError("checkout payment already succeeded").
+				WithHintf("session %s has been paid and cannot be cancelled", session.ID).
+				Mark(ierr.ErrInvalidOperation)
+		}
+	}
+
+	if err := s.cleanupCheckoutSession(ctx, session, nil, true); err != nil {
 		return nil, err
 	}
 
@@ -272,7 +366,7 @@ func (s *checkoutSessionService) CleanupCheckoutSession(ctx context.Context, ses
 		return err
 	}
 
-	return s.cleanupCheckoutSession(ctx, session, reason)
+	return s.cleanupCheckoutSession(ctx, session, reason, false)
 }
 
 func (s *checkoutSessionService) voidCheckoutInvoiceIfPartiallyPaid(ctx context.Context, session *domainCheckout.CheckoutSession, invoiceID string) error {
@@ -300,9 +394,31 @@ func (s *checkoutSessionService) voidCheckoutInvoiceIfPartiallyPaid(ctx context.
 	return err
 }
 
-func (s *checkoutSessionService) cleanupCheckoutSession(ctx context.Context, session *domainCheckout.CheckoutSession, reason error) error {
+// cleanupCheckoutSession terminates the session and publishes checkout.session.failed
+// (reason set) or checkout.session.expired (no reason). A cancel also sets cancelled_at
+// and publishes checkout.session.cancelled.
+func (s *checkoutSessionService) cleanupCheckoutSession(ctx context.Context, session *domainCheckout.CheckoutSession, reason error, cancelled bool) error {
+	terminated, err := s.terminateCheckoutSession(ctx, session, reason, cancelled)
+	if err != nil || !terminated {
+		return err
+	}
+
+	resp := dto.ToCheckoutSessionResponse(session)
+	if reason != nil {
+		s.publishCheckoutEvent(ctx, resp, types.WebhookEventCheckoutSessionFailed)
+	} else {
+		s.publishCheckoutEvent(ctx, resp, types.WebhookEventCheckoutSessionExpired)
+	}
+	if cancelled {
+		s.publishCheckoutEvent(ctx, resp, types.WebhookEventCheckoutSessionCancelled)
+	}
+	return nil
+}
+
+// terminate cleans up a checkout session without webhook publishing.
+func (s *checkoutSessionService) terminateCheckoutSession(ctx context.Context, session *domainCheckout.CheckoutSession, reason error, cancelled bool) (bool, error) {
 	if session.CheckoutStatus.IsTerminal() {
-		return nil
+		return false, nil
 	}
 
 	status := types.CheckoutStatusExpired
@@ -313,12 +429,18 @@ func (s *checkoutSessionService) cleanupCheckoutSession(ctx context.Context, ses
 		failureReason = &msg
 	}
 
+	terminalAction := activity.CheckoutSessionExpired
+	if status == types.CheckoutStatusFailed {
+		terminalAction = activity.CheckoutSessionFailed
+	}
+
 	err := s.DB.WithTx(ctx, func(txCtx context.Context) error {
 		if err := s.cleanupCheckoutResources(txCtx, session, reason); err != nil {
 			return err
 		}
 
-		claimed, err := s.CheckoutSessionRepo.MarkTerminal(txCtx, session.ID, status, failureReason)
+		txCtx = activity.WithAction(txCtx, session.ID, terminalAction)
+		claimed, err := s.CheckoutSessionRepo.MarkTerminal(txCtx, session.ID, status, failureReason, cancelled)
 		if err != nil {
 			return err
 		}
@@ -331,20 +453,15 @@ func (s *checkoutSessionService) cleanupCheckoutSession(ctx context.Context, ses
 	})
 	if err != nil {
 		if ierr.IsAlreadyExists(err) {
-			return nil
+			return false, nil
 		}
-		return err
+		return false, err
 	}
 
 	session.CheckoutStatus = status
 	session.FailureReason = failureReason
-	resp := dto.ToCheckoutSessionResponse(session)
-	if reason != nil {
-		s.publishCheckoutEvent(ctx, resp, types.WebhookEventCheckoutSessionFailed)
-	} else {
-		s.publishCheckoutEvent(ctx, resp, types.WebhookEventCheckoutSessionExpired)
-	}
-	return nil
+	metrics.RecordCounter(ctx, metrics.CheckoutSessions, 1, checkoutMetricLabels(session, status)...)
+	return true, nil
 }
 
 func (s *checkoutSessionService) cleanupCheckoutResources(ctx context.Context, session *domainCheckout.CheckoutSession, reason error) error {
@@ -391,24 +508,53 @@ func (s *checkoutSessionService) cleanupCheckoutResources(ctx context.Context, s
 		}
 	}
 
-	if cfg.AddAddonParams != nil {
-		for _, ref := range cfg.AddAddonParams.Addons {
-			association, err := s.AddonAssociationRepo.GetByID(ctx, ref.AssociationID)
-			if err != nil {
+	// Only the attaches wrote anything: a gated removal leaves its association active and
+	// billable until payment lands, so an abandoned checkout has nothing to undo for it.
+	var ids []string
+	priceIDsByAssociation := map[string][]string{}
+	for _, params := range cfg.AddAddonEntries() {
+		for _, ref := range params.Addons {
+			ids = append(ids, ref.AssociationID)
+			priceIDsByAssociation[ref.AssociationID] = ref.OverridePriceIDs()
+		}
+	}
+	if len(ids) > 0 {
+
+		associations, err := s.AddonAssociationRepo.GetByIDs(ctx, ids)
+		if err != nil {
+			s.Logger.Error(ctx, "failed to load pending addon associations for checkout cleanup",
+				"association_ids", ids, "error", err)
+			return err
+		}
+
+		pending := lo.FilterMap(associations, func(a *addonassociation.AddonAssociation, _ int) (string, bool) {
+			return a.ID, a.AddonStatus == types.AddonStatusPending
+		})
+		if len(pending) > 0 {
+			if err := s.AddonAssociationRepo.DeleteBulk(ctx, pending); err != nil {
+				s.Logger.Error(ctx, "failed to archive pending addon associations",
+					"association_ids", pending, "error", err)
 				return err
 			}
-			if association.AddonStatus != types.AddonStatusPending {
-				return ierr.NewError("checkout session already in terminal state").
-					WithHintf("session %s was claimed by another process", session.ID).
-					Mark(ierr.ErrAlreadyExists)
-			}
-			if err := s.AddonAssociationRepo.Delete(ctx, ref.AssociationID); err != nil {
+		}
+
+		// Override prices of attaches that never activated are referenced by nothing.
+		priceIDs := lo.FlatMap(pending, func(id string, _ int) []string { return priceIDsByAssociation[id] })
+		if len(priceIDs) > 0 {
+			if err := s.PriceRepo.DeleteBulk(ctx, priceIDs); err != nil {
+				s.Logger.Error(ctx, "failed to delete override prices of pending addon associations",
+					"price_ids", priceIDs, "error", err)
 				return err
 			}
 		}
 	}
 
 	if paymentID != "" {
+		if session.PaymentProvider.ClosesLinkOnSessionEnd() {
+			if err := s.closeCheckoutLinkAfterCommit(ctx, paymentID); err != nil {
+				return err
+			}
+		}
 		if err := s.PaymentRepo.Delete(ctx, paymentID); err != nil {
 			return err
 		}
@@ -418,17 +564,57 @@ func (s *checkoutSessionService) cleanupCheckoutResources(ctx context.Context, s
 		if err := s.voidCheckoutInvoiceIfPartiallyPaid(ctx, session, invoiceID); err != nil {
 			return err
 		}
-		if err := s.InvoiceRepo.Delete(ctx, invoiceID); err != nil {
+		if err := archiveDraftInvoice(ctx, s.ServiceParams, invoiceID); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+// closeCheckoutLinkAfterCommit closes the session's unpaid gateway link once the session's end is committed.
+func (s *checkoutSessionService) closeCheckoutLinkAfterCommit(ctx context.Context, paymentID string) error {
+	p, err := s.PaymentRepo.Get(ctx, paymentID)
+	if err != nil {
+		if ierr.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if p.IsPaymentPaid() || lo.FromPtr(p.GatewayTrackingID) == "" {
+		return nil
+	}
+
+	closeCtx := types.WithoutDBTransaction(ctx)
+	closeLink := func() {
+		NewPaymentService(s.ServiceParams).(*paymentService).closeProviderLink(closeCtx, p.DestinationID, p)
+	}
+	if !types.RegisterPostCommit(ctx, closeLink) {
+		closeLink()
+	}
+	return nil
+}
+
+// archiveDraftInvoice archives an unpaid checkout draft along with the coupon applications computed onto it.
+func archiveDraftInvoice(ctx context.Context, sp ServiceParams, invoiceID string) error {
+	filter := types.NewNoLimitCouponApplicationFilter()
+	filter.InvoiceIDs = []string{invoiceID}
+	applications, err := sp.CouponApplicationRepo.List(ctx, filter)
+	if err != nil {
+		return err
+	}
+	for _, application := range applications {
+		if err := sp.CouponApplicationRepo.Delete(ctx, application.ID); err != nil {
+			return err
+		}
+	}
+
+	return sp.InvoiceRepo.Delete(ctx, invoiceID)
+}
+
 const cleanupExpiredBatchSize = 1000
 
 func (s *checkoutSessionService) CleanupAllExpiredSessions(ctx context.Context, effectiveDate *time.Time) (*types.CheckoutSessionCleanupResult, error) {
-	cutoff := time.Now().UTC()
+	cutoff := clock.Now()
 	if effectiveDate != nil {
 		cutoff = effectiveDate.UTC()
 	}
@@ -436,7 +622,8 @@ func (s *checkoutSessionService) CleanupAllExpiredSessions(ctx context.Context, 
 	result := &types.CheckoutSessionCleanupResult{}
 
 	for {
-		sessions, err := s.CheckoutSessionRepo.ListExpiredCheckoutSessions(ctx, cutoff, cleanupExpiredBatchSize, 0)
+		// Failed sessions stay listed ahead of unprocessed ones, so skip past them.
+		sessions, err := s.CheckoutSessionRepo.ListExpiredCheckoutSessions(ctx, cutoff, cleanupExpiredBatchSize, result.Failed)
 		if err != nil {
 			return result, err
 		}
@@ -445,7 +632,7 @@ func (s *checkoutSessionService) CleanupAllExpiredSessions(ctx context.Context, 
 			result.Total++
 			sessCtx := context.WithValue(ctx, types.CtxTenantID, sess.TenantID)
 			sessCtx = context.WithValue(sessCtx, types.CtxEnvironmentID, sess.EnvironmentID)
-			if err := s.cleanupCheckoutSession(sessCtx, sess, nil); err != nil {
+			if err := s.cleanupCheckoutSession(sessCtx, sess, nil, false); err != nil {
 				s.Logger.Error(ctx, "failed to cleanup expired checkout session",
 					"session_id", sess.ID, "error", err)
 				result.Failed++
@@ -475,6 +662,16 @@ func (s *checkoutSessionService) CompleteCheckoutSession(ctx context.Context, se
 		return err
 	}
 
+	// Past expiry the session is expired, never completed; a payment it took is a late capture.
+	if !session.CheckoutStatus.IsTerminal() && !session.ExpiresAt.IsZero() && clock.Now().After(session.ExpiresAt) {
+		if err := s.cleanupCheckoutSession(ctx, session, nil, false); err != nil {
+			return err
+		}
+		return ierr.NewError("checkout session expired").
+			WithHintf("session %s expired at %s and cannot be completed", sessionID, session.ExpiresAt).
+			Mark(ierr.ErrAlreadyExists)
+	}
+
 	// Fast-path guard: already in a terminal state — nothing to do.
 	if session.CheckoutStatus.IsTerminal() {
 		return ierr.NewError("checkout session already in terminal state").
@@ -495,7 +692,8 @@ func (s *checkoutSessionService) CompleteCheckoutSession(ctx context.Context, se
 	}
 
 	// Atomic claim: only one concurrent caller gets n > 0.
-	now := time.Now().UTC()
+	now := clock.Now()
+	ctx = activity.WithAction(ctx, sessionID, activity.CheckoutSessionCompleted)
 	claimed, err := s.CheckoutSessionRepo.MarkCompleted(ctx, sessionID, now, mergedResult)
 	if err != nil {
 		return err
@@ -512,8 +710,33 @@ func (s *checkoutSessionService) CompleteCheckoutSession(ctx context.Context, se
 	if mergedResult != nil {
 		session.ProviderResult = domainCheckout.ToJSONBCheckoutProviderResult(mergedResult)
 	}
+	metrics.RecordCounter(ctx, metrics.CheckoutSessions, 1, checkoutMetricLabels(session, types.CheckoutStatusCompleted)...)
 	s.publishCheckoutEvent(ctx, dto.ToCheckoutSessionResponse(session), types.WebhookEventCheckoutSessionCompleted)
 	return nil
+}
+
+func checkoutMetricLabels(session *domainCheckout.CheckoutSession, status types.CheckoutStatus) []metrics.Label {
+	return []metrics.Label{
+		metrics.L(metrics.KeyProvider, string(session.PaymentProvider)),
+		metrics.L(metrics.KeyAction, string(session.Action)),
+		metrics.L(metrics.KeyChargeMode, checkoutChargeMode(session)),
+		metrics.L(metrics.KeyStatus, string(status)),
+	}
+}
+
+// checkoutChargeMode relies on auto-charge responses carrying no URL while auth links always do.
+func checkoutChargeMode(session *domainCheckout.CheckoutSession) string {
+	result := session.ProviderResult.ToProviderResult()
+	switch {
+	case result == nil:
+		return chargeModeNone
+	case lo.FromPtr(session.PaymentProviderConfig.ToCheckoutPaymentProviderConfig()).CollectionMethod == types.CollectionMethodSendInvoice:
+		return chargeModePaymentLink
+	case lo.FromPtr(result.NextAction).URL != "":
+		return chargeModeAuthLink
+	default:
+		return chargeModeAutoCharge
+	}
 }
 
 func (s *checkoutSessionService) publishCheckoutEvent(ctx context.Context, session *dto.CheckoutSessionResponse, eventName types.WebhookEventName) {
@@ -532,7 +755,7 @@ func (s *checkoutSessionService) publishCheckoutEvent(ctx context.Context, sessi
 		TenantID:      types.GetTenantID(ctx),
 		EnvironmentID: types.GetEnvironmentID(ctx),
 		UserID:        types.GetUserID(ctx),
-		Timestamp:     time.Now().UTC(),
+		Timestamp:     clock.Now(),
 		Payload:       json.RawMessage(payload),
 		EntityType:    types.SystemEntityTypeCheckoutSession,
 		EntityID:      session.ID,
@@ -574,7 +797,11 @@ func (s *checkoutSessionService) createDraftSubscription(ctx context.Context, se
 		return nil, nil, err
 	}
 
-	invResp, skipped, err := buildCheckoutDraftInvoice(ctx, s.ServiceParams, subResp)
+	invResp, skipped, err := buildCheckoutDraftInvoice(ctx, s.ServiceParams, dto.CreateSubscriptionDraftInvoiceRequest{
+		SubscriptionID: subResp.ID,
+		PeriodStart:    subResp.CurrentPeriodStart,
+		PeriodEnd:      subResp.CurrentPeriodEnd,
+	})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -586,19 +813,16 @@ func (s *checkoutSessionService) createDraftSubscription(ctx context.Context, se
 	return subResp, invResp, nil
 }
 
+// buildCheckoutDraftInvoice creates, computes and taxes an in-advance checkout draft for req's period.
 func buildCheckoutDraftInvoice(
 	ctx context.Context,
 	params ServiceParams,
-	subResp *dto.SubscriptionResponse,
+	req dto.CreateSubscriptionDraftInvoiceRequest,
 ) (*dto.InvoiceResponse, bool, error) {
 	invSvc := NewInvoiceService(params)
-	invResp, err := invSvc.CreateDraftInvoiceForSubscription(ctx, dto.CreateSubscriptionDraftInvoiceRequest{
-		SubscriptionID: subResp.ID,
-		PeriodStart:    subResp.CurrentPeriodStart,
-		PeriodEnd:      subResp.CurrentPeriodEnd,
-		ReferencePoint: types.ReferencePointPeriodStart,
-		SourceType:     types.InvoiceSourceTypeCheckout,
-	})
+	req.ReferencePoint = types.ReferencePointPeriodStart
+	req.SourceType = types.InvoiceSourceTypeCheckout
+	invResp, err := invSvc.CreateDraftInvoiceForSubscription(ctx, req)
 	if err != nil {
 		return nil, false, err
 	}
@@ -632,11 +856,45 @@ func (s *checkoutSessionService) createCheckoutPayment(ctx context.Context, inv 
 			Mark(ierr.ErrValidation)
 	}
 
+	// Every checkout passes here: convert and re-tax before minting the payment, so the link is in
+	// the billing currency. A missing rate fails before anything is charged.
+	invSvc := NewInvoiceService(s.ServiceParams).(*invoiceService)
+	billing, err := invSvc.conversionTarget(ctx, inv)
+	if err != nil {
+		return nil, err
+	}
+	if billing != "" {
+		if !inv.AmountPaid.IsZero() {
+			return nil, ierr.NewError("partly paid invoice cannot be converted for checkout").
+				WithHintf("This invoice is already partly paid in %s and the customer is billed in %s.", inv.Currency, billing).
+				WithReportableDetails(map[string]any{"invoice_id": inv.ID, "amount_paid": inv.AmountPaid.String()}).
+				Mark(ierr.ErrValidation)
+		}
+		if err := s.DB.WithTx(ctx, func(txCtx context.Context) error {
+			return invSvc.convertToBillingCurrency(txCtx, inv)
+		}); err != nil {
+			return nil, err
+		}
+	}
+
 	paySvc := NewPaymentService(s.ServiceParams)
 	return paySvc.CreatePaymentForCheckout(ctx, &dto.CreateCheckoutPaymentRequest{
 		Invoice: inv,
 		Gateway: gateway,
 	})
+}
+
+// scopeCheckout puts the customer's billing entity in ctx and rejects a provider that entity has not connected.
+func (s *checkoutSessionService) scopeCheckout(ctx context.Context, customerID string, provider types.CheckoutPaymentProvider) (context.Context, error) {
+	ctx, err := NewBillingEntityService(s.ServiceParams).ScopeToCustomer(ctx, customerID)
+	if err != nil {
+		return ctx, err
+	}
+	gateway, ok := provider.ToPaymentGateway()
+	if !ok {
+		return ctx, nil
+	}
+	return ctx, requireProviderConnected(ctx, s.ServiceParams, types.SecretProvider(gateway))
 }
 
 // StartPayFirstCheckoutSession creates a checkout session on an existing DRAFT invoice,
@@ -669,28 +927,47 @@ func (s *checkoutSessionService) StartPayFirstCheckoutSession(
 	if err := s.CheckoutSessionRepo.Create(ctx, session); err != nil {
 		// Compute already debited prepaid credits; archiving alone would not return them.
 		s.voidCheckoutInvoiceIfPartiallyPaid(ctx, session, draftInvoiceID)
-		if delErr := s.InvoiceRepo.Delete(ctx, draftInvoiceID); delErr != nil {
+		if delErr := archiveDraftInvoice(ctx, s.ServiceParams, draftInvoiceID); delErr != nil {
 			s.Logger.Error(ctx, "failed to archive draft invoice after checkout session create failure",
 				"invoice_id", draftInvoiceID,
 				"error", delErr,
 				"original_err", err,
 			)
 		}
+
+		if params := req.Configuration.WalletTopupParams; params != nil && params.WalletTransactionID != "" {
+			walletSvc := NewWalletService(s.ServiceParams)
+			if failErr := walletSvc.FailPurchasedCreditTransaction(ctx, params.WalletTransactionID, err.Error()); failErr != nil {
+				s.Logger.Error(ctx, "failed to fail wallet top-up transaction after checkout session create failure",
+					"wallet_transaction_id", params.WalletTransactionID,
+					"error", failErr,
+					"original_err", err,
+				)
+			}
+		}
 		return nil, err
 	}
 
-	if err := s.fulfillCheckoutSession(ctx, session, req.DraftInvoice); err != nil {
-		if cleanupErr := s.cleanupCheckoutSession(ctx, session, err); cleanupErr != nil {
+	terminate := func(ctx context.Context, err error) error {
+		if _, cleanupErr := s.terminateCheckoutSession(ctx, session, err, false); cleanupErr != nil {
 			s.Logger.Error(ctx, "checkout cleanup failed after pay-first fulfillment error",
 				"session_id", session.ID,
 				"error", cleanupErr,
 				"original_err", err,
 			)
 		}
-		return nil, err
+		return err
+	}
+	ctx, err := s.scopeCheckout(ctx, req.CustomerID, session.PaymentProvider)
+	if err != nil {
+		return nil, terminate(ctx, err)
+	}
+	if err := s.fulfillCheckoutSession(ctx, session, req.DraftInvoice); err != nil {
+		return nil, terminate(ctx, err)
 	}
 
 	sessionResp := s.toPollableResponse(ctx, session, false)
+	metrics.RecordCounter(ctx, metrics.CheckoutSessions, 1, checkoutMetricLabels(session, types.CheckoutStatusInitiated)...)
 	s.publishCheckoutEvent(ctx, sessionResp, types.WebhookEventCheckoutSessionInitiated)
 	return sessionResp, nil
 }
@@ -708,13 +985,19 @@ func (s *checkoutSessionService) fulfillCheckoutSession(
 	}
 	session.CheckoutInvoiceID = &inv.ID
 	session.CheckoutPaymentID = &payResp.ID
+	if err := s.CheckoutSessionRepo.Update(ctx, session); err != nil {
+		return err
+	}
 
 	providerResult, err := s.callCheckoutProvider(ctx, session, payResp)
 	if err != nil {
+		if s.completedDuringProviderCall(ctx, session) {
+			return nil
+		}
 		return err
 	}
 	s.recordGatewayHandles(ctx, payResp.ID, providerResult)
 	session.ProviderResult = (*domainCheckout.JSONBCheckoutProviderResult)(providerResult)
 	session.CheckoutStatus = types.CheckoutStatusPending
-	return s.CheckoutSessionRepo.Update(ctx, session)
+	return s.savePendingSession(ctx, session)
 }

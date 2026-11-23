@@ -44,7 +44,11 @@ func (s *SubscriptionTimezoneTestSuite) SetupTest() {
 		DB:                         s.GetDB(),
 		TaxAssociationRepo:         s.GetStores().TaxAssociationRepo,
 		TaxRateRepo:                s.GetStores().TaxRateRepo,
+		TaxAppliedRepo:             s.GetStores().TaxAppliedRepo,
 		SubRepo:                    s.GetStores().SubscriptionRepo,
+		CommitmentRepo:             s.GetStores().CommitmentRepo,
+		BillingTermRepo:            s.GetStores().BillingTermRepo,
+		BillingInstalmentRepo:      s.GetStores().BillingInstalmentRepo,
 		SubscriptionLineItemRepo:   s.GetStores().SubscriptionLineItemRepo,
 		SubscriptionPhaseRepo:      s.GetStores().SubscriptionPhaseRepo,
 		SubScheduleRepo:            s.GetStores().SubscriptionScheduleRepo,
@@ -55,6 +59,7 @@ func (s *SubscriptionTimezoneTestSuite) SetupTest() {
 		MeterRepo:                  s.GetStores().MeterRepo,
 		CustomerRepo:               s.GetStores().CustomerRepo,
 		InvoiceRepo:                s.GetStores().InvoiceRepo,
+		HostedInvoiceTokenRepo:     s.GetStores().HostedInvoiceTokenRepo,
 		InvoiceLineItemRepo:        s.GetStores().InvoiceLineItemRepo,
 		EntitlementRepo:            s.GetStores().EntitlementRepo,
 		EnvironmentRepo:            s.GetStores().EnvironmentRepo,
@@ -78,6 +83,7 @@ func (s *SubscriptionTimezoneTestSuite) SetupTest() {
 		ProrationCalculator:        s.GetCalculator(),
 		IntegrationFactory:         s.GetIntegrationFactory(),
 		PlanPriceSyncRepo:          s.GetStores().PlanPriceSyncRepo,
+		AddonPriceSyncRepo:         s.GetStores().AddonPriceSyncRepo,
 	}
 
 	s.subscriptionSvc = NewSubscriptionService(params)

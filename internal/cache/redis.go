@@ -93,7 +93,7 @@ func (c *redisCacheImpl) GetRedisKey(key string) string {
 }
 
 func (c *redisCacheImpl) IsEnabled() bool {
-	return c.config.Cache.Enabled && c.config.Cache.Redis.Enabled
+	return c != nil && c.config.Cache.Enabled && c.config.Cache.Redis.Enabled
 }
 
 func (c *redisCacheImpl) IsRedisCache() bool {
@@ -125,6 +125,35 @@ func (c *redisCacheImpl) Get(ctx context.Context, key string) (_ interface{}, fo
 	}
 
 	return value, true
+}
+
+// GetBulk retrieves many keys with one MGET; nil results are reported missing.
+func (c *redisCacheImpl) GetBulk(ctx context.Context, keys []string) (map[string]interface{}, []string) {
+	if c == nil || !c.IsEnabled() || len(keys) == 0 {
+		return nil, keys
+	}
+
+	redisKeys := make([]string, len(keys))
+	for i, k := range keys {
+		redisKeys[i] = c.GetRedisKey(k)
+	}
+
+	values, err := c.client.MGet(ctx, redisKeys...).Result()
+	if err != nil {
+		c.log.Error(ctx, "Redis MGET error", "key_count", len(keys), "error", err)
+		return nil, keys
+	}
+
+	found := make(map[string]interface{}, len(keys))
+	missing := make([]string, 0)
+	for i, v := range values {
+		if v == nil {
+			missing = append(missing, keys[i])
+			continue
+		}
+		found[keys[i]] = v
+	}
+	return found, missing
 }
 
 // Set adds a value to the cache with the specified expiration

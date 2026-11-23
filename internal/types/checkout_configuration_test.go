@@ -1,11 +1,14 @@
 package types
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
 	cockroachErrors "github.com/cockroachdb/errors"
 	ierr "github.com/flexprice/flexprice/internal/errors"
+	"github.com/samber/lo"
+	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -20,11 +23,29 @@ func validAddAddonRef() AddAddonRef {
 	}
 }
 
+func validRemoveAddonRef() RemoveAddonRef {
+	return RemoveAddonRef{
+		AssociationID:     "addon_assoc_456",
+		Reason:            "downgrade",
+		ProrationBehavior: ProrationBehaviorCreateProrations,
+		EffectiveDate:     time.Date(2026, 8, 5, 0, 0, 0, 0, time.UTC),
+	}
+}
+
 func TestAddAddonParams_Validate(t *testing.T) {
 	withRef := func(mutate func(*AddAddonRef)) *AddAddonParams {
 		ref := validAddAddonRef()
 		mutate(&ref)
 		return &AddAddonParams{SubscriptionID: "subs_123", Addons: []AddAddonRef{ref}}
+	}
+	withRemove := func(mutate func(*RemoveAddonRef)) *AddAddonParams {
+		ref := validRemoveAddonRef()
+		mutate(&ref)
+		return &AddAddonParams{
+			SubscriptionID: "subs_123",
+			Addons:         []AddAddonRef{validAddAddonRef()},
+			Removes:        []RemoveAddonRef{ref},
+		}
 	}
 
 	tests := []struct {
@@ -104,6 +125,76 @@ func TestAddAddonParams_Validate(t *testing.T) {
 			name:    "zero start date",
 			params:  withRef(func(r *AddAddonRef) { r.StartDate = time.Time{} }),
 			wantErr: true,
+		},
+		{
+			name:    "nil removes stays valid",
+			params:  &AddAddonParams{SubscriptionID: "subs_123", Addons: []AddAddonRef{validAddAddonRef()}, Removes: nil},
+			wantErr: false,
+		},
+		{
+			name:    "valid add and remove",
+			params:  withRemove(func(*RemoveAddonRef) {}),
+			wantErr: false,
+		},
+		{
+			name:    "valid remove with unset proration behavior",
+			params:  withRemove(func(r *RemoveAddonRef) { r.ProrationBehavior = "" }),
+			wantErr: false,
+		},
+		{
+			name:    "valid remove with no reason",
+			params:  withRemove(func(r *RemoveAddonRef) { r.Reason = "" }),
+			wantErr: false,
+		},
+		{
+			// A pay-first session exists because the net is positive, which needs an add.
+			name: "removes without adds rejected",
+			params: &AddAddonParams{
+				SubscriptionID: "subs_123",
+				Removes:        []RemoveAddonRef{validRemoveAddonRef()},
+			},
+			wantErr: true,
+		},
+		{
+			name:    "remove with empty association id",
+			params:  withRemove(func(r *RemoveAddonRef) { r.AssociationID = "" }),
+			wantErr: true,
+		},
+		{
+			name:    "remove with invalid proration behavior",
+			params:  withRemove(func(r *RemoveAddonRef) { r.ProrationBehavior = "always" }),
+			wantErr: true,
+		},
+		{
+			// A zero date would replay as time.Now(), against a different window than the draft.
+			name:    "remove with zero effective date",
+			params:  withRemove(func(r *RemoveAddonRef) { r.EffectiveDate = time.Time{} }),
+			wantErr: true,
+		},
+		{
+			name: "duplicate remove association id rejected",
+			params: &AddAddonParams{
+				SubscriptionID: "subs_123",
+				Addons:         []AddAddonRef{validAddAddonRef()},
+				Removes:        []RemoveAddonRef{validRemoveAddonRef(), validRemoveAddonRef()},
+			},
+			wantErr: true,
+		},
+		{
+			name: "multiple distinct removes allowed",
+			params: &AddAddonParams{
+				SubscriptionID: "subs_123",
+				Addons:         []AddAddonRef{validAddAddonRef()},
+				Removes: []RemoveAddonRef{
+					validRemoveAddonRef(),
+					func() RemoveAddonRef {
+						r := validRemoveAddonRef()
+						r.AssociationID = "addon_assoc_789"
+						return r
+					}(),
+				},
+			},
+			wantErr: false,
 		},
 	}
 
@@ -208,4 +299,104 @@ func TestCheckoutProviderResultBuilder_NilHandling(t *testing.T) {
 
 	var b *CheckoutProviderResultBuilder
 	assert.Nil(t, b.Build())
+}
+
+// Sessions persisted before removes existed must still unmarshal and validate.
+func TestAddAddonParams_LegacyJSONRoundTrip(t *testing.T) {
+	legacy := `{"subscription_id":"subs_123","addons":[{"association_id":"addon_assoc_123","addon_id":"addon_123","cadence":"recurring","proration_behavior":"create_prorations","start_date":"2026-08-05T00:00:00Z"}]}`
+
+	var params AddAddonParams
+	require.NoError(t, json.Unmarshal([]byte(legacy), &params))
+	assert.Nil(t, params.Removes)
+	assert.NoError(t, params.Validate())
+
+	out, err := json.Marshal(&params)
+	require.NoError(t, err)
+	assert.NotContains(t, string(out), "removes")
+	assert.NotContains(t, string(out), "price_overrides")
+}
+
+func TestAddAddonParams_PriceOverridesJSONRoundTrip(t *testing.T) {
+	ref := validAddAddonRef()
+	ref.PriceOverrides = []AddonPriceOverrideRef{
+		{PriceID: "price_plan_1", OverridePriceID: "price_sub_1", Quantity: lo.ToPtr(decimal.NewFromInt(5))},
+		{PriceID: "price_plan_2", OverridePriceID: "price_sub_2"},
+	}
+	batch := &CheckoutConfiguration{AddAddonBatchParams: []*AddAddonParams{
+		{SubscriptionID: "subs_child", Addons: []AddAddonRef{ref}},
+	}}
+
+	out, err := json.Marshal(batch)
+	require.NoError(t, err)
+
+	var decoded CheckoutConfiguration
+	require.NoError(t, json.Unmarshal(out, &decoded))
+	require.NoError(t, decoded.Validate(CheckoutActionAddAddon))
+
+	got := decoded.AddAddonEntries()[0].Addons[0].PriceOverrides
+	require.Len(t, got, 2)
+	assert.Equal(t, "price_sub_1", got[0].OverridePriceID)
+	assert.True(t, got[0].Quantity.Equal(decimal.NewFromInt(5)))
+	assert.Nil(t, got[1].Quantity)
+}
+
+func TestCheckoutConfiguration_ValidateAddAddonBatch(t *testing.T) {
+	addOnly := &AddAddonParams{SubscriptionID: "subs_child", Addons: []AddAddonRef{validAddAddonRef()}}
+	removeOnly := &AddAddonParams{SubscriptionID: "subs_parent", Removes: []RemoveAddonRef{validRemoveAddonRef()}}
+
+	tests := []struct {
+		name    string
+		cfg     CheckoutConfiguration
+		wantErr bool
+	}{
+		{"single entry", CheckoutConfiguration{AddAddonParams: addOnly}, false},
+		{"batch with a removal-only entry", CheckoutConfiguration{AddAddonBatchParams: []*AddAddonParams{removeOnly, addOnly}}, false},
+		{"batch with no addon", CheckoutConfiguration{AddAddonBatchParams: []*AddAddonParams{removeOnly}}, true},
+		{"batch entry without subscription id", CheckoutConfiguration{AddAddonBatchParams: []*AddAddonParams{{Addons: []AddAddonRef{validAddAddonRef()}}}}, true},
+		{"nil batch entry", CheckoutConfiguration{AddAddonBatchParams: []*AddAddonParams{nil, addOnly}}, true},
+		{"single and batch together", CheckoutConfiguration{AddAddonParams: addOnly, AddAddonBatchParams: []*AddAddonParams{addOnly}}, true},
+		{"neither", CheckoutConfiguration{}, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cfg.Validate(CheckoutActionAddAddon)
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.True(t, ierr.IsValidation(err))
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestCheckoutPaymentProvider_LinkExpiry(t *testing.T) {
+	cases := []struct {
+		name        string
+		provider    CheckoutPaymentProvider
+		linkExpiry  *Duration
+		wantErr     bool
+		wantSession time.Duration
+	}{
+		{"stripe default", CheckoutPaymentProviderStripe, nil, false, 40 * time.Minute},
+		{"stripe 2 hours", CheckoutPaymentProviderStripe, &Duration{Value: 2, Unit: DurationUnitHour}, false, 2*time.Hour + 5*time.Minute},
+		{"stripe 24 hours", CheckoutPaymentProviderStripe, &Duration{Value: 24, Unit: DurationUnitHour}, false, 24*time.Hour + 5*time.Minute},
+		{"stripe under floor", CheckoutPaymentProviderStripe, &Duration{Value: 30, Unit: DurationUnitMinute}, true, 0},
+		{"chargebee 1 hour", CheckoutPaymentProviderChargebee, &Duration{Value: 1, Unit: DurationUnitHour}, false, time.Hour + 5*time.Minute},
+		{"chargebee under floor", CheckoutPaymentProviderChargebee, &Duration{Value: 10, Unit: DurationUnitMinute}, true, 0},
+		{"chargebee default", CheckoutPaymentProviderChargebee, nil, false, 30 * time.Minute},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &CheckoutPaymentProviderConfig{LinkExpiry: tc.linkExpiry}
+			err := tc.provider.ValidateLinkExpiry(cfg)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.wantSession, tc.provider.ResolveSessionExpiry(cfg))
+		})
+	}
 }

@@ -2,15 +2,20 @@ package service
 
 import (
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/flexprice/flexprice/internal/api/dto"
+	"github.com/flexprice/flexprice/internal/domain/billingterm"
 	domainCheckout "github.com/flexprice/flexprice/internal/domain/checkout"
+	"github.com/flexprice/flexprice/internal/domain/commitment"
 	"github.com/flexprice/flexprice/internal/domain/customer"
+	"github.com/flexprice/flexprice/internal/domain/fxrate"
 	"github.com/flexprice/flexprice/internal/domain/invoice"
 	"github.com/flexprice/flexprice/internal/domain/plan"
 	"github.com/flexprice/flexprice/internal/domain/price"
 	"github.com/flexprice/flexprice/internal/domain/subscription"
+	"github.com/flexprice/flexprice/internal/domain/wallet"
 	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/testutil"
 	"github.com/flexprice/flexprice/internal/types"
@@ -139,6 +144,32 @@ func (s *SubscriptionServiceSuite) TestCreateSubscription_WithoutCheckoutIsUncha
 	})
 	s.Require().NoError(err)
 	s.Empty(sessions)
+}
+
+// A delegated subscription checks the invoicing customer's billing currency, not the subscriber's.
+func (s *SubscriptionServiceSuite) TestCreateSubscription_DelegatedInvoicingCustomerBillingCurrencyIsChecked() {
+	ctx := s.GetContext()
+	s.seedFixedPricePlan("plan_delegated_fx", decimal.NewFromInt(50), 0)
+
+	payer := &customer.Customer{
+		ID:              "cust_payer_inr",
+		ExternalID:      "ext_payer_inr",
+		Name:            "Payer billed in INR",
+		BillingCurrency: lo.ToPtr("inr"),
+		EnvironmentID:   types.GetEnvironmentID(ctx),
+		BaseModel:       types.GetDefaultBaseModel(ctx),
+	}
+	s.Require().NoError(s.GetStores().CustomerRepo.Create(ctx, payer))
+
+	req := s.checkoutCreateRequest("plan_delegated_fx")
+	req.Checkout = nil
+	req.Inheritance = &dto.SubscriptionInheritanceConfig{InvoicingCustomerExternalID: lo.ToPtr(payer.ExternalID)}
+
+	_, err := s.service.CreateSubscription(ctx, req)
+
+	s.Require().Error(err, "the subscriber has no billing currency, but the invoicing customer is billed in INR with no usd→inr rate")
+	s.True(ierr.IsValidation(err), "expected a validation error naming the pair, got %v", err)
+	s.Contains(err.Error(), "usd", "error must name the pair")
 }
 
 // ─────────────────────────────────────────────
@@ -332,6 +363,63 @@ func (s *SubscriptionServiceSuite) TestCreateSubscriptionWithCheckout_SessionCre
 	}
 }
 
+// An abandoned checkout must not leave inline commitments published, and their keys must be reusable.
+func (s *SubscriptionServiceSuite) TestCreateSubscriptionWithCheckout_SessionFailureArchivesInlineCommitments() {
+	ctx := s.GetContext()
+	s.seedFixedPricePlan("plan_checkout_commitment", decimal.NewFromInt(50), 0)
+	usagePrice := &price.Price{
+		ID:                 "price_checkout_commitment_usage",
+		Amount:             decimal.RequireFromString("0.05"),
+		Currency:           "usd",
+		EntityType:         types.PRICE_ENTITY_TYPE_PLAN,
+		EntityID:           "plan_checkout_commitment",
+		Type:               types.PRICE_TYPE_USAGE,
+		MeterID:            s.testData.meters.apiCalls.ID,
+		BillingCadence:     types.BILLING_CADENCE_RECURRING,
+		BillingPeriod:      types.BILLING_PERIOD_MONTHLY,
+		BillingPeriodCount: 1,
+		BillingModel:       types.BILLING_MODEL_FLAT_FEE,
+		InvoiceCadence:     types.InvoiceCadenceArrear,
+		BaseModel:          types.GetDefaultBaseModel(ctx),
+	}
+	s.Require().NoError(s.GetStores().PriceRepo.Create(ctx, usagePrice))
+
+	idempKey := "create-subscription-commitment-idemp-key"
+	s.seedCollidingCheckoutSession(idempKey)
+
+	start := s.testData.now.Truncate(time.Second)
+	req := s.checkoutCreateRequest("plan_checkout_commitment")
+	req.Checkout.IdempotencyKey = &idempKey
+	req.StartDate = lo.ToPtr(start)
+	req.Commitments = []dto.CreateCommitmentRequest{{
+		IdempotencyKey: lo.ToPtr("contract-checkout"),
+		Name:           "API floor",
+		Scope:          dto.CommitmentScopeInput{EntityType: types.CommitmentScopePrice, EntityID: usagePrice.ID},
+		Type:           types.COMMITMENT_TYPE_AMOUNT,
+		Value:          decimal.NewFromInt(100),
+		Measurement:    types.CommitmentMeasurementBillingPeriod,
+		StartDate:      start,
+		EndDate:        lo.ToPtr(start.AddDate(1, 0, 0)),
+	}}
+	_, err := s.service.CreateSubscription(ctx, req)
+	s.Require().Error(err)
+	s.Equal(types.StatusArchived, s.subscriptionForPlan("plan_checkout_commitment").Status)
+
+	published, err := s.GetStores().CommitmentRepo.List(ctx, commitment.NewNoLimitFilter())
+	s.Require().NoError(err)
+	s.Empty(published, "the abandoned subscription's commitments must be archived with it")
+
+	retry := s.inlineCommitmentRequest()
+	retry.Commitments[0].IdempotencyKey = lo.ToPtr("contract-checkout")
+	resp, err := s.service.CreateSubscription(ctx, retry)
+	s.Require().NoError(err, "the archived commitment must release its idempotency key")
+
+	published, err = s.GetStores().CommitmentRepo.List(ctx, commitment.NewNoLimitFilter())
+	s.Require().NoError(err)
+	s.Require().Len(published, 1)
+	s.Equal(resp.ID, published[0].SubscriptionID)
+}
+
 // ─────────────────────────────────────────────
 // Completion
 // ─────────────────────────────────────────────
@@ -353,7 +441,11 @@ func (s *SubscriptionServiceSuite) seedPayFirstSubscriptionCheckout(
 	subResp, err := subService.CreateSubscription(ctx, req)
 	s.Require().NoError(err)
 
-	draft, skipped, err := buildCheckoutDraftInvoice(ctx, subService.ServiceParams, subResp)
+	draft, skipped, err := buildCheckoutDraftInvoice(ctx, subService.ServiceParams, dto.CreateSubscriptionDraftInvoiceRequest{
+		SubscriptionID: subResp.ID,
+		PeriodStart:    subResp.CurrentPeriodStart,
+		PeriodEnd:      subResp.CurrentPeriodEnd,
+	})
 	s.Require().NoError(err)
 	s.Require().False(skipped, "the seeded plan must produce a real charge")
 	s.Require().True(draft.AmountDue.GreaterThan(decimal.Zero))
@@ -380,6 +472,71 @@ func (s *SubscriptionServiceSuite) seedPayFirstSubscriptionCheckout(
 	s.Require().NoError(s.GetStores().CheckoutSessionRepo.Create(ctx, session))
 
 	return session, subResp.Subscription, draft
+}
+
+// Cross-currency checkout end to end: completion finalizes without reconverting or applying credits.
+func (s *SubscriptionServiceSuite) TestCompleteSubscriptionCheckout_CrossCurrency_LinkAmountIsFinal() {
+	ctx := s.GetContext()
+	subService := s.service.(*subscriptionService)
+
+	cust := s.testData.customer
+	cust.BillingCurrency = lo.ToPtr("inr")
+	s.Require().NoError(s.GetStores().CustomerRepo.Update(ctx, cust))
+	s.Require().NoError(s.GetStores().FXRateRepo.Create(ctx, &fxrate.FXRate{
+		ID:            types.GenerateUUIDWithPrefix(types.UUID_PREFIX_FX_RATE),
+		Scope:         types.FXRateScopeTenant,
+		ScopeID:       types.FXRateScopeIDTenant,
+		FromCurrency:  "usd",
+		ToCurrency:    "inr",
+		Rate:          decimal.RequireFromString("83"),
+		EnvironmentID: types.GetEnvironmentID(ctx),
+		BaseModel:     types.GetDefaultBaseModel(ctx),
+	}))
+	// An INR prepaid wallet: without the finalize guard it would be drawn down on the converted draft.
+	inrWallet := &wallet.Wallet{
+		ID:             "wallet_inr_xcur",
+		CustomerID:     cust.ID,
+		Currency:       "inr",
+		Balance:        decimal.NewFromInt(100000),
+		CreditBalance:  decimal.NewFromInt(100000),
+		WalletStatus:   types.WalletStatusActive,
+		Name:           "INR wallet",
+		ConversionRate: decimal.NewFromInt(1),
+		WalletType:     types.WalletTypePrePaid,
+		EnvironmentID:  types.GetEnvironmentID(ctx),
+		BaseModel:      types.GetDefaultBaseModel(ctx),
+	}
+	s.Require().NoError(s.GetStores().WalletRepo.CreateWallet(ctx, inrWallet))
+
+	s.seedFixedPricePlan("plan_xcur_payfirst", decimal.NewFromInt(50), 0)
+	session, draftSub, draft := s.seedPayFirstSubscriptionCheckout("plan_xcur_payfirst")
+
+	// Session creation: converted draft, payment in INR.
+	s.Equal("inr", draft.Currency, "the checkout draft must be converted at session creation")
+	s.Require().NotNil(draft.FxConversion)
+	s.True(decimal.RequireFromString("4150").Equal(draft.AmountDue), "50 usd × 83, got %s", draft.AmountDue)
+	payment, err := s.GetStores().PaymentRepo.Get(ctx, lo.FromPtr(session.CheckoutPaymentID))
+	s.Require().NoError(err)
+	s.Equal("inr", payment.Currency, "the payment must inherit the billing currency")
+	s.True(decimal.RequireFromString("4150").Equal(payment.Amount), "payment amount got %s", payment.Amount)
+
+	checkoutSvc := &checkoutSessionService{ServiceParams: subService.ServiceParams}
+	s.Require().NoError(checkoutSvc.CompleteCheckoutSession(ctx, session.ID, &types.CheckoutProviderResult{
+		ProviderPaymentIntentID: "pay_xcur_001",
+	}))
+
+	final, err := s.GetStores().InvoiceRepo.Get(ctx, draft.ID)
+	s.Require().NoError(err)
+	s.Equal(types.InvoiceStatusFinalized, final.InvoiceStatus)
+	s.Equal("inr", final.Currency)
+	s.True(decimal.RequireFromString("83").Equal(final.FxConversion.Rate), "the frozen rate must not change")
+	s.True(decimal.RequireFromString("4150").Equal(final.AmountDue), "amount_due must equal the paid link amount, got %s", final.AmountDue)
+	s.True(final.TotalPrepaidCreditsApplied.IsZero(), "no credits may be applied after conversion, got %s", final.TotalPrepaidCreditsApplied)
+
+	w, err := s.GetStores().WalletRepo.GetWalletByID(ctx, inrWallet.ID)
+	s.Require().NoError(err)
+	s.True(decimal.NewFromInt(100000).Equal(w.Balance), "the INR wallet must be untouched, got %s", w.Balance)
+	_ = draftSub
 }
 
 func (s *SubscriptionServiceSuite) webhookEventNames() []types.WebhookEventName {
@@ -510,7 +667,7 @@ func (s *SubscriptionServiceSuite) TestCreateSubscriptionCheckout_CleanupArchive
 	session, draftSub, draft := s.seedPayFirstSubscriptionCheckout("plan_cleanup_draft")
 
 	checkoutSvc := &checkoutSessionService{ServiceParams: subService.ServiceParams}
-	s.Require().NoError(checkoutSvc.cleanupCheckoutSession(ctx, session, nil))
+	s.Require().NoError(checkoutSvc.cleanupCheckoutSession(ctx, session, nil, false))
 
 	archived, err := s.GetStores().SubscriptionRepo.Get(ctx, draftSub.ID)
 	s.Require().NoError(err)
@@ -546,7 +703,7 @@ func (s *SubscriptionServiceSuite) TestCreateSubscriptionCheckout_CleanupWithDup
 	s.Require().NoError(s.GetStores().CheckoutSessionRepo.Update(ctx, session))
 
 	checkoutSvc := &checkoutSessionService{ServiceParams: subService.ServiceParams}
-	s.Require().NoError(checkoutSvc.cleanupCheckoutSession(ctx, session, nil))
+	s.Require().NoError(checkoutSvc.cleanupCheckoutSession(ctx, session, nil, false))
 
 	archived, err := s.GetStores().SubscriptionRepo.Get(ctx, draftSub.ID)
 	s.Require().NoError(err)
@@ -589,7 +746,7 @@ func (s *SubscriptionServiceSuite) TestCreateSubscriptionCheckout_CleanupLegacyR
 	s.Require().NoError(s.GetStores().CheckoutSessionRepo.Update(ctx, session))
 
 	checkoutSvc := &checkoutSessionService{ServiceParams: subService.ServiceParams}
-	s.Require().NoError(checkoutSvc.cleanupCheckoutSession(ctx, session, nil))
+	s.Require().NoError(checkoutSvc.cleanupCheckoutSession(ctx, session, nil, false))
 
 	archived, err := s.GetStores().SubscriptionRepo.Get(ctx, draftSub.ID)
 	s.Require().NoError(err)
@@ -699,7 +856,7 @@ func (s *SubscriptionServiceSuite) TestCreateSubscriptionCheckout_CleanupSkipsAc
 	s.Require().NoError(s.GetStores().SubscriptionRepo.Update(ctx, draftSub))
 
 	checkoutSvc := &checkoutSessionService{ServiceParams: subService.ServiceParams}
-	s.Require().NoError(checkoutSvc.cleanupCheckoutSession(ctx, session, nil))
+	s.Require().NoError(checkoutSvc.cleanupCheckoutSession(ctx, session, nil, false))
 
 	live, err := s.GetStores().SubscriptionRepo.Get(ctx, draftSub.ID)
 	s.Require().NoError(err)
@@ -724,7 +881,7 @@ func (s *SubscriptionServiceSuite) TestCreateSubscriptionCheckout_CleanupArchive
 	s.Require().NotNil(s.firstApplicationFor(grantID))
 
 	checkoutSvc := &checkoutSessionService{ServiceParams: subService.ServiceParams}
-	s.Require().NoError(checkoutSvc.cleanupCheckoutSession(ctx, session, nil))
+	s.Require().NoError(checkoutSvc.cleanupCheckoutSession(ctx, session, nil, false))
 
 	published := types.NewNoLimitQueryFilter()
 	published.Status = lo.ToPtr(types.StatusPublished)
@@ -790,7 +947,11 @@ func (s *SubscriptionServiceSuite) seedPayFirstSubscriptionCheckoutWithGrants(
 	subResp, err := subService.CreateSubscription(ctx, req)
 	s.Require().NoError(err)
 
-	draft, skipped, err := buildCheckoutDraftInvoice(ctx, subService.ServiceParams, subResp)
+	draft, skipped, err := buildCheckoutDraftInvoice(ctx, subService.ServiceParams, dto.CreateSubscriptionDraftInvoiceRequest{
+		SubscriptionID: subResp.ID,
+		PeriodStart:    subResp.CurrentPeriodStart,
+		PeriodEnd:      subResp.CurrentPeriodEnd,
+	})
 	s.Require().NoError(err)
 	s.Require().False(skipped)
 
@@ -1066,6 +1227,56 @@ func (s *SubscriptionServiceSuite) TestArchiveDraftCheckoutSubscription_Cascades
 		s.Equal(types.StatusArchived, archived.Status,
 			"an abandoned checkout must not leave the group behind (%s)", id)
 	}
+}
+
+// Archiving an abandoned checkout's subscription cancels its commitments' scheduled instalments and archives their
+// terms, so the separate-invoice run has nothing left to bill for it.
+func (s *SubscriptionServiceSuite) TestArchiveDraftCheckoutSubscription_CancelsBillingTerms() {
+	ctx := s.GetContext()
+	subService := s.service.(*subscriptionService)
+
+	req := s.inlineCommitmentRequest()
+	req.SubscriptionStatus = types.SubscriptionStatusDraft
+	committed := &req.Commitments[0]
+	committed.Type, committed.Value, committed.CommittedPrice = types.COMMITMENT_TYPE_AMOUNT, decimal.NewFromInt(100), nil
+	committed.Binding = lo.ToPtr(true)
+	committed.CollectionMethod = lo.ToPtr(types.CommitmentCollectionBillingTerms)
+	committed.InstalmentInvoicing = lo.ToPtr(types.InstalmentDeliverySeparateInvoice)
+	committed.BillingTerms = upfrontPlusRemainder()
+
+	resp, err := s.service.CreateSubscription(ctx, req)
+	s.Require().NoError(err)
+	s.Require().Equal(types.SubscriptionStatusDraft, resp.SubscriptionStatus)
+
+	commitments, err := s.GetStores().CommitmentRepo.List(ctx, commitment.NewNoLimitFilter())
+	s.Require().NoError(err)
+	s.Require().Len(commitments, 1)
+	owner := commitments[0].ID
+
+	ownedBy := &billingterm.InstalmentFilter{OwnerType: types.BillingTermOwnerCommitment, OwnerIDs: []string{owner}}
+	scheduled, err := s.GetStores().BillingInstalmentRepo.List(ctx, ownedBy)
+	s.Require().NoError(err)
+	s.Require().NotEmpty(scheduled)
+
+	publisher := s.GetWebhookPublisher().(*testutil.InMemoryWebhookPublisher)
+	publisher.Reset()
+	s.Require().NoError(subService.archiveDraftCheckoutSubscription(ctx, resp.ID))
+
+	instalments, err := s.GetStores().BillingInstalmentRepo.List(ctx, ownedBy)
+	s.Require().NoError(err)
+	s.Len(instalments, len(scheduled))
+	for _, inst := range instalments {
+		s.Equal(types.InstalmentStatusCancelled, inst.InstalmentStatus, inst.InvoiceLabel)
+	}
+
+	terms, err := s.GetStores().BillingTermRepo.List(ctx, types.BillingTermOwnerCommitment, owner)
+	s.Require().NoError(err)
+	s.Empty(terms, "the archived commitment's terms are archived with it")
+
+	cancelled := lo.FilterMap(publisher.Events(), func(event *types.WebhookEvent, _ int) (string, bool) {
+		return event.EntityID, event.EventName == types.WebhookEventBillingInstalmentCancelled
+	})
+	s.ElementsMatch(lo.Map(scheduled, func(inst *billingterm.Instalment, _ int) string { return inst.ID }), cancelled)
 }
 
 // The cascade must stay inert for the standalone subscriptions every existing gated create produces.
@@ -1488,4 +1699,98 @@ func (s *SubscriptionServiceSuite) TestCreateSubscription_LineItemGroupingEndToE
 			}
 		})
 	}
+}
+
+// A plan price already scheduled to end gives the new line item that end date, so it does not
+// stay live next to the price that replaces it. A subscription or phase ending earlier still wins,
+// and a price that has ended before the line item would start gets no line item.
+func (s *SubscriptionServiceSuite) TestCreateSubscription_LineItemInheritsPriceEndDate() {
+	ctx := s.GetContext()
+	planID := "plan_price_end_date"
+	s.seedFixedPricePlan(planID, decimal.NewFromInt(10), 0)
+
+	cutover := time.Now().UTC().AddDate(0, 0, 7).Truncate(time.Second)
+	endingPrice, err := s.GetStores().PriceRepo.Get(ctx, "price_"+planID)
+	s.Require().NoError(err)
+	endingPrice.EndDate = &cutover
+	s.Require().NoError(s.GetStores().PriceRepo.Update(ctx, endingPrice, true))
+
+	s.NoError(s.GetStores().PriceRepo.Create(ctx, &price.Price{
+		ID:                 "price_" + planID + "_next",
+		Amount:             decimal.NewFromInt(20),
+		Currency:           "usd",
+		EntityType:         types.PRICE_ENTITY_TYPE_PLAN,
+		EntityID:           planID,
+		Type:               types.PRICE_TYPE_FIXED,
+		BillingCadence:     types.BILLING_CADENCE_RECURRING,
+		BillingPeriod:      types.BILLING_PERIOD_MONTHLY,
+		BillingPeriodCount: 1,
+		BillingModel:       types.BILLING_MODEL_FLAT_FEE,
+		InvoiceCadence:     types.InvoiceCadenceAdvance,
+		StartDate:          &cutover,
+		BaseModel:          types.GetDefaultBaseModel(ctx),
+	}))
+
+	lineItemsFor := func(edit func(req *dto.CreateSubscriptionRequest)) []*subscription.SubscriptionLineItem {
+		req := s.checkoutCreateRequest(planID)
+		req.Checkout = nil
+		edit(&req)
+		resp, err := s.service.CreateSubscription(ctx, req)
+		s.Require().NoError(err)
+		items, err := s.GetStores().SubscriptionLineItemRepo.ListBySubscription(ctx, resp.Subscription)
+		s.Require().NoError(err)
+		sort.Slice(items, func(i, j int) bool { return items[i].StartDate.Before(items[j].StartDate) })
+		return items
+	}
+	forPrice := func(items []*subscription.SubscriptionLineItem, priceID string) []*subscription.SubscriptionLineItem {
+		return lo.Filter(items, func(li *subscription.SubscriptionLineItem, _ int) bool { return li.PriceID == priceID })
+	}
+	endingPriceID, nextPriceID := "price_"+planID, "price_"+planID+"_next"
+	now := time.Now().UTC().Truncate(time.Second)
+
+	s.Run("price ending after the subscription starts ends the line item at the cutover", func() {
+		items := lineItemsFor(func(req *dto.CreateSubscriptionRequest) {})
+		ending, next := forPrice(items, endingPriceID), forPrice(items, nextPriceID)
+		s.Require().Len(ending, 1)
+		s.Require().Len(next, 1)
+		s.True(ending[0].EndDate.Equal(cutover), "the ending price's line item must end at the price's end date")
+		s.True(next[0].EndDate.IsZero(), "the replacement price's line item stays open")
+		s.True(next[0].StartDate.Equal(cutover), "the replacement price's line item starts at the cutover")
+	})
+
+	s.Run("subscription ending before the price keeps its own end date", func() {
+		subEnd := cutover.AddDate(0, 0, -2)
+		items := lineItemsFor(func(req *dto.CreateSubscriptionRequest) { req.EndDate = &subEnd })
+		ending := forPrice(items, endingPriceID)
+		s.Require().Len(ending, 1)
+		s.True(ending[0].EndDate.Equal(subEnd))
+	})
+
+	s.Run("subscription starting after the price ends gets no line item for it", func() {
+		subStart := cutover.AddDate(0, 0, 3)
+		items := lineItemsFor(func(req *dto.CreateSubscriptionRequest) { req.StartDate = &subStart })
+		s.Empty(forPrice(items, endingPriceID), "a price that ended before the line item would start must not be attached")
+		next := forPrice(items, nextPriceID)
+		s.Require().Len(next, 1)
+		s.True(next[0].StartDate.Equal(subStart))
+		s.True(next[0].EndDate.IsZero())
+	})
+
+	s.Run("later phases apply the price end date too", func() {
+		// P1 ends inside phase 1, phase 2 spans the cutover, phase 3 starts after it
+		phase2Start, phase3Start := cutover.AddDate(0, 0, -3), cutover.AddDate(0, 0, 3)
+		items := lineItemsFor(func(req *dto.CreateSubscriptionRequest) {
+			req.StartDate = &now
+			req.Phases = []dto.SubscriptionPhaseCreateRequest{
+				{StartDate: now, EndDate: &phase2Start},
+				{StartDate: phase2Start, EndDate: &phase3Start},
+				{StartDate: phase3Start},
+			}
+		})
+		ending := forPrice(items, endingPriceID)
+		s.Require().Len(ending, 2, "phase 3 starts after the price ends, so only phases 1 and 2 get a line item for it")
+		s.True(ending[0].EndDate.Equal(phase2Start), "phase 1 ends before the price, so it keeps the phase end")
+		s.True(ending[1].StartDate.Equal(phase2Start))
+		s.True(ending[1].EndDate.Equal(cutover), "phase 2 spans the cutover, so its line item ends at the price's end date")
+	})
 }

@@ -5,6 +5,11 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/flexprice/flexprice/internal/clock"
+
+	"github.com/samber/lo"
+	"github.com/shopspring/decimal"
+
 	"github.com/flexprice/flexprice/ent"
 	"github.com/flexprice/flexprice/ent/coupon"
 	"github.com/flexprice/flexprice/ent/couponassociation"
@@ -12,6 +17,7 @@ import (
 	"github.com/flexprice/flexprice/ent/subscription"
 	"github.com/flexprice/flexprice/ent/subscriptionlineitem"
 	"github.com/flexprice/flexprice/ent/subscriptionpause"
+	"github.com/flexprice/flexprice/internal/activity"
 	"github.com/flexprice/flexprice/internal/cache"
 	domainSub "github.com/flexprice/flexprice/internal/domain/subscription"
 	"github.com/flexprice/flexprice/internal/dsl"
@@ -19,8 +25,6 @@ import (
 	"github.com/flexprice/flexprice/internal/logger"
 	"github.com/flexprice/flexprice/internal/postgres"
 	"github.com/flexprice/flexprice/internal/types"
-	"github.com/samber/lo"
-	"github.com/shopspring/decimal"
 )
 
 type subscriptionRepository struct {
@@ -55,7 +59,7 @@ func (r *subscriptionRepository) Create(ctx context.Context, sub *domainSub.Subs
 		sub.EnvironmentID = types.GetEnvironmentID(ctx)
 	}
 
-	subscription, err := client.Subscription.Create().
+	create := client.Subscription.Create().
 		SetID(sub.ID).
 		SetTenantID(sub.TenantID).
 		SetLookupKey(sub.LookupKey).
@@ -98,8 +102,12 @@ func (r *subscriptionRepository) Create(ctx context.Context, sub *domainSub.Subs
 		SetNillableInvoicingCustomerID(sub.InvoicingCustomerID).
 		SetNillableParentSubscriptionID(sub.ParentSubscriptionID).
 		SetNillablePaymentTerms(sub.PaymentTerms).
-		SetSyncedPriceSequence(sub.SyncedPriceSequence).
-		Save(ctx)
+		SetSyncedPriceSequence(sub.SyncedPriceSequence)
+	// SetSettings(nil) would store JSON null, so leave the column NULL when there are no overrides.
+	if sub.Settings != nil {
+		create.SetSettings(sub.Settings)
+	}
+	subscription, err := create.Save(ctx)
 
 	if err != nil {
 		SetSpanError(span, err)
@@ -119,7 +127,6 @@ func (r *subscriptionRepository) Get(ctx context.Context, id string) (*domainSub
 	})
 	defer FinishSpan(span)
 
-	// Try to get from cache first
 	if cachedSub := r.GetCache(ctx, id); cachedSub != nil {
 		return cachedSub, nil
 	}
@@ -152,6 +159,30 @@ func (r *subscriptionRepository) Get(ctx context.Context, id string) (*domainSub
 	subData := domainSub.GetSubscriptionFromEnt(sub)
 	r.SetCache(ctx, subData)
 	return subData, nil
+}
+
+func (r *subscriptionRepository) GetTimezone(ctx context.Context, id string) (string, error) {
+	span := StartRepositorySpan(ctx, "subscription", "get_timezone", map[string]interface{}{"subscription_id": id})
+	defer FinishSpan(span)
+
+	sub, err := r.client.Reader(ctx).Subscription.Query().
+		Where(
+			subscription.ID(id),
+			subscription.TenantID(types.GetTenantID(ctx)),
+			subscription.EnvironmentID(types.GetEnvironmentID(ctx)),
+			subscription.Status(string(types.StatusPublished)),
+		).
+		Select(subscription.FieldTimezone).
+		Only(ctx)
+	if err != nil {
+		SetSpanError(span, err)
+		if ent.IsNotFound(err) {
+			return "", ierr.NewError("subscription not found").WithHint("Subscription not found").Mark(ierr.ErrNotFound)
+		}
+		return "", ierr.WithError(err).WithHint("Failed to get subscription timezone").Mark(ierr.ErrDatabase)
+	}
+	SetSpanSuccess(span)
+	return sub.Timezone, nil
 }
 
 // GetForUpdate row-locks the subscription and bypasses cache (cache can't hold a lock).
@@ -214,7 +245,7 @@ func (r *subscriptionRepository) GetForUpdate(ctx context.Context, id string) (*
 
 func (r *subscriptionRepository) Update(ctx context.Context, sub *domainSub.Subscription) error {
 	client := r.client.Writer(ctx)
-	now := time.Now().UTC()
+	now := clock.Now()
 
 	// Start a span for this repository operation
 	span := StartRepositorySpan(ctx, "subscription", "update", map[string]interface{}{
@@ -255,14 +286,34 @@ func (r *subscriptionRepository) Update(ctx context.Context, sub *domainSub.Subs
 		query.SetLineItemGrouping(sub.LineItemGrouping)
 	}
 
+	if sub.ProrationBehavior != "" {
+		query.SetProrationBehavior(sub.ProrationBehavior)
+	}
+
 	// Handle nullable payment_terms - explicitly clear if nil
 	if sub.PaymentTerms != nil {
 		query.SetPaymentTerms(*sub.PaymentTerms)
 	} else {
 		query.ClearPaymentTerms()
 	}
+	if sub.Settings != nil {
+		query.SetSettings(sub.Settings)
+	} else {
+		query.ClearSettings()
+	}
 
 	// Handle nullable date fields - explicitly clear if nil
+	if sub.TrialStart != nil {
+		query.SetTrialStart(*sub.TrialStart)
+	} else {
+		query.ClearTrialStart()
+	}
+	if sub.TrialEnd != nil {
+		query.SetTrialEnd(*sub.TrialEnd)
+	} else {
+		query.ClearTrialEnd()
+	}
+
 	if sub.CancelledAt != nil {
 		query.SetCancelledAt(*sub.CancelledAt)
 	} else {
@@ -294,7 +345,7 @@ func (r *subscriptionRepository) Update(ctx context.Context, sub *domainSub.Subs
 	}
 
 	// Execute update
-	_, err := query.Save(ctx)
+	_, err := query.SaveReturning(ctx)
 	if err != nil {
 		SetSpanError(span, err)
 		r.logger.Error(ctx, "failed to update subscription", "error", err, "subscription_id", sub.ID)
@@ -304,7 +355,7 @@ func (r *subscriptionRepository) Update(ctx context.Context, sub *domainSub.Subs
 	}
 
 	SetSpanSuccess(span)
-	r.DeleteCache(ctx, sub.ID)
+	r.invalidateCache(ctx, sub.ID)
 	return nil
 }
 
@@ -332,9 +383,9 @@ func (r *subscriptionRepository) UpdatePlan(ctx context.Context, id string, plan
 			subscription.EnvironmentID(types.GetEnvironmentID(ctx)),
 		).
 		SetPlanID(planID).
-		SetUpdatedAt(time.Now().UTC()).
+		SetUpdatedAt(clock.Now()).
 		SetUpdatedBy(types.GetUserID(ctx)).
-		Save(ctx)
+		SaveReturning(ctx)
 	if err != nil {
 		SetSpanError(span, err)
 		r.logger.Error(ctx, "failed to update subscription plan", "error", err, "subscription_id", id, "plan_id", planID)
@@ -342,7 +393,7 @@ func (r *subscriptionRepository) UpdatePlan(ctx context.Context, id string, plan
 			WithHint("Failed to change the subscription's plan").
 			Mark(ierr.ErrDatabase)
 	}
-	if affected == 0 {
+	if len(affected) == 0 {
 		return ierr.NewError("subscription not found").
 			WithHint("Subscription not found").
 			WithReportableDetails(map[string]any{"subscription_id": id}).
@@ -350,7 +401,7 @@ func (r *subscriptionRepository) UpdatePlan(ctx context.Context, id string, plan
 	}
 
 	SetSpanSuccess(span)
-	r.DeleteCache(ctx, id)
+	r.invalidateCache(ctx, id)
 	return nil
 }
 
@@ -363,6 +414,7 @@ func (r *subscriptionRepository) Delete(ctx context.Context, id string) error {
 	})
 	defer FinishSpan(span)
 
+	ctx = activity.WithAction(ctx, id, activity.SubscriptionArchived)
 	err := client.Subscription.UpdateOneID(id).
 		Where(
 			subscription.TenantID(types.GetTenantID(ctx)),
@@ -370,7 +422,7 @@ func (r *subscriptionRepository) Delete(ctx context.Context, id string) error {
 			subscription.EnvironmentID(types.GetEnvironmentID(ctx)),
 		).
 		SetStatus(string(types.StatusArchived)).
-		SetUpdatedAt(time.Now().UTC()).
+		SetUpdatedAt(clock.Now()).
 		SetUpdatedBy(types.GetUserID(ctx)).
 		Exec(ctx)
 
@@ -388,7 +440,7 @@ func (r *subscriptionRepository) Delete(ctx context.Context, id string) error {
 	}
 
 	SetSpanSuccess(span)
-	r.DeleteCache(ctx, id)
+	r.invalidateCache(ctx, id)
 	return nil
 }
 
@@ -867,6 +919,7 @@ func (r *subscriptionRepository) CreateWithLineItems(ctx context.Context, sub *d
 				SetQuantity(item.Quantity).
 				SetCurrency(item.Currency).
 				SetBillingPeriod(item.BillingPeriod).
+				SetBillingPeriodCount(max(item.BillingPeriodCount, 1)).
 				SetNillableStartDate(types.ToNillableTime(item.StartDate)).
 				SetNillableEndDate(types.ToNillableTime(item.EndDate)).
 				SetNillableSubscriptionPhaseID(item.SubscriptionPhaseID).
@@ -885,8 +938,8 @@ func (r *subscriptionRepository) CreateWithLineItems(ctx context.Context, sub *d
 				SetStatus(string(item.Status)).
 				SetCreatedBy(item.CreatedBy).
 				SetUpdatedBy(item.UpdatedBy).
-				SetCreatedAt(time.Now()).
-				SetUpdatedAt(time.Now())
+				SetCreatedAt(clock.Now()).
+				SetUpdatedAt(clock.Now())
 		}
 
 		// Insert in batches to stay within PostgreSQL's 65535 parameter limit.
@@ -1050,7 +1103,7 @@ func (r *subscriptionRepository) UpdatePause(ctx context.Context, pause *domainS
 	defer FinishSpan(span)
 
 	client := r.client.Writer(ctx)
-	now := time.Now().UTC()
+	now := clock.Now()
 
 	p, err := client.SubscriptionPause.Query().
 		Where(
@@ -1169,6 +1222,10 @@ func (r *subscriptionRepository) GetWithPauses(ctx context.Context, id string) (
 }
 
 func (r *subscriptionRepository) SetCache(ctx context.Context, sub *domainSub.Subscription) {
+	// Uncommitted rows must not become visible through the shared cache.
+	if r.client.TxFromContext(ctx) != nil {
+		return
+	}
 	span, ctx := cache.StartRedisCacheSpan(ctx, "subscription", "set", map[string]interface{}{
 		"subscription_id": sub.ID,
 	})
@@ -1204,6 +1261,15 @@ func (r *subscriptionRepository) DeleteCache(ctx context.Context, subID string) 
 
 	cacheKey := cache.GenerateKey(ctx, cache.PrefixSubscription, subID)
 	r.redisCache.Delete(ctx, cacheKey)
+}
+
+// invalidateCache drops the cached rows once the surrounding transaction commits.
+func (r *subscriptionRepository) invalidateCache(ctx context.Context, ids ...string) {
+	afterCommit(ctx, func() {
+		for _, id := range ids {
+			r.DeleteCache(ctx, id)
+		}
+	})
 }
 
 // ListByCustomerID retrieves all active subscriptions for a customer and includes line items
@@ -1311,4 +1377,157 @@ func (r *subscriptionRepository) GetSubscriptionsWithAutoInvoiceThreshold(ctx co
 	}
 
 	return result, nil
+}
+
+// ListEnvironmentsWithGatedActiveSubscriptions reads only idx_subscriptions_gated_active, so it stays cheap
+// however many subscriptions are not payment-gated.
+func (r *subscriptionRepository) ListEnvironmentsWithGatedActiveSubscriptions(ctx context.Context) ([]types.TenantEnvironment, error) {
+	span := StartRepositorySpan(ctx, "subscription", "list_environments_with_gated_active", nil)
+	defer FinishSpan(span)
+
+	var envs []types.TenantEnvironment
+	err := r.client.Reader(ctx).Subscription.Query().
+		Where(
+			subscription.Status(string(types.StatusPublished)),
+			subscription.SubscriptionStatusEQ(types.SubscriptionStatusActive),
+			subscription.PaymentBehaviorIn(types.IncompletePaymentBehaviors()...),
+		).
+		GroupBy(subscription.FieldTenantID, subscription.FieldEnvironmentID).
+		Scan(ctx, &envs)
+	if err != nil {
+		SetSpanError(span, err)
+		return nil, ierr.WithError(err).
+			WithHint("Failed to list environments with payment-gated subscriptions").
+			Mark(ierr.ErrDatabase)
+	}
+
+	SetSpanSuccess(span)
+	return envs, nil
+}
+
+// listEnvironmentsForAutoCancellationQuery finds environments where auto-cancellation is on at any level;
+// the customer and subscription branches read only the settings_override partial indexes.
+const listEnvironmentsForAutoCancellationQuery = `
+	SELECT tenant_id, environment_id FROM settings
+	WHERE key = 'subscription_config' AND status = 'published'
+		AND (value ->> 'auto_cancellation_enabled')::boolean
+	UNION
+	SELECT tenant_id, environment_id FROM subscriptions
+	WHERE settings IS NOT NULL AND status = 'published'
+		AND (settings -> 'subscription_config' ->> 'auto_cancellation_enabled')::boolean
+	UNION
+	SELECT tenant_id, environment_id FROM customers
+	WHERE settings IS NOT NULL AND status = 'published'
+		AND (settings -> 'subscription_config' ->> 'auto_cancellation_enabled')::boolean`
+
+func (r *subscriptionRepository) ListEnvironmentsForAutoCancellation(ctx context.Context) ([]types.TenantEnvironment, error) {
+	span := StartRepositorySpan(ctx, "subscription", "list_environments_for_auto_cancellation", nil)
+	defer FinishSpan(span)
+
+	rows, err := r.client.Reader(ctx).QueryContext(ctx, listEnvironmentsForAutoCancellationQuery)
+	if err != nil {
+		SetSpanError(span, err)
+		return nil, ierr.WithError(err).
+			WithHint("Failed to list environments for auto-cancellation").
+			Mark(ierr.ErrDatabase)
+	}
+	defer rows.Close()
+
+	var envs []types.TenantEnvironment
+	for rows.Next() {
+		var env types.TenantEnvironment
+		if err := rows.Scan(&env.TenantID, &env.EnvironmentID); err != nil {
+			SetSpanError(span, err)
+			return nil, ierr.WithError(err).
+				WithHint("Failed to read environment for auto-cancellation").
+				Mark(ierr.ErrDatabase)
+		}
+		envs = append(envs, env)
+	}
+	if err := rows.Err(); err != nil {
+		SetSpanError(span, err)
+		return nil, ierr.WithError(err).
+			WithHint("Failed to read environments for auto-cancellation").
+			Mark(ierr.ErrDatabase)
+	}
+
+	SetSpanSuccess(span)
+	return envs, nil
+}
+
+// markOverdueGatedIncompleteQuery is one UPDATE ... RETURNING, so the returned IDs are exactly the rows
+// changed. The subscription filter matches idx_subscriptions_gated_active; EXISTS re-checks the invoice at
+// write time, so an invoice paid mid-sweep never flips its subscription. $5 is the environment grace days,
+// overridden by the subscription's, then the customer's, settings.
+const markOverdueGatedIncompleteQuery = `
+	UPDATE subscriptions s
+	SET subscription_status = 'incomplete', updated_at = $3, updated_by = $4
+	WHERE s.tenant_id = $1
+		AND s.environment_id = $2
+		AND s.status = 'published'
+		AND s.subscription_status = 'active'
+		AND s.payment_behavior IN ('allow_incomplete', 'default_incomplete', 'error_if_incomplete')
+		AND EXISTS (
+			SELECT 1 FROM invoices i
+			WHERE i.tenant_id = s.tenant_id
+				AND i.environment_id = s.environment_id
+				AND i.subscription_id = s.id
+				AND i.status = 'published'
+				AND i.invoice_type = 'SUBSCRIPTION'
+				AND i.invoice_status = 'FINALIZED'
+				AND i.billing_reason = 'SUBSCRIPTION_CYCLE'
+				AND i.payment_status IN ('PENDING', 'FAILED')
+				AND i.amount_remaining > 0
+				AND i.due_date <= $3
+				AND i.due_date > $3 - make_interval(days => COALESCE(
+					(s.settings->'subscription_config'->>'grace_period_days')::int,
+					(SELECT (c.settings->'subscription_config'->>'grace_period_days')::int FROM customers c
+						WHERE c.tenant_id = s.tenant_id AND c.environment_id = s.environment_id AND c.id = s.customer_id),
+					$5::int)))
+	RETURNING s.id`
+
+func (r *subscriptionRepository) MarkOverdueGatedSubscriptionsIncomplete(ctx context.Context, asOf time.Time, graceDays int) ([]string, error) {
+	span := StartRepositorySpan(ctx, "subscription", "mark_overdue_gated_incomplete", map[string]interface{}{
+		"grace_days": graceDays,
+	})
+	defer FinishSpan(span)
+
+	asOf = asOf.UTC()
+	rows, err := r.client.Writer(ctx).QueryContext(ctx, markOverdueGatedIncompleteQuery,
+		types.GetTenantID(ctx),
+		types.GetEnvironmentID(ctx),
+		asOf,
+		types.GetUserID(ctx),
+		graceDays,
+	)
+	if err != nil {
+		SetSpanError(span, err)
+		return nil, ierr.WithError(err).
+			WithHint("Failed to mark overdue subscriptions incomplete").
+			Mark(ierr.ErrDatabase)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			SetSpanError(span, err)
+			return nil, ierr.WithError(err).
+				WithHint("Failed to read subscription marked incomplete").
+				Mark(ierr.ErrDatabase)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		SetSpanError(span, err)
+		return nil, ierr.WithError(err).
+			WithHint("Failed to read subscriptions marked incomplete").
+			Mark(ierr.ErrDatabase)
+	}
+
+	r.invalidateCache(ctx, ids...)
+
+	SetSpanSuccess(span)
+	return ids, nil
 }

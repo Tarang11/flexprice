@@ -28,10 +28,12 @@ type Payment struct {
 	PaymentGateway *string `json:"payment_gateway,omitempty"`
 	// The gateway_payment_id is the transaction identifier from the external payment gateway (optional)
 	GatewayPaymentID *string `json:"gateway_payment_id,omitempty"`
+	// The connection_id is the gateway connection that took this payment (optional)
+	ConnectionID *string `json:"connection_id,omitempty"`
 	// The gateway_tracking_id is the tracking identifier from the external payment gateway (optional)
 	GatewayTrackingID *string `json:"gateway_tracking_id,omitempty"`
 	// The gateway_metadata field contains gateway-specific metadata (optional)
-	GatewayMetadata types.Metadata `json:"gateway_metadata,omitempty"`
+	GatewayMetadata types.Metadata `json:"gateway_metadata,omitempty" activity:"redact"`
 	// The amount field specifies the payment value in the given currency
 	Amount decimal.Decimal `json:"amount" swaggertype:"string"`
 	// The currency field uses a three-letter ISO code (USD, EUR, GBP, etc.)
@@ -41,7 +43,7 @@ type Payment struct {
 	// The track_attempts flag indicates whether payment processing attempts are being monitored
 	TrackAttempts bool `json:"track_attempts"`
 	// The metadata field contains additional custom key-value pairs for this payment (optional)
-	Metadata types.Metadata `json:"metadata,omitempty"`
+	Metadata types.Metadata `json:"metadata,omitempty" activity:"drop"`
 	// The succeeded_at timestamp shows when this payment was successfully completed (optional)
 	SucceededAt *time.Time `json:"succeeded_at,omitempty"`
 	// The failed_at timestamp indicates when this payment failed (optional)
@@ -126,7 +128,7 @@ func (p *Payment) Validate() error {
 				WithHint("Payment method id is invalid for payment links").
 				Mark(ierr.ErrValidation)
 		}
-	} else if p.PaymentMethodType == types.PaymentMethodTypeCard {
+	} else if p.PaymentMethodType.IsSavedMethod() {
 		// For card payments, payment method ID is optional - it will be fetched automatically if empty
 		// No validation needed here as the payment processor will handle fetching the saved payment method
 	} else if p.PaymentMethodID == "" {
@@ -163,6 +165,24 @@ func (pa *PaymentAttempt) Validate() error {
 	return nil
 }
 
+// IsPaymentPaid reports whether the payment captured money (succeeded or overpaid).
+func (p *Payment) IsPaymentPaid() bool {
+	return p != nil && (p.PaymentStatus == types.PaymentStatusSucceeded || p.PaymentStatus == types.PaymentStatusOverpaid)
+}
+
+// SettlesByWebhook reports whether the payment is a saved-method charge whose outcome the gateway sends by webhook.
+// Like a link, it is INITIATED until the gateway has it and PENDING until the webhook settles it.
+func (p *Payment) SettlesByWebhook() bool {
+	return p != nil && p.PaymentGateway != nil && *p.PaymentGateway == string(types.PaymentGatewayTypeRazorpay) &&
+		p.PaymentMethodType.IsSavedMethod()
+}
+
+// IsChargeInFlight reports whether a charge was submitted to the gateway and awaits its outcome.
+func (p *Payment) IsChargeInFlight() bool {
+	return p != nil && (p.PaymentStatus == types.PaymentStatusProcessing ||
+		(p.PaymentStatus == types.PaymentStatusPending && p.SettlesByWebhook()))
+}
+
 // TableName returns the table name for the payment
 func (p *Payment) TableName() string {
 	return "payments"
@@ -188,6 +208,7 @@ func FromEnt(p *ent.Payment) *Payment {
 		PaymentMethodID:   p.PaymentMethodID,
 		PaymentGateway:    p.PaymentGateway,
 		GatewayPaymentID:  p.GatewayPaymentID,
+		ConnectionID:      p.ConnectionID,
 		GatewayTrackingID: p.GatewayTrackingID,
 		GatewayMetadata:   p.GatewayMetadata,
 		Amount:            p.Amount,

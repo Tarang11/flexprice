@@ -105,6 +105,17 @@ func requireSuperAdminToReadSAMLConfig(ctx context.Context, key types.SettingKey
 	return nil
 }
 
+// rejectAPIReadOnlySetting refuses any settings API write or delete of a key only Flexprice changes.
+// To protect some fields of a key the API may still write, use apiImmutableSettingFields.
+func rejectAPIReadOnlySetting(key types.SettingKey) error {
+	if key != types.SettingKeyBillingEntityConfig {
+		return nil
+	}
+	return ierr.NewError("billing_entity_config cannot be changed through the settings API").
+		WithHint("The billing entities mode changes only by enabling billing entities").
+		Mark(ierr.ErrValidation)
+}
+
 // apiImmutableSettingFields lists the fields of a setting that the settings API
 // may never write, whatever the caller's role.
 //
@@ -115,13 +126,17 @@ func requireSuperAdminToReadSAMLConfig(ctx context.Context, key types.SettingKey
 // else.
 //
 // Fields listed here are carried over from the stored value on update and are
-// changed out of band, directly in the database.
+// changed out of band, directly in the database. The rest of the key stays
+// writable; to refuse the whole key, use rejectAPIReadOnlySetting.
 func apiImmutableSettingFields(key types.SettingKey) []string {
 	if key == types.SettingKeySAMLConfig {
 		// "active" is Flexprice's approval that this tenant may serve SSO at
 		// all, granted after its claim to the identity provider is checked.
 		// A tenant that could set it would be approving itself.
 		return []string{"active"}
+	}
+	if key == types.SettingKeyUsageAlertConfig {
+		return []string{types.UsageAlertConfigFieldScheduleDelaySeconds, types.UsageAlertConfigFieldStaleAfterSeconds}
 	}
 	return nil
 }
@@ -247,6 +262,22 @@ func GetSetting[T any](s *settingsService, ctx context.Context, key types.Settin
 	return typedValue, nil
 }
 
+// resolveSubscriptionConfig applies each override's set fields onto the environment config; later overrides win.
+func resolveSubscriptionConfig(config types.SubscriptionConfig, overrides ...*types.SettingsOverride) types.SubscriptionConfig {
+	for _, o := range overrides {
+		if o == nil || o.SubscriptionConfig == nil {
+			continue
+		}
+		if o.SubscriptionConfig.GracePeriodDays != nil {
+			config.GracePeriodDays = *o.SubscriptionConfig.GracePeriodDays
+		}
+		if o.SubscriptionConfig.AutoCancellationEnabled != nil {
+			config.AutoCancellationEnabled = *o.SubscriptionConfig.AutoCancellationEnabled
+		}
+	}
+	return config
+}
+
 // UpdateSetting updates a setting value (creates if doesn't exist)
 //
 // WHEN TO USE:
@@ -363,12 +394,24 @@ func (s *settingsService) GetSettingByKeyUnchecked(ctx context.Context, key type
 		return getSettingByKey[types.BonusCreditsTopupConfig](s, ctx, key)
 	case types.SettingKeyDraftInvoiceRecomputeConfig:
 		return getSettingByKey[types.DraftInvoiceRecomputeConfig](s, ctx, key)
+	case types.SettingKeyUsageAlertConfig:
+		return getSettingByKey[types.UsageAlertConfig](s, ctx, key)
 	case types.SettingKeySAMLConfig:
 		return getSettingByKey[types.SAMLConfig](s, ctx, key)
 	case types.SettingKeyWalletTopupConfig:
 		return getSettingByKey[types.WalletTopupConfig](s, ctx, key)
 	case types.SettingKeyCustomCurrencyConfig:
 		return getSettingByKey[types.CustomCurrencyConfig](s, ctx, key)
+	case types.SettingKeyTaxConfig:
+		return getSettingByKey[types.TaxConfig](s, ctx, key)
+	case types.SettingKeyRevenueRecognitionConfig:
+		return getSettingByKey[types.RevenueRecognitionConfig](s, ctx, key)
+	case types.SettingKeyRevenueAnalyticsConfig:
+		return getSettingByKey[types.RevenueAnalyticsConfig](s, ctx, key)
+	case types.SettingKeyBillingEntityConfig:
+		return getSettingByKey[types.BillingEntityConfig](s, ctx, key)
+	case types.SettingKeyEmailNotificationConfig:
+		return getSettingByKey[types.EmailNotificationConfig](s, ctx, key)
 	default:
 		return nil, ierr.NewErrorf("unknown setting key: %s", key).
 			WithHintf("Unknown setting key: %s", key).
@@ -391,6 +434,9 @@ func (s *settingsService) UpdateSettingByKey(ctx context.Context, key types.Sett
 	if err := s.requireSAMLEnabled(key); err != nil {
 		return nil, err
 	}
+	if err := rejectAPIReadOnlySetting(key); err != nil {
+		return nil, err
+	}
 
 	if err := req.Validate(key); err != nil {
 		return nil, err
@@ -398,7 +444,7 @@ func (s *settingsService) UpdateSettingByKey(ctx context.Context, key types.Sett
 
 	switch key {
 	case types.SettingKeyInvoiceConfig:
-		return updateSettingByKey[types.InvoiceConfig](s, ctx, key, req)
+		return s.updateBillingEntityGuardedSetting(ctx, key, req, updateSettingByKey[types.InvoiceConfig])
 	case types.SettingKeySubscriptionConfig:
 		return updateSettingByKey[types.SubscriptionConfig](s, ctx, key, req)
 	case types.SettingKeyInvoicePDFConfig:
@@ -425,12 +471,23 @@ func (s *settingsService) UpdateSettingByKey(ctx context.Context, key types.Sett
 		return updateSettingByKey[types.BonusCreditsTopupConfig](s, ctx, key, req)
 	case types.SettingKeyDraftInvoiceRecomputeConfig:
 		return updateSettingByKey[types.DraftInvoiceRecomputeConfig](s, ctx, key, req)
+	case types.SettingKeyUsageAlertConfig:
+		return updateSettingByKey[types.UsageAlertConfig](s, ctx, key, req)
 	case types.SettingKeySAMLConfig:
 		return updateSettingByKey[types.SAMLConfig](s, ctx, key, req)
 	case types.SettingKeyWalletTopupConfig:
 		return updateSettingByKey[types.WalletTopupConfig](s, ctx, key, req)
 	case types.SettingKeyCustomCurrencyConfig:
 		return updateSettingByKey[*types.CustomCurrencyConfig](s, ctx, key, req)
+	case types.SettingKeyTaxConfig:
+		return s.updateBillingEntityGuardedSetting(ctx, key, req, updateSettingByKey[types.TaxConfig])
+	case types.SettingKeyRevenueRecognitionConfig:
+		return updateSettingByKey[types.RevenueRecognitionConfig](s, ctx, key, req)
+	case types.SettingKeyEmailNotificationConfig:
+		if err := s.requireReplyToForEmails(ctx, req); err != nil {
+			return nil, err
+		}
+		return updateSettingByKey[types.EmailNotificationConfig](s, ctx, key, req)
 	default:
 		return nil, ierr.NewErrorf("unknown setting key: %s", key).
 			WithHintf("Unknown setting key: %s", key).
@@ -450,6 +507,9 @@ func (s *settingsService) DeleteSettingByKey(ctx context.Context, key types.Sett
 	if err := s.requireSAMLEnabled(key); err != nil {
 		return err
 	}
+	if err := rejectAPIReadOnlySetting(key); err != nil {
+		return err
+	}
 
 	// Check if setting exists
 	_, err := s.fetchSetting(ctx, key)
@@ -462,7 +522,20 @@ func (s *settingsService) DeleteSettingByKey(ctx context.Context, key types.Sett
 		return err
 	}
 
-	// Delete based on setting type (tenant-level vs environment-level)
+	// Deleting invoice_config resets the prefix, which billing entities own once enabling.
+	if key == types.SettingKeyInvoiceConfig {
+		return NewBillingEntityService(s.ServiceParams).WithMode(ctx, func(txCtx context.Context, mode types.BillingEntityMode) error {
+			if mode != types.BillingEntityModeOff {
+				return errSettingOwnedByBillingEntity()
+			}
+			return s.deleteSetting(txCtx, key)
+		})
+	}
+	return s.deleteSetting(ctx, key)
+}
+
+// deleteSetting deletes a tenant-level or environment-level setting by key.
+func (s *settingsService) deleteSetting(ctx context.Context, key types.SettingKey) error {
 	if isTenantLevelSetting(key) {
 		return s.SettingsRepo.DeleteTenantLevelSettingByKey(ctx, key)
 	}
@@ -534,4 +607,85 @@ func updateSettingByKey[T types.SettingConfig](s *settingsService, ctx context.C
 
 	// Return updated setting
 	return s.GetSettingByKey(ctx, key)
+}
+
+type settingUpdater func(s *settingsService, ctx context.Context, key types.SettingKey, req *dto.UpdateSettingRequest) (*dto.SettingResponse, error)
+
+// updateBillingEntityGuardedSetting applies an invoice_config or tax_config update under the shared
+// billing entity lock, so it cannot race an enablement.
+func (s *settingsService) updateBillingEntityGuardedSetting(ctx context.Context, key types.SettingKey, req *dto.UpdateSettingRequest, update settingUpdater) (*dto.SettingResponse, error) {
+	var resp *dto.SettingResponse
+	err := NewBillingEntityService(s.ServiceParams).WithMode(ctx, func(txCtx context.Context, mode types.BillingEntityMode) error {
+		if mode != types.BillingEntityModeOff {
+			if err := s.guardBillingEntitySetting(txCtx, key, req); err != nil {
+				return err
+			}
+		}
+		var err error
+		resp, err = update(s, txCtx, key, req)
+		return err
+	})
+	return resp, err
+}
+
+// requireReplyToForEmails refuses to turn on emails while the tenant has no email customers can reply to.
+func (s *settingsService) requireReplyToForEmails(ctx context.Context, req *dto.UpdateSettingRequest) error {
+	cfg, err := utils.ToStruct[types.EmailNotificationConfig](req.Value)
+	if err != nil {
+		return err
+	}
+	if !cfg.Enabled && !cfg.AutoSend.Enabled {
+		return nil
+	}
+	t, err := s.TenantRepo.GetByID(ctx, types.GetTenantID(ctx))
+	if err != nil {
+		return err
+	}
+	if t.BillingDetails.ReplyToEmail() == "" {
+		return ierr.NewError("tenant has no reply-to email").
+			WithHint("Add a billing or help email in your business settings before turning on emails").
+			Mark(ierr.ErrValidation)
+	}
+	return nil
+}
+
+// guardBillingEntitySetting rejects a prefix change or an external tax engine once billing entities are on.
+func (s *settingsService) guardBillingEntitySetting(ctx context.Context, key types.SettingKey, req *dto.UpdateSettingRequest) error {
+	switch key {
+	case types.SettingKeyInvoiceConfig:
+		prefix, ok := req.Value["prefix"]
+		if !ok {
+			return nil
+		}
+		current, err := GetSetting[types.InvoiceConfig](s, ctx, key)
+		if err != nil {
+			return err
+		}
+		if prefix != current.InvoiceNumberPrefix {
+			return errSettingOwnedByBillingEntity()
+		}
+	case types.SettingKeyTaxConfig:
+		merged, err := GetSetting[types.TaxConfig](s, ctx, key)
+		if err != nil {
+			return err
+		}
+		if enabled, ok := req.Value["enabled"].(bool); ok {
+			merged.Enabled = enabled
+		}
+		if provider, ok := req.Value["provider"].(string); ok {
+			merged.Provider = types.TaxProvider(provider)
+		}
+		if merged.UsesExternalTaxEngine() {
+			return ierr.NewErrorf("the %s tax engine cannot be used with billing entities", merged.Provider).
+				WithHintf("Billing entities calculate tax natively. The %s tax engine cannot be turned on while billing entities are enabled.", merged.Provider).
+				Mark(ierr.ErrValidation)
+		}
+	}
+	return nil
+}
+
+func errSettingOwnedByBillingEntity() error {
+	return ierr.NewError("invoice prefix is set per billing entity").
+		WithHint("The invoice prefix is set per billing entity. Edit the billing entity's invoice prefix instead.").
+		Mark(ierr.ErrValidation)
 }

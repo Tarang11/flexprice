@@ -10,6 +10,8 @@ import (
 type Repository interface {
 	Create(ctx context.Context, subscription *Subscription) error
 	Get(ctx context.Context, id string) (*Subscription, error)
+	// GetTimezone reads the timezone without accessing the shared subscription cache.
+	GetTimezone(ctx context.Context, id string) (string, error)
 
 	GetForUpdate(ctx context.Context, id string) (*Subscription, error)
 	Update(ctx context.Context, subscription *Subscription) error
@@ -39,4 +41,17 @@ type Repository interface {
 	// GetSubscriptionsWithAutoInvoiceThreshold returns active, published subscriptions (paginated)
 	// where auto_invoice_threshold is set on the subscription (non-nil and > 0).
 	GetSubscriptionsWithAutoInvoiceThreshold(ctx context.Context, limit, offset int) ([]*Subscription, error)
+
+	// ListEnvironmentsWithGatedActiveSubscriptions returns, across all tenants, every environment
+	// holding an active subscription whose payment behavior gates it on invoice payment.
+	ListEnvironmentsWithGatedActiveSubscriptions(ctx context.Context) ([]types.TenantEnvironment, error)
+
+	// ListEnvironmentsForAutoCancellation returns, across all tenants, every environment where
+	// auto-cancellation is enabled by the environment setting or a customer or subscription override.
+	ListEnvironmentsForAutoCancellation(ctx context.Context) ([]types.TenantEnvironment, error)
+
+	// MarkOverdueGatedSubscriptionsIncomplete moves active payment-gated subscriptions with an unpaid
+	// renewal invoice due within their grace period before asOf to incomplete and returns their IDs.
+	// graceDays is the environment value; subscription and customer overrides take precedence.
+	MarkOverdueGatedSubscriptionsIncomplete(ctx context.Context, asOf time.Time, graceDays int) ([]string, error)
 }

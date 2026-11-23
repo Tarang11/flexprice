@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/flexprice/flexprice/internal/metrics"
 
 	"github.com/flexprice/flexprice/internal/api/dto"
 	ierr "github.com/flexprice/flexprice/internal/errors"
@@ -43,7 +44,16 @@ func NewHandler(
 }
 
 // HandleWebhookEvent processes a Chargebee webhook event
-func (h *Handler) HandleWebhookEvent(ctx context.Context, event *ChargebeeWebhookEvent, environmentID string, services *ServiceDependencies) error {
+func (h *Handler) HandleWebhookEvent(ctx context.Context, event *ChargebeeWebhookEvent, environmentID string, services *ServiceDependencies) (err error) {
+	metricEventType, handled := string(event.EventType), true
+	defer func() {
+		metrics.RecordCounter(ctx, metrics.GatewayWebhooks, 1,
+			metrics.L(metrics.KeyProvider, string(types.SecretProviderChargebee)),
+			metrics.L(metrics.KeyEventType, metricEventType),
+			metrics.L(metrics.KeyOutcome, lo.Ternary(err != nil, "failed", lo.Ternary(handled, "processed", "ignored"))),
+		)
+	}()
+
 	h.logger.Info(ctx, "processing Chargebee webhook event",
 		"event_type", event.EventType,
 		"event_id", event.ID,
@@ -66,6 +76,7 @@ func (h *Handler) HandleWebhookEvent(ctx context.Context, event *ChargebeeWebhoo
 		return nil
 	default:
 		h.logger.Info(ctx, "unhandled Chargebee webhook event type", "type", event.EventType)
+		metricEventType, handled = "other", false
 		return nil // Not an error, just unhandled
 	}
 }
@@ -227,7 +238,7 @@ func (h *Handler) handleCheckoutSessionForPayment(
 	}
 
 	switch session.CheckoutStatus {
-	case types.CheckoutStatusPending:
+	case types.CheckoutStatusInitiated, types.CheckoutStatusPending:
 		err := services.CheckoutSessionService.CompleteCheckoutSession(ctx, session.ID, &types.CheckoutProviderResult{
 			ProviderPaymentIntentID: chargebeeTransactionID,
 			ProviderMetadata: map[string]string{
@@ -308,7 +319,7 @@ func (h *Handler) settleLinkedPayment(
 
 	// A tenant's own notes land in the same array, so anything that is not one of our
 	// payment ids simply is not ours to settle.
-	if _, err := services.PaymentService.GetPayment(ctx, flexpricePaymentID); err != nil {
+	if _, err := services.PaymentService.GetPayment(ctx, dto.GetPaymentRequest{ID: flexpricePaymentID}); err != nil {
 		return false, nil
 	}
 

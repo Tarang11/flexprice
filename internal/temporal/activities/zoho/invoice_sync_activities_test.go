@@ -2,6 +2,7 @@ package zoho_test
 
 import (
 	"context"
+	ierr "github.com/flexprice/flexprice/internal/errors"
 	"testing"
 
 	"github.com/flexprice/flexprice/internal/config"
@@ -59,6 +60,8 @@ func buildZohoActivityFactory(
 		encSvc,
 		nil, // TemporalService — not needed in activity unit tests
 		testutil.NewInMemoryRedisLocker(nil),
+		nil,
+		nil,
 	)
 }
 
@@ -73,7 +76,7 @@ func TestMarkZohoBooksInvoicePaid_NoZohoConnection(t *testing.T) {
 	subStore := testutil.NewInMemorySubscriptionStore()
 
 	factory := buildZohoActivityFactory(connectionStore, mappingStore, invoiceStore, subStore)
-	act := zohoactivities.NewInvoiceSyncActivities(factory, logger.NewNoopLogger())
+	act := zohoactivities.NewInvoiceSyncActivities(factory, nil, logger.NewNoopLogger())
 
 	input := models.NewZohoBooksInvoiceMarkPaidWorkflowInput("inv_no_conn", types.GetTenantID(ctx), types.GetEnvironmentID(ctx))
 
@@ -83,5 +86,5 @@ func TestMarkZohoBooksInvoicePaid_NoZohoConnection(t *testing.T) {
 	var appErr *temporal.ApplicationError
 	require.ErrorAs(t, err, &appErr)
 	assert.True(t, appErr.NonRetryable(), "error must be non-retryable")
-	assert.Equal(t, "ConnectionNotFound", appErr.Type())
+	assert.Equal(t, ierr.ErrConnectionNotFound, appErr.Type())
 }

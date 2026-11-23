@@ -13,14 +13,17 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/flexprice/flexprice/internal/clock"
+
 	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/httpclient"
 	"github.com/flexprice/flexprice/internal/logger"
+	"github.com/flexprice/flexprice/internal/types"
 	"github.com/flexprice/flexprice/internal/utils"
 )
 
 const (
-	tokenURLTemplate      = "https://login.microsoftonline.com/%s/oauth2/v2.0/token"  // #nosec G101 -- field name, not a secret
+	tokenURLTemplate      = "https://login.microsoftonline.com/%s/oauth2/v2.0/token" // #nosec G101 -- field name, not a secret
 	marketplaceAPIBaseURL = "https://marketplaceapi.microsoft.com/api"
 	apiVersion            = "2018-08-31"
 
@@ -83,7 +86,7 @@ type client struct {
 
 // NewClient builds a stateless Azure Marketplace client.
 func NewClient(log *logger.Logger) Client {
-	return &client{httpClient: httpclient.NewDefaultClient(), logger: log}
+	return &client{httpClient: httpclient.NewProviderClient(log, string(types.SecretProviderAzureMarketplace)), logger: log}
 }
 
 // sendFailureReason turns a failed httpClient.Send into a diagnosable message with the tenant's own
@@ -167,7 +170,7 @@ func (c *client) GetToken(ctx context.Context, tenantID, clientID, clientSecret 
 		}
 	}
 
-	return Token{AccessToken: parsed.AccessToken, ExpiresAt: time.Now().UTC().Add(ttl)}, nil
+	return Token{AccessToken: parsed.AccessToken, ExpiresAt: clock.Now().Add(ttl)}, nil
 }
 
 // azureUsageEventWire is the usageEvent wire format.

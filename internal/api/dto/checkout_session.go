@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	"github.com/flexprice/flexprice/internal/clock"
+
 	domainCheckout "github.com/flexprice/flexprice/internal/domain/checkout"
 	"github.com/flexprice/flexprice/internal/domain/invoice"
 	ierr "github.com/flexprice/flexprice/internal/errors"
@@ -32,7 +34,7 @@ func (p *PaymentParams) Validate() error {
 			return err
 		}
 	}
-	return nil
+	return p.PaymentProvider.ValidateLinkExpiry(p.PaymentProviderConfig)
 }
 
 // RedirectionParams groups post-checkout redirect URLs.
@@ -42,18 +44,44 @@ type RedirectionParams struct {
 	CancelURL  *string `json:"cancel_url,omitempty"`
 }
 
+// Validate checks each set URL is https (http only for localhost).
+func (p RedirectionParams) Validate() error {
+	for name, raw := range map[string]*string{
+		"success_url": p.SuccessURL,
+		"failure_url": p.FailureURL,
+		"cancel_url":  p.CancelURL,
+	} {
+		if raw == nil || *raw == "" {
+			continue
+		}
+		if !isValidURL(*raw) {
+			return ierr.NewError("invalid " + name).
+				WithHint(name + " must be an absolute https URL").
+				Mark(ierr.ErrValidation)
+		}
+	}
+	return nil
+}
+
 // CheckoutParams is the reusable checkout opt-in payload shared by
 // create-session, payment-gated subscription modify, and wallet top-up.
 type CheckoutParams struct {
 	PaymentParams
 	RedirectionParams
-	IdempotencyKey *string           `json:"idempotency_key,omitempty"`
-	Metadata       map[string]string `json:"metadata,omitempty"`
+	IdempotencyKey        *string                `json:"idempotency_key,omitempty"`
+	Metadata              map[string]string      `json:"metadata,omitempty"`
+	EntityCreationOptions *EntityCreationOptions `json:"entity_creation_options,omitempty"`
 }
 
 func (p *CheckoutParams) Validate() error {
 	if p == nil {
 		return nil
+	}
+	if err := p.EntityCreationOptions.Validate(); err != nil {
+		return err
+	}
+	if err := p.RedirectionParams.Validate(); err != nil {
+		return err
 	}
 	return p.PaymentParams.Validate()
 }
@@ -121,7 +149,7 @@ func (r *CreateCheckoutSessionRequest) Validate() error {
 }
 
 func (r *CreateCheckoutSessionRequest) ResolveExpiresAt(now time.Time) time.Time {
-	return now.UTC().Add(r.PaymentProvider.SessionExpiry())
+	return now.UTC().Add(r.PaymentProvider.ResolveSessionExpiry(r.PaymentProviderConfig))
 }
 
 func (r *CreateCheckoutSessionRequest) ToCheckoutSession(ctx context.Context, customerID string) *domainCheckout.CheckoutSession {
@@ -138,7 +166,7 @@ func (r *CreateCheckoutSessionRequest) ToCheckoutSession(ctx context.Context, cu
 		SuccessURL:            r.SuccessURL,
 		FailureURL:            r.FailureURL,
 		CancelURL:             r.CancelURL,
-		ExpiresAt:             r.ResolveExpiresAt(time.Now()),
+		ExpiresAt:             r.ResolveExpiresAt(clock.Now()),
 		Metadata:              r.Metadata,
 		BaseModel:             types.GetDefaultBaseModel(ctx),
 	}
@@ -207,7 +235,7 @@ func (r *PayFirstCheckoutRequest) ToCheckoutSession(ctx context.Context, custome
 		SuccessURL:            r.Checkout.SuccessURL,
 		FailureURL:            r.Checkout.FailureURL,
 		CancelURL:             r.Checkout.CancelURL,
-		ExpiresAt:             time.Now().UTC().Add(r.Checkout.PaymentProvider.SessionExpiry()),
+		ExpiresAt:             clock.Now().Add(r.Checkout.PaymentProvider.ResolveSessionExpiry(r.Checkout.PaymentProviderConfig)),
 		Metadata:              r.Checkout.Metadata,
 		BaseModel:             types.GetDefaultBaseModel(ctx),
 	}
@@ -253,12 +281,12 @@ func ValidateCheckoutSessionForCompletion(session *domainCheckout.CheckoutSessio
 		}
 		return cfg.WalletTopupParams.Validate()
 	case types.CheckoutActionAddAddon:
-		if cfg.AddAddonParams == nil {
+		if cfg.AddAddonParams == nil && len(cfg.AddAddonBatchParams) == 0 {
 			return ierr.NewError("session has no add_addon_params").
 				WithHint("checkout session must have add_addon_params before it can be completed").
 				Mark(ierr.ErrValidation)
 		}
-		return cfg.AddAddonParams.Validate()
+		return cfg.Validate(types.CheckoutActionAddAddon)
 	case types.CheckoutActionPayInvoice:
 		if cfg.PayInvoiceParams == nil {
 			return ierr.NewError("session has no pay_invoice_params").
@@ -337,21 +365,29 @@ type CheckoutSessionResponse struct {
 
 	// Payment is the payment this session is waiting on, when one exists.
 	Payment *CheckoutPaymentBlock `json:"payment,omitempty"`
+	// Describes the call that returned this session, not the session itself; never persisted.
+	EntityCreationResult *EntityCreationResult `json:"entity_creation_result,omitempty"`
 }
 
 // ListCheckoutSessionsResponse is the paginated list response.
 type ListCheckoutSessionsResponse = types.ListResponse[*CheckoutSessionResponse]
 
+// IsAutoCharge reports whether an open session was charged off-session: unlike links, an auto-charge has no payment URL.
+func (r *CheckoutSessionResponse) IsAutoCharge() bool {
+	return r != nil && !r.Terminal && r.PaymentAction == nil
+}
+
 // ToCheckoutSessionResponse maps a domain session to its API response.
 //
-// PaymentAction is derived from ProviderResult; the raw ProviderResult is never
+// PaymentAction is derived from ProviderResult and only shown while the session is open,
+// so a finished session never hands out a payable URL. The raw ProviderResult is never
 // exposed because it holds gateway session identifiers. Configuration, Result and
 // PaymentProviderConfig are likewise internal and have no field here.
 func ToCheckoutSessionResponse(s *domainCheckout.CheckoutSession) *CheckoutSessionResponse {
 	if s == nil {
 		return nil
 	}
-	return &CheckoutSessionResponse{
+	resp := &CheckoutSessionResponse{
 		ID:                s.ID,
 		CustomerID:        s.CustomerID,
 		Action:            s.Action,
@@ -370,7 +406,10 @@ func ToCheckoutSessionResponse(s *domainCheckout.CheckoutSession) *CheckoutSessi
 		Metadata:          s.Metadata,
 		CreatedAt:         s.CreatedAt,
 		UpdatedAt:         s.UpdatedAt,
-		PaymentAction:     s.ProviderResult.ToProviderResult().PaymentAction(),
 		Terminal:          s.CheckoutStatus.IsTerminal(),
 	}
+	if !resp.Terminal {
+		resp.PaymentAction = s.ProviderResult.ToProviderResult().PaymentAction()
+	}
+	return resp
 }

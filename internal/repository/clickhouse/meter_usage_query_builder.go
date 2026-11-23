@@ -12,6 +12,11 @@ import (
 // validMeterUsageGroupByPattern matches safe property names (alphanumeric, underscores, dots).
 var validMeterUsageGroupByPattern = regexp.MustCompile(`^[A-Za-z0-9_.]+$`)
 
+// maxMemoryUsageSetting mirrors the inline 90GB bound used by
+// GetEarliestUsageTimestamp/GetMeterUsageForExport/CountMeterUsageForExport/GetEventsByEventIDAndExternalCustomerID in
+// meter_usage.go (AGENTS.md: every ClickHouse query bounded by 90GB).
+const maxMemoryUsageSetting = "max_memory_usage = 96636764160"
+
 // BucketedGroupByDim describes one group_by dimension supported by the bucketed
 // query: "source" and "properties.X" only. Public so the repo's scan code can
 // read the alias / property name without re-parsing the input.
@@ -162,6 +167,13 @@ func (qb *MeterUsageQueryBuilder) BuildWhereClause(params *events.MeterUsageQuer
 		conditions = append(conditions, fmt.Sprintf("meter_id IN (%s)", strings.Join(placeholders, ", ")))
 	}
 
+	// Event id filter. Bound as one list argument rather than a placeholder per
+	// id, so a large set stays a short statement.
+	if len(params.IDs) > 0 {
+		conditions = append(conditions, "id IN (?)")
+		args = append(args, params.IDs)
+	}
+
 	// Time range: multiple OR'd windows when TimeRanges is set (one query for
 	// disjoint ranges), else the single [StartTime, EndTime) pair.
 	if len(params.TimeRanges) > 0 {
@@ -253,6 +265,14 @@ func (qb *MeterUsageQueryBuilder) BuildFinalClause(useFinal bool) (finalClause s
 	return "", ""
 }
 
+// FINAL rows are unique; count suffices.
+func eventCountExpr(useFinal bool) string {
+	if useFinal {
+		return "count()"
+	}
+	return "COUNT(DISTINCT id)"
+}
+
 // BuildBucketedQuery constructs a windowed aggregation query for bucketed meters (MAX/SUM with bucket_size).
 // Mirrors the feature_usage getWindowedQuery logic but operates on the meter_usage table.
 //
@@ -306,7 +326,7 @@ func (qb *MeterUsageQueryBuilder) BuildBucketedQuery(params *events.MeterUsageQu
 					%s as bucket_start,
 					%s,
 					%s(qty_total) as group_value,
-					COUNT(DISTINCT id) as group_event_count
+					%s as group_event_count
 				FROM %s
 				WHERE %s
 				GROUP BY bucket_start, %s
@@ -320,7 +340,7 @@ func (qb *MeterUsageQueryBuilder) BuildBucketedQuery(params *events.MeterUsageQu
 			FROM per_group
 			ORDER BY bucket_start, %s
 			%s
-		`, bucketWindow, dimSelects, aggFunc, tableRef, where, dimGroupBy, dimGroupBy, settings)
+		`, bucketWindow, dimSelects, aggFunc, eventCountExpr(params.UseFinal), tableRef, where, dimGroupBy, dimGroupBy, settings)
 
 		return query, args
 	}
@@ -331,7 +351,7 @@ func (qb *MeterUsageQueryBuilder) BuildBucketedQuery(params *events.MeterUsageQu
 			SELECT
 				%s as bucket_start,
 				%s(qty_total) as %s,
-				COUNT(DISTINCT id) as bucket_event_count
+				%s as bucket_event_count
 			FROM %s
 			WHERE %s
 			GROUP BY bucket_start
@@ -348,7 +368,7 @@ func (qb *MeterUsageQueryBuilder) BuildBucketedQuery(params *events.MeterUsageQu
 		%s
 	`,
 		bucketTableName,
-		bucketWindow, aggFunc, bucketColumnName,
+		bucketWindow, aggFunc, bucketColumnName, eventCountExpr(params.UseFinal),
 		tableRef, where,
 		bucketColumnName, bucketTableName,
 		bucketTableName,
@@ -405,7 +425,7 @@ func (qb *MeterUsageQueryBuilder) BuildBucketedAggregateQuery(params *events.Met
 				%s as bucket_start,
 				%s,
 				%s(qty_total) as bucket_value,
-				COUNT(DISTINCT id) as bucket_event_count
+				%s as bucket_event_count
 			FROM %s
 			WHERE %s
 			GROUP BY bucket_start, %s
@@ -419,7 +439,7 @@ func (qb *MeterUsageQueryBuilder) BuildBucketedAggregateQuery(params *events.Met
 		ORDER BY %s
 		%s
 	`,
-		bucketWindow, dimSelects, aggFunc, tableRef, where, dimAliases,
+		bucketWindow, dimSelects, aggFunc, eventCountExpr(params.UseFinal), tableRef, where, dimAliases,
 		dimAliases, dimAliases, dimAliases, settings)
 
 	return query, args, dims
@@ -470,13 +490,13 @@ func (qb *MeterUsageQueryBuilder) BuildBucketedPointsQuery(
 		SELECT
 			%s as bucket_start,
 			%s(qty_total) as bucket_value,
-			COUNT(DISTINCT id) as bucket_event_count
+			%s as bucket_event_count
 		FROM %s
 		WHERE %s
 		GROUP BY bucket_start
 		ORDER BY bucket_start
 		%s
-	`, bucketWindow, aggFunc, tableRef, extraWhere, settings)
+	`, bucketWindow, aggFunc, eventCountExpr(params.UseFinal), tableRef, extraWhere, settings)
 
 	return query, args
 }
@@ -570,6 +590,11 @@ func (qb *MeterUsageQueryBuilder) BuildDetailedGroupByColumns(params *events.Met
 			result.Columns = append(result.Columns, "source")
 			result.Aliases = append(result.Aliases, "source")
 			result.FieldMapping["source"] = "source"
+		case groupBy == "external_customer_id":
+			// Real, indexed column on meter_usage — select/group directly, no JSONExtract.
+			result.Columns = append(result.Columns, "external_customer_id")
+			result.Aliases = append(result.Aliases, "external_customer_id")
+			result.FieldMapping["external_customer_id"] = "external_customer_id"
 		case strings.HasPrefix(groupBy, "properties."):
 			propertyName := strings.TrimPrefix(groupBy, "properties.")
 			if propertyName == "" || !validMeterUsageGroupByPattern.MatchString(propertyName) {
@@ -581,17 +606,17 @@ func (qb *MeterUsageQueryBuilder) BuildDetailedGroupByColumns(params *events.Met
 			result.Aliases = append(result.Aliases, fmt.Sprintf("%s AS %s", jsonExpr, alias))
 			result.FieldMapping[groupBy] = alias
 		default:
-			return nil, fmt.Errorf("invalid group_by value: %s (allowed: meter_id, source, properties.<field>)", groupBy)
+			return nil, fmt.Errorf("invalid group_by value: %s (allowed: meter_id, source, external_customer_id, properties.<field>)", groupBy)
 		}
 	}
 
 	return result, nil
 }
 
-// BuildDetailedPointsQuery constructs a time-series sub-query for a single group's analytics points.
+// BuildDetailedPointsQuery constructs one time-series query for every group's analytics points,
+// selecting the group-by columns ahead of window_start.
 func (qb *MeterUsageQueryBuilder) BuildDetailedPointsQuery(
 	params *events.MeterUsageDetailedAnalyticsParams,
-	result *events.MeterUsageDetailedResult,
 	groupByResult *DetailedGroupByResult,
 ) (string, []interface{}) {
 	windowExpr := formatWindowSizeWithBillingAnchor(params.WindowSize, params.BillingAnchor, params.Timezone)
@@ -599,39 +624,97 @@ func (qb *MeterUsageQueryBuilder) BuildDetailedPointsQuery(
 		return "", nil
 	}
 
-	aggColumns := buildMeterUsageAggregationColumns(params.AggregationTypes)
+	aggColumns := buildMeterUsageAggregationColumns(params.AggregationTypes, params.UseFinal)
 	finalClause, settings := qb.BuildFinalClause(params.UseFinal)
-
-	// Start with the base WHERE from the detailed params
 	where, args := qb.BuildDetailedWhereClause(params)
 
-	// Narrow to this specific group
-	if result.MeterID != "" {
-		where += " AND meter_id = ?"
-		args = append(args, result.MeterID)
+	var selectCols, groupCols []string
+	if groupByResult != nil {
+		selectCols = append(selectCols, groupByResult.Aliases...)
+		groupCols = append(groupCols, groupByResult.Columns...)
 	}
-	if result.Source != "" {
-		where += " AND source = ?"
-		args = append(args, result.Source)
-	}
-	for propName, propValue := range result.Properties {
-		if propValue != "" {
-			where += " AND JSONExtractString(properties, ?) = ?"
-			args = append(args, propName, propValue)
-		}
-	}
-
-	selectCols := append([]string{fmt.Sprintf("%s AS window_start", windowExpr)}, aggColumns...)
+	selectCols = append(selectCols, fmt.Sprintf("%s AS window_start", windowExpr))
+	selectCols = append(selectCols, aggColumns...)
+	groupCols = append(groupCols, "window_start")
 
 	query := fmt.Sprintf(`
 		SELECT
 			%s
 		FROM meter_usage %s
 		WHERE %s
-		GROUP BY window_start
+		GROUP BY %s
 		ORDER BY window_start ASC
 		%s
-	`, strings.Join(selectCols, ",\n\t\t\t"), finalClause, where, settings)
+	`, strings.Join(selectCols, ",\n\t\t\t"), finalClause, where, strings.Join(groupCols, ", "), settings)
+
+	return query, args
+}
+
+// BuildUsageActivityQuery builds the distinct-customer probe the rollup scan
+// uses to find which customers received usage. It selects external_customer_id
+// because that is the column meter_usage has: there is no internal customer_id
+// on this table, and naming one compiles and fails only at runtime.
+//
+// It bounds `timestamp` as well as `ingested_at`: meter_usage is partitioned by
+// toYYYYMMDD(timestamp), so filtering on ingested_at alone reads every
+// partition the tenant has ever written.
+func (qb *MeterUsageQueryBuilder) BuildUsageActivityQuery(params *events.UsageActivityParams) (string, []interface{}) {
+	finalClause, finalSettings := qb.BuildFinalClause(params.UseFinal)
+	settings := "SETTINGS " + maxMemoryUsageSetting
+	if finalSettings != "" {
+		settings = finalSettings + ", " + maxMemoryUsageSetting
+	}
+
+	query := fmt.Sprintf(`
+		SELECT DISTINCT external_customer_id
+		FROM meter_usage %s
+		WHERE tenant_id = ? AND environment_id = ?
+			AND timestamp >= ?
+			AND ingested_at >= ?
+		%s
+	`, finalClause, settings)
+
+	return query, []interface{}{
+		params.TenantID, params.EnvironmentID, params.TimestampAfter, params.IngestedAfter,
+	}
+}
+
+// BuildDailyUsageQuery builds a per-day SUM(qty_total) query over
+// [StartTime, EndTime] for every meter in MeterIDs at once, tenant/env-scoped.
+// Reuses BuildDetailedWhereClause for RLS and BuildFinalClause for FINAL
+// handling so tenant/env injection and dedup semantics match the rest of the
+// engine. Grouping by meter is what lets one query serve a whole subscription.
+func (qb *MeterUsageQueryBuilder) BuildDailyUsageQuery(params *events.DailyUsageParams) (string, []interface{}) {
+	tz := normalizeCHTimezone(params.Timezone)
+	dayExpr := fmt.Sprintf("toStartOfDay(timestamp, '%s')", tz)
+
+	detailedParams := &events.MeterUsageDetailedAnalyticsParams{
+		TenantID:            params.TenantID,
+		EnvironmentID:       params.EnvironmentID,
+		ExternalCustomerIDs: params.ExternalCustomerIDs,
+		MeterIDs:            params.MeterIDs,
+		StartTime:           params.StartTime,
+		EndTime:             params.EndTime,
+	}
+	where, args := qb.BuildDetailedWhereClause(detailedParams)
+	finalClause, finalSettings := qb.BuildFinalClause(params.UseFinal)
+
+	settings := "SETTINGS " + maxMemoryUsageSetting
+	if finalSettings != "" {
+		settings = finalSettings + ", " + maxMemoryUsageSetting
+	}
+
+	query := fmt.Sprintf(`
+		SELECT
+			meter_id,
+			%s AS day,
+			SUM(qty_total) AS day_qty
+		FROM meter_usage %s
+		WHERE %s
+		GROUP BY meter_id, day
+		ORDER BY meter_id ASC, day ASC
+		%s
+	`, dayExpr, finalClause, where, settings)
 
 	return query, args
 }

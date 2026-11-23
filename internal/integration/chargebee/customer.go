@@ -11,6 +11,7 @@ import (
 	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/logger"
 	"github.com/flexprice/flexprice/internal/types"
+	"github.com/samber/lo"
 )
 
 // ChargebeeCustomerService defines the interface for Chargebee customer operations
@@ -43,11 +44,17 @@ func NewCustomerService(params CustomerServiceParams) ChargebeeCustomerService {
 
 // GetChargebeeCustomerID retrieves the Chargebee customer ID from entity mapping
 func (s *CustomerService) GetChargebeeCustomerID(ctx context.Context, flexpriceCustomerID string) (string, error) {
+	conn, err := s.Client.GetConnection(ctx)
+	if err != nil {
+		return "", err
+	}
+
 	// Create filter for entity mapping lookup
 	filter := types.NewEntityIntegrationMappingFilter()
 	filter.EntityType = types.IntegrationEntityTypeCustomer
 	filter.EntityID = flexpriceCustomerID
 	filter.ProviderTypes = []string{string(types.SecretProviderChargebee)}
+	filter.ConnectionID = conn.ID
 
 	// Get entity mapping
 	mappings, err := s.EntityIntegrationMappingRepo.List(ctx, filter)
@@ -110,14 +117,14 @@ func (s *CustomerService) GetOrCreateChargebeeCustomer(ctx context.Context, flex
 
 // SyncCustomerToChargebee syncs FlexPrice customer to Chargebee
 func (s *CustomerService) SyncCustomerToChargebee(ctx context.Context, flexpriceCustomer *customerDomain.Customer) (*CustomerResponse, error) {
-	// Initialize Chargebee SDK
-	if err := s.Client.(*Client).InitializeChargebeeSDK(ctx); err != nil {
-		return nil, err
-	}
-
 	s.Logger.Info(ctx, "syncing customer to Chargebee",
 		"customer_id", flexpriceCustomer.ID,
 		"email", flexpriceCustomer.Email)
+
+	conn, err := s.Client.GetConnection(ctx)
+	if err != nil {
+		return nil, err
+	}
 
 	// Prepare customer creation request
 	createParams := &customer.CreateRequestParams{
@@ -184,6 +191,7 @@ func (s *CustomerService) SyncCustomerToChargebee(ctx context.Context, flexprice
 		ProviderEntityID: chargebeeCustomer.Id,
 		EnvironmentID:    flexpriceCustomer.EnvironmentID,
 		BaseModel:        types.GetDefaultBaseModel(ctx),
+		ConnectionID:     lo.ToPtr(conn.ID),
 	}
 	mapping.TenantID = flexpriceCustomer.TenantID
 
@@ -236,10 +244,16 @@ func (s *CustomerService) EnsureCustomerSyncedToChargebee(ctx context.Context, c
 
 	// Check if customer is synced via integration mapping table
 	if s.EntityIntegrationMappingRepo != nil {
+		conn, err := s.Client.GetConnection(ctx)
+		if err != nil {
+			return nil, err
+		}
+
 		filter := &types.EntityIntegrationMappingFilter{
 			EntityID:      customerID,
 			EntityType:    types.IntegrationEntityTypeCustomer,
 			ProviderTypes: []string{string(types.SecretProviderChargebee)},
+			ConnectionID:  conn.ID,
 		}
 
 		existingMappings, err := s.EntityIntegrationMappingRepo.List(ctx, filter)

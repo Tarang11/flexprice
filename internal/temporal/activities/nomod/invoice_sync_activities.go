@@ -8,6 +8,7 @@ import (
 	"github.com/flexprice/flexprice/internal/integration/nomod"
 	"github.com/flexprice/flexprice/internal/interfaces"
 	"github.com/flexprice/flexprice/internal/logger"
+	"github.com/flexprice/flexprice/internal/temporal/activities/billingentity"
 	"github.com/flexprice/flexprice/internal/temporal/models"
 	"github.com/flexprice/flexprice/internal/types"
 	"go.temporal.io/sdk/temporal"
@@ -17,6 +18,7 @@ import (
 type InvoiceSyncActivities struct {
 	integrationFactory *integration.Factory
 	customerService    interfaces.CustomerService
+	entityScope        interfaces.BillingEntityScope
 	logger             *logger.Logger
 }
 
@@ -24,11 +26,13 @@ type InvoiceSyncActivities struct {
 func NewInvoiceSyncActivities(
 	integrationFactory *integration.Factory,
 	customerService interfaces.CustomerService,
+	entityScope interfaces.BillingEntityScope,
 	logger *logger.Logger,
 ) *InvoiceSyncActivities {
 	return &InvoiceSyncActivities{
 		integrationFactory: integrationFactory,
 		customerService:    customerService,
+		entityScope:        entityScope,
 		logger:             logger,
 	}
 }
@@ -49,6 +53,11 @@ func (a *InvoiceSyncActivities) SyncInvoiceToNomod(
 	ctx = types.SetTenantID(ctx, input.TenantID)
 	ctx = types.SetEnvironmentID(ctx, input.EnvironmentID)
 
+	ctx, err := billingentity.ScopeActivity(ctx, a.entityScope, input.CustomerID, input.InvoiceID, "")
+	if err != nil {
+		return err
+	}
+
 	// Get Nomod integration with runtime context
 	nomodIntegration, err := a.integrationFactory.GetNomodIntegration(ctx)
 	if err != nil {
@@ -59,7 +68,7 @@ func (a *InvoiceSyncActivities) SyncInvoiceToNomod(
 			// Return NON-RETRYABLE error - connection doesn't exist, retrying won't help
 			return temporal.NewNonRetryableApplicationError(
 				"Nomod connection not configured",
-				"ConnectionNotFound",
+				ierr.ErrConnectionNotFound,
 				err,
 			)
 		}

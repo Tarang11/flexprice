@@ -7,6 +7,7 @@ import (
 	"github.com/flexprice/flexprice/internal/domain/secret"
 	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/types"
+	"github.com/samber/lo"
 )
 
 // InMemorySecretStore implements secret.Repository
@@ -61,6 +62,10 @@ func secretFilterFn(ctx context.Context, s *secret.Secret, filter interface{}) b
 
 	// Filter by user_id
 	if filter_.UserID != nil && s.UserID != *filter_.UserID {
+		return false
+	}
+
+	if len(filter_.SecretIDs) > 0 && !lo.Contains(filter_.SecretIDs, s.ID) {
 		return false
 	}
 
@@ -132,6 +137,7 @@ func (s *InMemorySecretStore) ListAll(ctx context.Context, filter *types.SecretF
 		Prefix:          filter.Prefix,
 		UserID:          filter.UserID,
 		NotExpiredAt:    filter.NotExpiredAt,
+		SecretIDs:       filter.SecretIDs,
 	}
 	if filter.QueryFilter != nil {
 		unlimitedFilter.QueryFilter.Status = filter.QueryFilter.Status
@@ -142,6 +148,25 @@ func (s *InMemorySecretStore) ListAll(ctx context.Context, filter *types.SecretF
 
 func (s *InMemorySecretStore) Delete(ctx context.Context, id string) error {
 	return s.InMemoryStore.Delete(ctx, id)
+}
+
+func (s *InMemorySecretStore) RevokeByUserID(ctx context.Context, userID string) ([]*secret.Secret, error) {
+	allEnvs := types.SetEnvironmentID(ctx, "")
+	secrets, err := s.InMemoryStore.List(allEnvs, &types.SecretFilter{
+		QueryFilter: types.NewNoLimitQueryFilter(),
+		UserID:      &userID,
+	}, secretFilterFn, secretSortFn)
+	if err != nil {
+		return nil, err
+	}
+	var revoked []*secret.Secret
+	for _, sec := range secrets {
+		if sec.Status == types.StatusPublished {
+			sec.Status = types.StatusDeleted
+			revoked = append(revoked, sec)
+		}
+	}
+	return revoked, nil
 }
 
 func (s *InMemorySecretStore) GetAPIKeyByValue(ctx context.Context, value string) (*secret.Secret, error) {

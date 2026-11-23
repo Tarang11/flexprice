@@ -34,16 +34,18 @@ type Configuration struct {
 	// local cluster — consumed AND always written. See infrastructure/docs/GCP-CUTOVER-STEPWISE.md.
 	KafkaSecondary         *KafkaConfig                 `mapstructure:"kafka_secondary" validate:"omitempty"`
 	ClickHouse             ClickHouseConfig             `validate:"required"`
+	Reports                ReportsConfig                `mapstructure:"reports" validate:"omitempty"`
 	Logging                LoggingConfig                `validate:"required"`
 	Postgres               PostgresConfig               `validate:"required"`
 	Otel                   OtelConfig                   `validate:"omitempty"`
 	Pyroscope              PyroscopeConfig              `validate:"required"`
+	Telemetry              TelemetryConfig              `mapstructure:"telemetry" validate:"omitempty"`
 	Event                  EventConfig                  `validate:"required"`
 	DynamoDB               DynamoDBConfig               `validate:"required"`
 	Temporal               TemporalConfig               `validate:"required"`
 	Webhook                Webhook                      `validate:"omitempty"`
 	Secrets                SecretsConfig                `validate:"required"`
-	Billing                BillingConfig                `validate:"omitempty"`
+	Billing                BillingConfig                `mapstructure:"billing" validate:"omitempty"`
 	S3                     S3Config                     `validate:"required"`
 	Storage                StorageConfig                `mapstructure:"storage" validate:"omitempty"`
 	GCS                    GCSConfig                    `mapstructure:"gcs" validate:"omitempty"`
@@ -60,17 +62,22 @@ type Configuration struct {
 	BulkEventConsumption   BulkEventConsumptionConfig   `mapstructure:"bulk_event_consumption" validate:"required"`
 	BulkMeterUsageTracking BulkMeterUsageTrackingConfig `mapstructure:"bulk_meter_usage_tracking" validate:"required"`
 	UsageAlerts            UsageAlertsConfig            `mapstructure:"usage_alerts" validate:"omitempty"`
+	EntitlementGrants      EntitlementGrantsConfig      `mapstructure:"entitlement_grants" validate:"omitempty"`
 	EnvAccess              EnvAccessConfig              `mapstructure:"env_access" json:"env_access" validate:"omitempty"`
 	Email                  EmailConfig                  `mapstructure:"email" validate:"required"`
 	RBAC                   RBACConfig                   `mapstructure:"rbac" validate:"omitempty"`
 	OAuth                  OAuthConfig                  `mapstructure:"oauth" validate:"required"`
 	WalletBalanceAlert     WalletBalanceAlertConfig     `mapstructure:"wallet_balance_alert" validate:"required"`
+	Activity               ActivityConfig               `mapstructure:"activity" validate:"omitempty"`
 	CustomerPortal         CustomerPortalConfig         `mapstructure:"customer_portal" validate:"required"`
 	Checkout               CheckoutConfig               `mapstructure:"checkout" validate:"omitempty"`
+	HostedInvoice          HostedInvoiceConfig          `mapstructure:"hosted_invoice" validate:"omitempty"`
+	BillingEntities        BillingEntitiesConfig        `mapstructure:"billing_entities" validate:"omitempty"`
 	Redis                  RedisConfig                  `mapstructure:"redis" validate:"required"`
 	RawEventsReprocessing  RawEventsReprocessingConfig  `mapstructure:"raw_events_reprocessing" validate:"required"`
 	RawEventConsumption    RawEventConsumptionConfig    `mapstructure:"raw_event_consumption" validate:"required"`
 	IntegrationEvents      IntegrationEventsConfig      `mapstructure:"integration_events" validate:"omitempty"`
+	EmailEvents            EmailEventsConfig            `mapstructure:"email_events" validate:"omitempty"`
 	OnboardingEvents       OnboardingEventsConfig       `mapstructure:"onboarding_events" validate:"omitempty"`
 	WebhookRetryJob        WebhookRetryJobConfig        `mapstructure:"webhook_retry_job" validate:"omitempty"`
 	Gemini                 GeminiConfig                 `mapstructure:"gemini" validate:"omitempty"`
@@ -78,12 +85,32 @@ type Configuration struct {
 	Onboarding             OnboardingConfig             `mapstructure:"onboarding" validate:"omitempty"`
 	ChatSupport            ChatSupportConfig            `mapstructure:"chat_support" validate:"omitempty"`
 	Analytics              AnalyticsConfig              `mapstructure:"analytics" validate:"omitempty"`
+	Admin                  AdminConfig                  `mapstructure:"admin" validate:"omitempty"`
+}
+
+// AdminConfig is the operator portal. Secret is required when deployment.mode is admin.
+// Set it from the secret manager via FLEXPRICE_ADMIN_SECRET. Callers send it as X-Admin-Secret.
+type AdminConfig struct {
+	Secret string `mapstructure:"secret"`
 }
 
 // AnalyticsConfig gates the fire-and-forget analytics meter_usage feed.
 type AnalyticsConfig struct {
-	Enabled             bool   `mapstructure:"enabled" default:"false"`
-	MeterUsageSinkTopic string `mapstructure:"meter_usage_sink_topic"`
+	Enabled             bool                `mapstructure:"enabled" default:"false"`
+	MeterUsageSinkTopic string              `mapstructure:"meter_usage_sink_topic"`
+	RevenueRollup       RevenueRollupConfig `mapstructure:"revenue_rollup" validate:"omitempty"`
+}
+
+// RevenueRollupConfig gates the daily Temporal revenue_facts rollup + drift
+// sweep (RevenueRollupWorkflow). Off by default; AutoCorrect keeps the sweeper
+// flag-only (detect, never repair) unless explicitly enabled.
+type RevenueRollupConfig struct {
+	Enabled     bool `mapstructure:"enabled" default:"false"`
+	AutoCorrect bool `mapstructure:"auto_correct" default:"false"`
+	// FullRebuildWeekday forces a full pass on that weekday (0=Sunday), so
+	// anything the scan's triggers miss is repaired within a week rather than
+	// persisting. This is the net under the scan, not a switch for it.
+	FullRebuildWeekday int `mapstructure:"full_rebuild_weekday" default:"0"`
 }
 
 type ChatSupportConfig struct {
@@ -323,8 +350,30 @@ type DeploymentConfig struct {
 	Mode types.RunMode `mapstructure:"mode" validate:"required"`
 }
 
+const (
+	DefaultServerShutdownTimeout = 25 * time.Second
+	// Ceiling for the drain, leaving the rest of StopTimeout to other stop hooks.
+	MaxServerShutdownTimeout = 45 * time.Second
+	// Budget fx allows for all stop hooks combined.
+	ServerStopTimeout = 1 * time.Minute
+)
+
 type ServerConfig struct {
 	Address string `mapstructure:"address" validate:"required"`
+	// Grace period for in-flight requests to finish after SIGTERM.
+	// Must stay below the ECS task stopTimeout.
+	ShutdownTimeout time.Duration `mapstructure:"shutdown_timeout"`
+}
+
+// GetShutdownTimeout clamps the configured drain so it cannot outlive the fx stop budget.
+func (c ServerConfig) GetShutdownTimeout() time.Duration {
+	if c.ShutdownTimeout <= 0 {
+		return DefaultServerShutdownTimeout
+	}
+	if c.ShutdownTimeout > MaxServerShutdownTimeout {
+		return MaxServerShutdownTimeout
+	}
+	return c.ShutdownTimeout
 }
 
 type AuthConfig struct {
@@ -569,6 +618,24 @@ type ClickHouseConfig struct {
 	MaxMemoryUsage int64  `mapstructure:"max_memory_usage" validate:"required"`
 }
 
+// ReportsConfig is the reports ClickHouse login.
+type ReportsConfig struct {
+	Address                 string `mapstructure:"address"`
+	Database                string `mapstructure:"database"`
+	UsageDatabase           string `mapstructure:"usage_database"`
+	UsageOnEventsClickHouse bool   `mapstructure:"usage_on_events_clickhouse"`
+	Username                string `mapstructure:"username"`
+	Password                string `mapstructure:"password"`
+	MaxExecutionSeconds     int    `mapstructure:"max_execution_seconds"`
+	MaxResultRows           int    `mapstructure:"max_result_rows"`
+	MaxRowsToRead           int64  `mapstructure:"max_rows_to_read"`
+	QueryCacheTTLSeconds    int    `mapstructure:"query_cache_ttl_seconds"`
+}
+
+func (c ReportsConfig) Enabled() bool {
+	return c.Database != "" && c.Username != ""
+}
+
 type LoggingConfig struct {
 	Level   types.LogLevel `mapstructure:"level" validate:"required"`
 	DBLevel types.LogLevel `mapstructure:"db_level" validate:"required"`
@@ -586,6 +653,9 @@ type LoggingConfig struct {
 	OtelAuthHeader string `mapstructure:"otel_auth_header" validate:"omitempty"` // header name
 	OtelAuthValue  string `mapstructure:"otel_auth_value" validate:"omitempty"`  // header value / token
 	OtelDebug      bool   `mapstructure:"otel_debug" default:"false"`            // use synchronous SimpleProcessor and verbose stderr output
+
+	// ProviderCallsEnabled is the kill switch for provider call log lines.
+	ProviderCallsEnabled bool `mapstructure:"provider_calls_enabled" default:"true"`
 }
 
 type PostgresConfig struct {
@@ -708,6 +778,10 @@ type OtelMetricsConfig struct {
 	// and SigNoz already derives it); turn it on where the backend cannot store
 	// traces and this is the only source of API latency.
 	HTTPServerEnabled bool `mapstructure:"http_server_enabled" default:"false"`
+	// AppEnabled, DisabledMetrics and TenantAllowlist control internal/metrics only.
+	AppEnabled      bool     `mapstructure:"app_enabled" default:"false"`
+	DisabledMetrics []string `mapstructure:"disabled_metrics"`
+	TenantAllowlist []string `mapstructure:"tenant_allowlist"`
 }
 
 // MergedHeaders — see OtelTracesConfig.MergedHeaders.
@@ -779,6 +853,13 @@ type PyroscopeConfig struct {
 	DisableGCRuns   bool     `mapstructure:"disable_gc_runs" default:"false"`
 }
 
+type TelemetryConfig struct {
+	// On by default. FLEXPRICE_TELEMETRY_DISABLED opts out.
+	Disabled     bool   `mapstructure:"disabled"`
+	Host         string `mapstructure:"host"`
+	InstallLabel string `mapstructure:"install_label"`
+}
+
 type TemporalConfig struct {
 	Address                string               `mapstructure:"address" validate:"required"`
 	TaskQueue              string               `mapstructure:"task_queue" validate:"required"`
@@ -803,15 +884,99 @@ type TemporalWorkerConfig struct {
 	// TaskQueueActivitiesPerSecond is the rate limit for activities per second across all workers for the task queue. 0 means unlimited.
 	// Default: 0 (unlimited)
 	TaskQueueActivitiesPerSecond float64 `mapstructure:"task_queue_activities_per_second"`
+	// Queues holds per-task-queue overrides, keyed by task queue name. Unset
+	// fields fall back to the values above.
+	Queues map[string]TemporalQueueWorkerConfig `mapstructure:"queues"`
+}
+
+// TemporalQueueWorkerConfig overrides worker limits for a single task queue.
+// Zero fields inherit the global TemporalWorkerConfig value.
+type TemporalQueueWorkerConfig struct {
+	MaxConcurrentActivityExecutionSize     int     `mapstructure:"max_concurrent_activity_execution_size"`
+	MaxConcurrentWorkflowTaskExecutionSize int     `mapstructure:"max_concurrent_workflow_task_execution_size"`
+	WorkerActivitiesPerSecond              float64 `mapstructure:"worker_activities_per_second"`
+	TaskQueueActivitiesPerSecond           float64 `mapstructure:"task_queue_activities_per_second"`
 }
 
 type SecretsConfig struct {
 	EncryptionKey string `mapstructure:"encryption_key" validate:"required"`
 }
 
+// BillingConfig points this region at the Flexprice billing tenant on Flexprice Cloud.
+// TenantID/EnvironmentID are set only where that tenant is local; the remote fields are set wherever self-billing runs.
 type BillingConfig struct {
 	TenantID      string `mapstructure:"tenant_id" validate:"omitempty"`
 	EnvironmentID string `mapstructure:"environment_id" validate:"omitempty"`
+	Enabled       bool   `mapstructure:"enabled" default:"false"`
+	Region        string `mapstructure:"region"`
+	APIHost       string `mapstructure:"api_host"`
+	APIKey        string `mapstructure:"api_key"`
+	// DefaultPlanID is the plan every new tenant's trial starts on; it must be one of PlanIDs.
+	DefaultPlanID string `mapstructure:"default_plan_id"`
+	// PlanIDs are every plan a tenant may buy at checkout, the default included.
+	PlanIDs      []string `mapstructure:"plan_ids"`
+	DashboardURL string   `mapstructure:"dashboard_url"`
+
+	// PaymentProvider is the provider of Flexprice Cloud's trial-end checkout; empty means stripe.
+	PaymentProvider types.CheckoutPaymentProvider `mapstructure:"payment_provider"`
+
+	// UsageLookbackHours is how many closed hours each usage push re-sends, so a missed run is recovered.
+	UsageLookbackHours int `mapstructure:"usage_lookback_hours" default:"6"`
+
+	// ZapierWebhookURL receives self-billing lifecycle alerts for Slack; empty disables them.
+	ZapierWebhookURL string `mapstructure:"zapier_webhook_url"`
+}
+
+const defaultUsageLookback = 6 * time.Hour
+
+// UsageLookback is the usage push window length; a non-positive setting falls back to 6 hours.
+func (c BillingConfig) UsageLookback() time.Duration {
+	if c.UsageLookbackHours <= 0 {
+		return defaultUsageLookback
+	}
+	return time.Duration(c.UsageLookbackHours) * time.Hour
+}
+
+// IsSelfBillingEnabled reports whether this deployment bills its tenants through Flexprice Cloud.
+func (c BillingConfig) IsSelfBillingEnabled() bool {
+	return c.Enabled &&
+		c.Region != "" &&
+		c.APIKey != "" &&
+		c.DefaultPlanID != "" &&
+		c.DashboardURL != "" &&
+		c.CheckoutProvider().Validate() == nil &&
+		c.hasSecureAPIHost()
+}
+
+// CheckoutProvider returns the configured checkout payment provider, defaulting to stripe.
+func (c BillingConfig) CheckoutProvider() types.CheckoutPaymentProvider {
+	if c.PaymentProvider == "" {
+		return types.CheckoutPaymentProviderStripe
+	}
+	return c.PaymentProvider
+}
+
+// hasSecureAPIHost reports whether APIHost is an https URL; plain http is allowed only for localhost.
+func (c BillingConfig) hasSecureAPIHost() bool {
+	return isSecureURL(c.APIHost)
+}
+
+// HasSecureZapierWebhookURL reports whether ZapierWebhookURL is an https URL; plain http is allowed only for localhost.
+func (c BillingConfig) HasSecureZapierWebhookURL() bool {
+	return isSecureURL(c.ZapierWebhookURL)
+}
+
+func isSecureURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return u.Scheme == "https" || (u.Scheme == "http" && isLoopbackHost(u.Hostname()))
+}
+
+// IsBillingTenant reports whether tenantID is the local billing tenant, which never bills itself.
+func (c BillingConfig) IsBillingTenant(tenantID string) bool {
+	return c.TenantID != "" && c.TenantID == tenantID
 }
 
 type EventProcessingConfig struct {
@@ -859,6 +1024,12 @@ type MeterUsageTrackingConfig struct {
 	RejectedEventWebhookWindow time.Duration `mapstructure:"rejected_event_webhook_window" default:"10m"`
 }
 
+// EntitlementGrantsConfig controls entitlement grant behaviour outside billing.
+type EntitlementGrantsConfig struct {
+	// RefreshOnRead lets entitlement reads with refresh_grants=true evaluate grants first.
+	RefreshOnRead bool `mapstructure:"refresh_on_read" default:"true"`
+}
+
 // UsageAlertsConfig controls the usage-driven alert pipeline end to end:
 // meter-usage post-insert schedules a debounced per-customer Temporal workflow
 // which evaluates spend, entitlement-grant, and wallet alerts.
@@ -868,6 +1039,7 @@ type UsageAlertsConfig struct {
 	Enabled bool `mapstructure:"enabled" default:"false"`
 	// ScheduleDelay is the debounce window: the workflow's StartDelay AND the
 	// TTL of the Redis lock that throttles schedule attempts to one per customer per window.
+	// ScheduleDelay and StaleAfter are deployment defaults; the usage_alert_config setting overrides them per environment.
 	ScheduleDelay time.Duration `mapstructure:"schedule_delay" default:"5m30s"`
 	// StaleAfter bounds staleness on both queues: a workflow run firing more
 	// than this past its intended time yields once (ContinueAsNew) to the back
@@ -898,6 +1070,27 @@ type WalletBalanceAlertConfig struct {
 	Topic         string `mapstructure:"topic" default:"wallet_alert"`
 	RateLimit     int64  `mapstructure:"rate_limit" default:"1"`
 	ConsumerGroup string `mapstructure:"consumer_group" default:"v1_wallet_alert_service"`
+}
+
+// ActivityConfig configures the activity log pipeline; Enabled is the kill switch.
+type ActivityConfig struct {
+	Enabled       bool                    `mapstructure:"enabled" default:"false"`
+	Topic         string                  `mapstructure:"topic" default:"activity_logs"`
+	TopicDLQ      string                  `mapstructure:"topic_dlq" default:"activity_logs_dlq"`
+	ConsumerGroup string                  `mapstructure:"consumer_group" default:"activity_log"`
+	RateLimit     int64                   `mapstructure:"rate_limit" default:"50"`
+	Publisher     ActivityPublisherConfig `mapstructure:"publisher"`
+	// ExcludedTenants lists "tenant_id" or "tenant_id:environment_id" entries whose writes are not logged. Empty = log all.
+	ExcludedTenants []string `mapstructure:"excluded_tenants"`
+}
+
+type ActivityPublisherConfig struct {
+	BufferSize           int           `mapstructure:"buffer_size" default:"10000"`
+	Workers              int           `mapstructure:"workers" default:"4"`
+	MaxEntriesPerMessage int           `mapstructure:"max_entries_per_message" default:"100"`
+	MaxMessageBytes      int           `mapstructure:"max_message_bytes" default:"524288"`
+	MaxSnapshotBytes     int           `mapstructure:"max_snapshot_bytes" default:"262144"`
+	ShutdownTimeout      time.Duration `mapstructure:"shutdown_timeout" default:"10s"`
 }
 
 type RawEventsReprocessingConfig struct {
@@ -991,15 +1184,48 @@ type Email struct {
 
 type EmailConfig struct {
 	Enabled          bool   `mapstructure:"enabled" validate:"required"`
-	ResendAPIKey     string `mapstructure:"resend_api_key" validate:"omitempty"`
 	FromAddress      string `mapstructure:"from_address" validate:"omitempty"`
 	ReplyTo          string `mapstructure:"reply_to" validate:"omitempty"`
 	CalendarURL      string `mapstructure:"calendar_url" validate:"omitempty"`
 	ZapierWebhookURL string `mapstructure:"zapier_webhook_url" validate:"omitempty"`
+
+	// Customer invoice emails.
+	Provider        string            `mapstructure:"provider" validate:"omitempty,oneof=resend local"`
+	Resend          ResendEmailConfig `mapstructure:"resend"`
+	SenderDomain    string            `mapstructure:"sender_domain" validate:"omitempty"`
+	SenderLocalPart string            `mapstructure:"sender_local_part" validate:"omitempty"`
+	RegionTag       string            `mapstructure:"region_tag" validate:"omitempty"`
+}
+
+// EmailEventsConfig is the consumer group that auto-sends customer emails from webhook.topic events.
+type EmailEventsConfig struct {
+	Enabled       bool   `mapstructure:"enabled" default:"true"`
+	ConsumerGroup string `mapstructure:"consumer_group" default:"email-events-consumer"`
+	RateLimit     int64  `mapstructure:"rate_limit" default:"10"`
+}
+
+type ResendEmailConfig struct {
+	APIKey        string `mapstructure:"api_key" validate:"omitempty"`
+	WebhookSecret string `mapstructure:"webhook_secret" validate:"omitempty"`
+}
+
+// IsProviderConfigured reports whether customer emails are on: email.enabled and a provider set.
+func (c EmailConfig) IsProviderConfigured() bool {
+	return c.Enabled && c.Provider != ""
 }
 
 type CheckoutConfig struct {
 	BaseURL string `mapstructure:"base_url" validate:"required,url"`
+}
+
+// BillingEntitiesConfig gates enabling billing entities; off rejects every enable request.
+type BillingEntitiesConfig struct {
+	Enabled bool `mapstructure:"enabled" default:"false"`
+}
+
+// HostedInvoiceConfig holds the hosted invoice page base; empty returns no Flexprice hosted links.
+type HostedInvoiceConfig struct {
+	BaseURL string `mapstructure:"base_url" validate:"omitempty,url"`
 }
 
 type CustomerPortalConfig struct {
@@ -1085,6 +1311,13 @@ func NewConfig() (*Configuration, error) {
 	// here (defaults live in config.yaml), so guarantee default-on for deploys whose
 	// config.yaml predates this key. Env/yaml still override.
 	v.SetDefault("otel.traces.capture_exceptions", true)
+	v.SetDefault("logging.provider_calls_enabled", true)
+	// Customer email sender defaults, for deploys whose config.yaml (a Helm ConfigMap) predates these keys.
+	v.SetDefault("email.sender_domain", "mail.flexprice.io")
+	v.SetDefault("email.sender_local_part", "invoices")
+	v.SetDefault("email_events.enabled", true)
+	v.SetDefault("email_events.consumer_group", "email-events-consumer")
+	v.SetDefault("email_events.rate_limit", 10)
 
 	// Step 5: Read the YAML file
 	if err := v.ReadInConfig(); err != nil {
@@ -1198,6 +1431,9 @@ func (c Configuration) Validate() error {
 // Legitimate for local dev; a red flag in any real deployment.
 const devDBPassword = "flexprice123"
 
+// devAPIKeyHash is the hash of the public dev API key in config.yaml.
+const devAPIKeyHash = "0cfd568f22158887f8b77bc019fb245b1f14077b80936342b052985efa7de46c"
+
 const (
 	defaultClickHouseDialTimeout = 10 * time.Second
 	defaultClickHouseReadTimeout = 30 * time.Second
@@ -1207,7 +1443,8 @@ const (
 // A non-local deployment booting with any of these for an ENABLED feature is running on a
 // public credential, so validateSecrets flags it (warn-only — see NewValidatedConfig).
 var placeholderSecrets = map[string]bool{
-	"": true, // unset
+	"":             true, // unset
+	"super_secret": true,
 	"dev-only-insecure-secret-prod-sets-FLEXPRICE_AUTH_SECRET": true,
 	"<supabase service key>":                                   true,
 	"svix_auth_token":                                          true,
@@ -1226,6 +1463,9 @@ func NewValidatedConfig() (*Configuration, error) {
 	}
 	if cfg.Deployment.Mode == types.ModeLocal {
 		return cfg, nil
+	}
+	if err := cfg.validateCriticalSecrets(); err != nil {
+		return nil, err
 	}
 	// NOTE: we deliberately do NOT run the full-struct cfg.Validate() here.
 	// Many fields carry dormant `validate:"required"` tags that were never enforced
@@ -1254,13 +1494,72 @@ func NewValidatedConfig() (*Configuration, error) {
 	// customer uploads to their identity provider contains unusable endpoints,
 	// and the failure surfaces much later as an audience mismatch on every
 	// assertion, pointing at signatures rather than at configuration.
+	if err := cfg.validateEncryptionKey(); err != nil {
+		return nil, err
+	}
 	if err := cfg.Auth.SAML.validate(); err != nil {
 		return nil, err
 	}
 	if err := cfg.validateSAMLDependencies(); err != nil {
 		return nil, err
 	}
+	if err := cfg.validateEmail(); err != nil {
+		return nil, err
+	}
 	return cfg, nil
+}
+
+// validateEmail rejects a customer-email provider that cannot work in this deployment. It applies
+// only when customer emails are on, so a deployment without them cannot be taken down by it.
+func (c Configuration) validateEmail() error {
+	if !c.Email.IsProviderConfigured() {
+		return nil
+	}
+	if strings.TrimSpace(c.Email.SenderDomain) == "" || strings.TrimSpace(c.Email.SenderLocalPart) == "" {
+		return fmt.Errorf("email.sender_domain and email.sender_local_part are required (mode %q)", c.Deployment.Mode)
+	}
+	switch types.EmailProvider(c.Email.Provider) {
+	case types.EmailProviderLocal:
+		if os.Getenv("FLEXPRICE_ALLOW_INSECURE_DEFAULTS") != "true" {
+			return fmt.Errorf("email.provider local writes emails to disk and is only for local runs (mode %q): set email.provider to resend", c.Deployment.Mode)
+		}
+	case types.EmailProviderResend:
+		var missing []string
+		for _, f := range []struct{ value, name string }{
+			{c.Email.Resend.APIKey, "email.resend.api_key (FLEXPRICE_EMAIL_RESEND_API_KEY)"},
+			{c.Email.Resend.WebhookSecret, "email.resend.webhook_secret (FLEXPRICE_EMAIL_RESEND_WEBHOOK_SECRET)"},
+			{c.Email.RegionTag, "email.region_tag (FLEXPRICE_EMAIL_REGION_TAG)"},
+		} {
+			if strings.TrimSpace(f.value) == "" {
+				missing = append(missing, f.name)
+			}
+		}
+		if len(missing) > 0 {
+			return fmt.Errorf("email.provider resend needs %s (mode %q)", strings.Join(missing, ", "), c.Deployment.Mode)
+		}
+	default:
+		return fmt.Errorf("unsupported email.provider %q (mode %q): use resend or local", c.Email.Provider, c.Deployment.Mode)
+	}
+	return nil
+}
+
+// validateCriticalSecrets rejects secrets that sign tokens or grant access.
+func (c Configuration) validateCriticalSecrets() error {
+	allowInsecure := os.Getenv("FLEXPRICE_ALLOW_INSECURE_DEFAULTS") == "true"
+	fail := func(err error) error {
+		if !allowInsecure {
+			return err
+		}
+		log.Printf("[config] WARNING: FLEXPRICE_ALLOW_INSECURE_DEFAULTS bypassed critical secret check: %v. Must never be set outside local Docker Compose", err)
+		return nil
+	}
+	if placeholderSecrets[strings.TrimSpace(c.Auth.Secret)] {
+		return fail(fmt.Errorf("auth.secret (FLEXPRICE_AUTH_SECRET) is empty or a placeholder (mode %q)", c.Deployment.Mode))
+	}
+	if _, ok := c.Auth.APIKey.Keys[devAPIKeyHash]; ok {
+		return fail(fmt.Errorf("auth.api_key.keys contains the public dev key (mode %q): set FLEXPRICE_AUTH_API_KEY_KEYS", c.Deployment.Mode))
+	}
+	return nil
 }
 
 // validateSecrets flags placeholder/dev secret values for features that are actually
@@ -1292,16 +1591,27 @@ func (c Configuration) validateSecrets() error {
 	if strings.TrimSpace(c.ClickHouse.Password) == devDBPassword {
 		bad = append(bad, "clickhouse.password (FLEXPRICE_CLICKHOUSE_PASSWORD)")
 	}
-	// NOTE: secrets.encryption_key is intentionally NOT checked. ECS prod currently decrypts
-	// with the baked value (canonical env FLEXPRICE_SECRETS_ENCRYPTION_KEY is unset there; ECS
-	// sets a different, unread name). Rejecting it would block prod boot and switching keys
-	// would corrupt stored ciphertext. Reconcile separately before adding it. See config.yaml.
-
 	if len(bad) > 0 {
 		return fmt.Errorf("placeholder/dev secrets detected for enabled features (mode %q): %s — inject real values via FLEXPRICE_* env",
 			c.Deployment.Mode, strings.Join(bad, ", "))
 	}
 	return nil
+}
+
+const defaultEncryptionKey = "super-secret-encryption-key"
+
+func (c Configuration) validateEncryptionKey() error {
+	key := strings.TrimSpace(c.Secrets.EncryptionKey)
+	if key != "" && key != defaultEncryptionKey {
+		return nil
+	}
+	err := fmt.Errorf("secrets.encryption_key is empty or the shipped default (mode %q): set FLEXPRICE_SECRETS_ENCRYPTION_KEY",
+		c.Deployment.Mode)
+	if os.Getenv("FLEXPRICE_ALLOW_INSECURE_DEFAULTS") == "true" {
+		log.Printf("[config] WARNING: FLEXPRICE_ALLOW_INSECURE_DEFAULTS bypassed encryption key check: %v. Must never be set outside local Docker Compose", err)
+		return nil
+	}
+	return err
 }
 
 // GetDefaultConfig returns a default configuration for local development

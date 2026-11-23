@@ -3,9 +3,11 @@ package tracing
 import (
 	"context"
 	"os"
+	"slices"
 	"testing"
 
 	"github.com/flexprice/flexprice/internal/config"
+	"github.com/flexprice/flexprice/internal/metrics"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -390,5 +392,72 @@ func TestMetricResourceInstanceIDEnvOverride(t *testing.T) {
 	}
 	if got != "pod-from-downward-api" {
 		t.Fatalf("service.instance.id = %q, want the env override to win", got)
+	}
+}
+
+func TestAppMetricViews(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  config.OtelMetricsConfig
+		want []string
+	}{
+		{"kill switch drops app scope only", config.OtelMetricsConfig{}, []string{"db.client.duration"}},
+		{"enabled keeps all", config.OtelMetricsConfig{AppEnabled: true}, []string{"app.kept", "app.disabled", "db.client.duration"}},
+		{"disabled by name", config.OtelMetricsConfig{AppEnabled: true, DisabledMetrics: []string{"app.disabled"}}, []string{"app.kept", "db.client.duration"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Service{cfg: &config.Configuration{Otel: config.OtelConfig{Metrics: tt.cfg}}}
+			reader := sdkmetric.NewManualReader()
+			mp := sdkmetric.NewMeterProvider(append([]sdkmetric.Option{sdkmetric.WithReader(reader)}, s.appMetricViews()...)...)
+			add := func(meter metric.Meter, name string) {
+				c, err := meter.Int64Counter(name)
+				if err != nil {
+					t.Fatal(err)
+				}
+				c.Add(context.Background(), 1)
+			}
+			app := mp.Meter(metrics.MeterName)
+			add(app, "app.kept")
+			add(app, "app.disabled")
+			add(mp.Meter(tracerName), "db.client.duration")
+
+			got := collect(t, reader)
+			if len(got) != len(tt.want) {
+				t.Fatalf("exported %v, want %v", got, tt.want)
+			}
+			for _, name := range tt.want {
+				if _, ok := got[name]; !ok {
+					t.Fatalf("missing %q in %v", name, got)
+				}
+			}
+		})
+	}
+}
+
+func TestDBDurationViewTrimsBucketsAndMinMax(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader), dbDurationView())
+	h, err := mp.Meter(tracerName).Float64Histogram("db.client.duration")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.Record(context.Background(), 42)
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	hist := rm.ScopeMetrics[0].Metrics[0].Data.(metricdata.Histogram[float64])
+	dp := hist.DataPoints[0]
+	want := []float64{1, 5, 10, 25, 50, 100, 250, 1000, 5000}
+	if !slices.Equal(dp.Bounds, want) {
+		t.Fatalf("bounds = %v, want %v", dp.Bounds, want)
+	}
+	if _, ok := dp.Min.Value(); ok {
+		t.Error("min should not be recorded")
+	}
+	if _, ok := dp.Max.Value(); ok {
+		t.Error("max should not be recorded")
 	}
 }

@@ -47,6 +47,7 @@ swagger-3-0:
 		-d @docs/swagger/swagger.json > docs/swagger/swagger-3-0.json
 	@echo "Conversion complete. Output saved to docs/swagger/swagger-3-0.json"
 	@node scripts/fix_swagger_internal_types.mjs
+	@node scripts/build_webhooks_spec.mjs
 	@./scripts/update_swagger_servers.sh
 
 .PHONY: swagger-fix-refs
@@ -135,6 +136,12 @@ run-local:
 	@set -a && [ -f .env ] && . ./.env; [ -f .env.local ] && . ./.env.local; set +a; \
 	FLEXPRICE_DEPLOYMENT_MODE=local go run cmd/server/main.go
 
+# Run the admin portal API only (loads .env then .env.local)
+.PHONY: run-local-admin
+run-local-admin:
+	@set -a && [ -f .env ] && . ./.env; [ -f .env.local ] && . ./.env.local; set +a; \
+	FLEXPRICE_DEPLOYMENT_MODE=admin go run cmd/server/main.go
+
 # ---------------------------------------------------------------------------
 # Worktree-aware server — deterministic port from branch name, shared .env
 # ---------------------------------------------------------------------------
@@ -216,7 +223,7 @@ install-ent:
 .PHONY: generate-ent
 generate-ent: install-ent
 	@echo "Generating ent code..."
-	@go run -mod=mod entgo.io/ent/cmd/ent generate --feature sql/execquery ./ent/schema
+	@go run -mod=mod entgo.io/ent/cmd/ent generate --feature sql/execquery --template ./ent/template ./ent/schema
 
 .PHONY: migrate-ent
 migrate-ent:
@@ -237,6 +244,7 @@ migrate-ent-dry-run:
 #     -p 5440:5432 postgres:16
 MIGRATIONS_PG  ?= migrations/versioned/postgres
 MIGRATIONS_CH  ?= migrations/versioned/clickhouse
+MIGRATIONS_CH_REPL ?= migrations/versioned/clickhouse/replicated
 
 .PHONY: migrate-up
 migrate-up:
@@ -271,9 +279,7 @@ migrate-fingerprint:
 
 # ── CI gates ─────────────────────────────────────────────────────────────────
 .PHONY: migrate-check
-# migrate-check-clickhouse is deliberately NOT in this list — see the note in
-# .github/workflows/migrations.yml. Run it by hand if you need it.
-migrate-check: migrate-check-sync migrate-check-checksum migrate-check-order
+migrate-check: migrate-check-sync migrate-check-checksum migrate-check-order migrate-check-clickhouse migrate-check-clickhouse-replication migrate-check-clickhouse-parity
 	@echo "all migration checks passed"
 
 .PHONY: migrate-check-sync
@@ -290,7 +296,15 @@ migrate-check-order:
 
 .PHONY: migrate-check-clickhouse
 migrate-check-clickhouse:
-	@./scripts/migrations/clickhouse-check.sh $(MIGRATIONS_CH)
+	@./scripts/migrations/clickhouse-check.sh $(MIGRATIONS_CH) $(MIGRATIONS_CH_REPL)
+
+.PHONY: migrate-check-clickhouse-replication
+migrate-check-clickhouse-replication:
+	@./scripts/migrations/clickhouse-replication-check.sh $(MIGRATIONS_CH_REPL)
+
+.PHONY: migrate-check-clickhouse-parity
+migrate-check-clickhouse-parity:
+	@./scripts/migrations/clickhouse-parity-check.sh
 
 .PHONY: generate-migration
 generate-migration:
@@ -376,6 +390,8 @@ init-kafka:
 				events_post_processing_backfill \
 				system_events \
 				wallet_alert \
+				activity_logs \
+				activity_logs_dlq \
 				onboarding_events \
 				staging_benchmarking \
 				prod_events_v4 \
@@ -398,6 +414,19 @@ init-kafka:
 	done; \
 	echo "Error: Kafka failed to become ready after 10 attempts"; \
 	exit 1
+
+# Replay a dead-letter topic back to origin. Dry-run first, then drop DRY_RUN.
+#   make dlq-replay SOURCE=staging_events_dlq
+#   make dlq-replay SOURCE=production_event_processing_dlq DRY_RUN=
+.PHONY: dlq-replay
+DRY_RUN ?= --dry-run
+# Read SOURCE/DRY_RUN from the environment, not make interpolation, so they can't inject shell.
+dlq-replay: export SOURCE := $(SOURCE)
+dlq-replay: export DRY_RUN := $(DRY_RUN)
+dlq-replay:
+	@case "$$SOURCE" in ''|*[!A-Za-z0-9._-]*) echo "usage: make dlq-replay SOURCE=<dlq-topic> [DRY_RUN=]"; exit 1;; esac
+	@case "$$DRY_RUN" in --dry-run|'') ;; *) echo "DRY_RUN must be --dry-run or empty"; exit 1;; esac
+	go run ./cmd/dlq replay --source "$$SOURCE" $$DRY_RUN
 
 # Clean all docker containers and volumes related to the project
 .PHONY: clean-docker
@@ -529,8 +558,10 @@ help-sdk:
 	@echo "  make update-sdk          - Regenerate swagger then run sdk-all"
 	@echo "  make clean-sdk           - Remove generated api/go, api/typescript, api/python, api/mcp"
 	@echo "  make merge-custom       - Copy api/custom/<lang>/ into api/<lang>/"
+	@echo "  make ts-sdk-check       - Build the merged TypeScript SDK in a temp dir and run its custom tests"
 	@echo "  make sync-gen-to-output - Copy .speakeasy/gen/*.yaml to api/<lang>/.speakeasy/gen.yaml (run before generate)"
 	@echo "  make show-custom-files  - List files in api/custom/"
+	@echo "  make mcp-check          - Build the merged MCP server in a temp dir and run its custom tests"
 	@echo ""
 	@echo "Go SDK only:"
 	@echo "  make go-sdk              - Clean + generate Go SDK + merge custom + build"
@@ -655,9 +686,13 @@ filter-mcp-spec:
 sync-gen-to-output:
 	@./scripts/sync-gen-to-output.sh
 
+# Local runs skip the registry upload. The release workflow overrides this to publish the spec and
+# code samples behind the hosted docs spec (spec.speakeasy.com/flexprice/prod/swagger-json-with-code-samples).
+SPEAKEASY_RUN_FLAGS ?= --skip-upload-spec --minimal
+
 speakeasy-generate: speakeasy-validate filter-mcp-spec sync-gen-to-output
 	@echo "Generating SDKs with Speakeasy..."
-	@CI=true TERM=dumb speakeasy run --target all -y --skip-upload-spec --skip-compile --minimal
+	@CI=true TERM=dumb speakeasy run --target all -y --skip-compile $(SPEAKEASY_RUN_FLAGS)
 
 # =============================================================================
 # Single command: Swagger + SDK/MCP generation + merge custom (no testing; use make test-sdk for integration tests)
@@ -716,16 +751,36 @@ merge-custom:
 	@for dir in go typescript python mcp; do \
 		if [ -d "api/custom/$$dir" ]; then \
 			echo "Merging custom files into api/$$dir/..."; \
-			rsync -av --exclude='.gitkeep' "api/custom/$$dir/" "api/$$dir/" 2>/dev/null || true; \
+			rsync -av --exclude='.gitkeep' --exclude='/tests/' "api/custom/$$dir/" "api/$$dir/" 2>/dev/null || true; \
 		fi; \
 	done
 	@if [ -f api/python/pyproject.toml ]; then \
 		sed 's/Generated by Speakeasy\./for the FlexPrice API./' api/python/pyproject.toml > api/python/pyproject.toml.tmp && mv api/python/pyproject.toml.tmp api/python/pyproject.toml; \
 	fi
+	@if [ -f api/mcp/package.json ]; then \
+		node scripts/patch-mcp-serve.mjs; \
+	fi
 	@if [ -f api/typescript/src/index.ts ] && [ -f api/typescript/src/index.extras.ts ]; then \
 		node scripts/patch-ts-sdk-index.mjs; \
 	fi
+	@if [ -f api/typescript/src/lib/config.ts ]; then \
+		node scripts/patch-ts-sdk-config.mjs; \
+	fi
 	@echo "✓ Custom merge complete"
+
+# Build a scratch copy of the merged TS SDK and run api/custom/typescript/tests against it.
+# The copy keeps node_modules and esm/ out of api/typescript, which is uploaded and published as is.
+.PHONY: ts-sdk-check
+ts-sdk-check:
+	@test -f api/typescript/package.json || { echo "api/typescript not found; run make sdk-all first"; exit 1; }
+	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; set -e; \
+	rsync -a --exclude='node_modules' --exclude='esm' api/typescript/ "$$tmp/"; \
+	rsync -a api/custom/typescript/tests/ "$$tmp/tests/"; \
+	cd "$$tmp"; \
+	npm install --ignore-scripts --no-audit --no-fund; \
+	npm run build; \
+	node --test tests/*.test.mjs
+	@echo "✓ TypeScript SDK build and tests passed"
 
 # Force MCP package name so npm publish uses @flexprice/mcp-server.
 .PHONY: fix-mcp-package-name
@@ -734,6 +789,24 @@ fix-mcp-package-name:
 		jq '.name = "@flexprice/mcp-server"' api/mcp/package.json > api/mcp/package.json.tmp && mv api/mcp/package.json.tmp api/mcp/package.json; \
 		echo "✓ MCP package name set to @flexprice/mcp-server"; \
 	fi
+
+# Build a scratch copy of the MCP server with api/custom/mcp merged in and run api/custom/mcp/tests against it.
+# MCP_SRC is the generated server: api/mcp after make sdk-all, or a checkout of flexprice/mcp-server.
+MCP_SRC ?= api/mcp
+.PHONY: mcp-check
+mcp-check:
+	@test -f "$(MCP_SRC)/package.json" || { echo "$(MCP_SRC) not found; run make sdk-all first or pass MCP_SRC=<generated MCP server>"; exit 1; }
+	@set -e; tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+	rsync -a --exclude='.git' --exclude='node_modules' --exclude='esm' --exclude='bin' "$(MCP_SRC)/" "$$tmp/"; \
+	rsync -a --exclude='.gitkeep' --exclude='/tests/' api/custom/mcp/ "$$tmp/"; \
+	node scripts/patch-mcp-serve.mjs "$$tmp/src/mcp-server/cli/serve/impl.ts"; \
+	rsync -a api/custom/mcp/tests/ "$$tmp/tests/"; \
+	cd "$$tmp"; \
+	npm install --ignore-scripts --no-audit --no-fund; \
+	[ -f node_modules/bun/install.js ] && node node_modules/bun/install.js || true; \
+	npm run build; \
+	PATCH_SCRIPT="$(CURDIR)/scripts/patch-mcp-serve.mjs" node --test tests/*.test.mjs
+	@echo "✓ MCP server build and tests passed"
 
 # =============================================================================
 # SDK tests: single command runs all SDKs (published integration tests)

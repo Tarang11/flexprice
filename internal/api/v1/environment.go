@@ -4,9 +4,9 @@ import (
 	"net/http"
 
 	"github.com/flexprice/flexprice/internal/api/dto"
+	"github.com/flexprice/flexprice/internal/ee/service"
 	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/logger"
-	"github.com/flexprice/flexprice/internal/ee/service"
 	temporalmodels "github.com/flexprice/flexprice/internal/temporal/models"
 	temporalservice "github.com/flexprice/flexprice/internal/temporal/service"
 	"github.com/flexprice/flexprice/internal/types"
@@ -129,6 +129,15 @@ func (h *EnvironmentHandler) CloneEnvironment(c *gin.Context) {
 
 	// Validate that the source environment exists
 	if _, err := h.service.GetEnvironment(c.Request.Context(), sourceEnvID); err != nil {
+		c.Error(err)
+		return
+	}
+
+	cloneEnvIDs := []string{sourceEnvID}
+	if req.TargetEnvironmentID != "" {
+		cloneEnvIDs = append(cloneEnvIDs, req.TargetEnvironmentID)
+	}
+	if err := h.service.CheckCloneAllowed(c.Request.Context(), cloneEnvIDs...); err != nil {
 		c.Error(err)
 		return
 	}

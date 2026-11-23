@@ -59,10 +59,12 @@ func (s TaxRateScope) Validate() error {
 type TaxRateEntityType string
 
 const (
-	TaxRateEntityTypeCustomer     TaxRateEntityType = "customer"
-	TaxRateEntityTypeSubscription TaxRateEntityType = "subscription"
-	TaxRateEntityTypeInvoice      TaxRateEntityType = "invoice"
-	TaxRateEntityTypeTenant       TaxRateEntityType = "tenant"
+	TaxRateEntityTypeCustomer      TaxRateEntityType = "customer"
+	TaxRateEntityTypeSubscription  TaxRateEntityType = "subscription"
+	TaxRateEntityTypeInvoice       TaxRateEntityType = "invoice"
+	TaxRateEntityTypeTenant        TaxRateEntityType = "tenant"
+	TaxRateEntityTypeCreditNote    TaxRateEntityType = "credit_note"
+	TaxRateEntityTypeBillingEntity TaxRateEntityType = "billing_entity"
 )
 
 func (t TaxRateEntityType) String() string {
@@ -75,6 +77,8 @@ func (t TaxRateEntityType) Validate() error {
 		TaxRateEntityTypeSubscription.String(),
 		TaxRateEntityTypeInvoice.String(),
 		TaxRateEntityTypeTenant.String(),
+		TaxRateEntityTypeCreditNote.String(),
+		TaxRateEntityTypeBillingEntity.String(),
 	}
 
 	if !slices.Contains(allowedValues, string(t)) {

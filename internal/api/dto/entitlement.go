@@ -3,6 +3,7 @@ package dto
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -15,10 +16,12 @@ import (
 
 // CreateEntitlementRequest represents the request to create a new entitlement
 type CreateEntitlementRequest struct {
-	PlanID              string                            `json:"plan_id,omitempty"`
-	FeatureID           string                            `json:"feature_id" binding:"required"`
-	FeatureType         types.FeatureType                 `json:"feature_type" binding:"required"`
-	IsEnabled           bool                              `json:"is_enabled"`
+	PlanID string `json:"plan_id,omitempty"`
+	// Required, except on a subscription entitlement grant (entity_type SUBSCRIPTION with grant config), which has no feature.
+	FeatureID   string            `json:"feature_id"`
+	FeatureType types.FeatureType `json:"feature_type"`
+	IsEnabled   bool              `json:"is_enabled"`
+	// Deprecated: use grant_quota; a metered usage_limit is converted to a grant on create.
 	UsageLimit          *int64                            `json:"usage_limit"`
 	UsageResetPeriod    types.EntitlementUsageResetPeriod `json:"usage_reset_period"`
 	IsSoftLimit         bool                              `json:"is_soft_limit"`
@@ -37,11 +40,37 @@ type CreateEntitlementRequest struct {
 	GrantAllocationBehavior types.EntitlementGrantAllocationBehavior `json:"grant_allocation_behavior,omitempty"`
 	GrantQuota              *decimal.Decimal                         `json:"grant_quota,omitempty" swaggertype:"string"`
 	AggregationMode         types.EntitlementAggregationMode         `json:"aggregation_mode,omitempty"`
+	GrantUnlimited          bool                                     `json:"grant_unlimited,omitempty"`
+}
+
+// IsSubscriptionEntitlementGrant reports a subscription entitlement grant: a grant config on a subscription with no feature.
+func (r *CreateEntitlementRequest) IsSubscriptionEntitlementGrant() bool {
+	return r.EntityType == types.ENTITLEMENT_ENTITY_TYPE_SUBSCRIPTION && r.EntityID != "" && r.FeatureID == "" && r.hasGrantConfig()
+}
+
+func (r *CreateEntitlementRequest) hasGrantConfig() bool {
+	return r.GrantQuota != nil || r.GrantDurationValue != nil || r.GrantMeasure != "" || r.GrantDurationUnit != ""
 }
 
 func (r *CreateEntitlementRequest) Validate() error {
 	if err := validator.ValidateRequest(r); err != nil {
 		return err
+	}
+
+	hasGrantConfig := r.hasGrantConfig()
+	if hasGrantConfig && r.GrantQuota == nil && !r.GrantUnlimited {
+		return ierr.NewError("grant_quota is required unless the allowance is unlimited").
+			WithHint("Set grant_quota, or send grant_unlimited: true for an allowance with no ceiling").
+			Mark(ierr.ErrValidation)
+	}
+	if r.GrantUnlimited && r.GrantQuota != nil {
+		return ierr.NewError("grant_quota cannot be set on an unlimited allowance").
+			WithHint("Remove grant_quota, or drop grant_unlimited").
+			Mark(ierr.ErrValidation)
+	}
+
+	if r.IsSubscriptionEntitlementGrant() {
+		return nil
 	}
 
 	if r.FeatureID == "" {
@@ -100,6 +129,11 @@ func (r *CreateEntitlementRequest) ToEntitlement(ctx context.Context) *entitleme
 	if r.FeatureType == types.FeatureTypeStatic || r.FeatureType == types.FeatureTypeMetered || r.FeatureType == types.FeatureTypeConfig {
 		r.IsEnabled = true
 	}
+	var grantScope types.EntitlementGrantScopeEntityType
+	if r.IsSubscriptionEntitlementGrant() {
+		r.IsEnabled = true
+		grantScope = types.EntitlementGrantScopeSubscription
+	}
 
 	// TODO: This is a temporary fix to maintain backward compatibility
 	// We need to remove this once we have a proper entitlement entity type
@@ -129,6 +163,7 @@ func (r *CreateEntitlementRequest) ToEntitlement(ctx context.Context) *entitleme
 		GrantAllocationBehavior: r.GrantAllocationBehavior,
 		GrantQuota:              r.GrantQuota,
 		AggregationMode:         r.AggregationMode,
+		GrantScope:              grantScope,
 		EnvironmentID:           types.GetEnvironmentID(ctx),
 		BaseModel:               types.GetDefaultBaseModel(ctx),
 	}
@@ -137,22 +172,31 @@ func (r *CreateEntitlementRequest) ToEntitlement(ctx context.Context) *entitleme
 
 // UpdateEntitlementRequest represents the request to update an existing entitlement
 type UpdateEntitlementRequest struct {
-	IsEnabled        *bool                             `json:"is_enabled"`
+	IsEnabled *bool `json:"is_enabled"`
+	// Deprecated: use grant_quota.
 	UsageLimit       *int64                            `json:"usage_limit"`
 	UsageResetPeriod types.EntitlementUsageResetPeriod `json:"usage_reset_period"`
 	IsSoftLimit      *bool                             `json:"is_soft_limit"`
 	StaticValue      string                            `json:"static_value"`
 	ConfigValue      map[string]interface{}            `json:"config_value,omitempty"`
 
-	// Grant config — nil fields leave the current value alone.
-	// ClearGrantConfig=true wipes the whole grant config (back to a legacy entitlement).
-	ClearGrantConfig        *bool                                     `json:"clear_grant_config,omitempty"`
+	// Deprecated: use grant_unlimited to remove a ceiling. This flag only remains
+	// for the "back to a legacy usage_limit" case, which metered entitlements are
+	// moving off entirely.
+	ClearGrantConfig        *bool                                     `json:"clear_grant_config,omitempty" swaggerignore:"true"`
 	GrantMeasure            *types.EntitlementGrantMeasure            `json:"grant_measure,omitempty"`
 	GrantDurationValue      *int                                      `json:"grant_duration_value,omitempty"`
 	GrantDurationUnit       *types.EntitlementGrantDurationUnit       `json:"grant_duration_unit,omitempty"`
 	GrantAllocationBehavior *types.EntitlementGrantAllocationBehavior `json:"grant_allocation_behavior,omitempty"`
 	GrantQuota              *decimal.Decimal                          `json:"grant_quota,omitempty" swaggertype:"string"`
 	AggregationMode         *types.EntitlementAggregationMode         `json:"aggregation_mode,omitempty"`
+	GrantUnlimited          *bool                                     `json:"grant_unlimited,omitempty"`
+}
+
+// OnlySetsGrantQuota reports whether grant_quota is the only field the request sets; a field added
+// later counts as set too.
+func (r *UpdateEntitlementRequest) OnlySetsGrantQuota() bool {
+	return reflect.DeepEqual(*r, UpdateEntitlementRequest{GrantQuota: r.GrantQuota})
 }
 
 // Validate validates the update entitlement request
@@ -271,4 +315,13 @@ func EntitlementsToResponse(entitlements []*entitlement.Entitlement) []*Entitlem
 		}
 	}
 	return responses
+}
+
+type ReissueEntitlementGrantsRequest struct {
+	SubscriptionID string
+	FeatureID      string
+	Delta          decimal.Decimal
+	Unlimited      bool
+	At             time.Time
+	Source         string
 }

@@ -99,6 +99,11 @@ type PrepareSubscriptionInvoiceRequestParams struct {
 	// OpeningInvoiceAdjustmentAmount is the credit from the cancelled subscription to apply to the
 	// first invoice (reduces fixed line item amounts before coupons).
 	OpeningInvoiceAdjustmentAmount *decimal.Decimal `json:"-"`
+	// AsOf overrides the reference instant used for open-period clipping (inactive line items,
+	// windowed-commitment effective end). Zero value = now, i.e. today's behavior.
+	AsOf time.Time `json:"-"`
+	// LineItems are the active line items at PeriodStart; empty loads them.
+	LineItems []*subscription.SubscriptionLineItem `json:"-"`
 }
 
 // Validate enforces struct tags and the reference point.
@@ -177,6 +182,9 @@ type CreateInvoiceRequestForChargesParams struct {
 	Metadata      types.Metadata
 	InvoiceType   types.InvoiceType
 	BillingReason types.InvoiceBillingReason
+	// ReferencePoint of the preparing call; revenue_facts additionally
+	// dry-runs coupon discounts onto the line items.
+	ReferencePoint types.InvoiceReferencePoint
 }
 
 // Validate enforces struct tags.

@@ -6,6 +6,8 @@ import (
 
 	invoiceModel "github.com/chargebee/chargebee-go/v3/models/invoice"
 	invoiceEnum "github.com/chargebee/chargebee-go/v3/models/invoice/enum"
+	paymentSourceModel "github.com/chargebee/chargebee-go/v3/models/paymentsource"
+	paymentSourceEnum "github.com/chargebee/chargebee-go/v3/models/paymentsource/enum"
 	transactionEnum "github.com/chargebee/chargebee-go/v3/models/transaction/enum"
 
 	ierr "github.com/flexprice/flexprice/internal/errors"
@@ -217,6 +219,34 @@ func (a *CheckoutAdapter) TryAutoChargingSavedMethod(
 	}
 }
 
+// HasAutoChargeableMethod implements interfaces.CheckoutProvider by checking
+// if the customer has any valid or expiring payment sources in Chargebee.
+func (a *CheckoutAdapter) HasAutoChargeableMethod(ctx context.Context, req interfaces.HasAutoChargeableMethodRequest) (bool, error) {
+	if a == nil || a.Client == nil || a.CustomerSvc == nil || req.CustomerID == "" {
+		return false, nil
+	}
+
+	cbCustomerID, err := a.CustomerSvc.GetChargebeeCustomerID(ctx, req.CustomerID)
+	if err != nil {
+		if ierr.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	sources, err := a.Client.ListPaymentSources(ctx, cbCustomerID)
+	if err != nil {
+		if ierr.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	return lo.ContainsBy(sources, func(s *paymentSourceModel.PaymentSource) bool {
+		return s.Status == paymentSourceEnum.StatusValid || s.Status == paymentSourceEnum.StatusExpiring
+	}), nil
+}
+
 func autoCollectResponse(
 	inv *invoiceModel.Invoice,
 	txn *invoiceModel.LinkedPayment,
@@ -380,5 +410,14 @@ func (a *CheckoutAdapter) FetchPaymentState(
 ) (*interfaces.PaymentState, error) {
 	return nil, ierr.NewError("chargebee does not support checkout payment state reads").
 		WithHint("Chargebee checkout sessions are reconciled by webhook only").
+		Mark(ierr.ErrNotImplemented)
+}
+
+func (a *CheckoutAdapter) ExpirePaymentLink(
+	ctx context.Context,
+	req interfaces.ExpirePaymentLinkRequest,
+) (*interfaces.ExpirePaymentLinkResponse, error) {
+	return nil, ierr.NewError("chargebee hosted pages cannot be expired").
+		WithHint("Chargebee has no API to cancel or expire a hosted page").
 		Mark(ierr.ErrNotImplemented)
 }

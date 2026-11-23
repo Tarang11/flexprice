@@ -3,8 +3,10 @@ package entitlement
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/flexprice/flexprice/internal/types"
+	"github.com/samber/lo"
 	"github.com/shopspring/decimal"
 )
 
@@ -193,5 +195,198 @@ func TestEntitlement_Validate_SubscriptionPeriodWithBehaviorRejected(t *testing.
 	e.GrantAllocationBehavior = types.EntitlementGrantAllocationBehaviorUnitStart
 	if err := e.Validate(); err == nil {
 		t.Fatalf("subscription_period with allocation_behavior must be rejected")
+	}
+}
+
+// Empty allocation behaviour has always meant first_usage, but the schema default never
+// applied: the repository writes the column on every create. Stating it keeps the row
+// readable and a query on the value complete.
+func TestApplyGrantDefaults(t *testing.T) {
+	quota := decimal.NewFromInt(100)
+
+	grant := &Entitlement{
+		GrantMeasure:      types.EntitlementGrantMeasureQuantity,
+		GrantQuota:        &quota,
+		GrantDurationUnit: types.EntitlementGrantDurationUnitHour,
+	}
+	grant.ApplyGrantDefaults()
+	if grant.GrantAllocationBehavior != types.EntitlementGrantAllocationBehaviorFirstUsage {
+		t.Fatalf("empty behaviour should be stated as first_usage, got %q", grant.GrantAllocationBehavior)
+	}
+
+	chosen := &Entitlement{
+		GrantMeasure:            types.EntitlementGrantMeasureQuantity,
+		GrantQuota:              &quota,
+		GrantDurationUnit:       types.EntitlementGrantDurationUnitDay,
+		GrantAllocationBehavior: types.EntitlementGrantAllocationBehaviorUnitStart,
+	}
+	chosen.ApplyGrantDefaults()
+	if chosen.GrantAllocationBehavior != types.EntitlementGrantAllocationBehaviorUnitStart {
+		t.Fatalf("an explicit choice must never be overwritten, got %q", chosen.GrantAllocationBehavior)
+	}
+
+	cycle := &Entitlement{
+		GrantMeasure:      types.EntitlementGrantMeasureQuantity,
+		GrantQuota:        &quota,
+		GrantDurationUnit: types.EntitlementGrantDurationUnitSubscriptionPeriod,
+	}
+	cycle.ApplyGrantDefaults()
+	if cycle.GrantAllocationBehavior != "" {
+		t.Fatalf("a cycle-long window has nothing to anchor, got %q", cycle.GrantAllocationBehavior)
+	}
+
+	limit := int64(100)
+	legacy := &Entitlement{UsageLimit: &limit}
+	legacy.ApplyGrantDefaults()
+	if legacy.GrantAllocationBehavior != "" {
+		t.Fatalf("no grant config means nothing to state, got %q", legacy.GrantAllocationBehavior)
+	}
+}
+
+// An update that restates the current allowance must not read as a change: the service
+// re-runs the meter and price rules only when something actually moved.
+func TestGrantConfigEquals(t *testing.T) {
+	base := func() *Entitlement {
+		q := decimal.NewFromInt(1000)
+		v := 1
+		return &Entitlement{
+			GrantMeasure:            types.EntitlementGrantMeasureQuantity,
+			GrantQuota:              &q,
+			GrantDurationValue:      &v,
+			GrantDurationUnit:       types.EntitlementGrantDurationUnitHour,
+			GrantAllocationBehavior: types.EntitlementGrantAllocationBehaviorFirstUsage,
+			AggregationMode:         types.EntitlementAggregationModeAdditive,
+		}
+	}
+
+	same := base()
+	same.IsEnabled = true
+	same.StaticValue = "unrelated"
+	if !base().GrantConfigEquals(same) {
+		t.Error("fields outside the allowance must not count as a change")
+	}
+
+	// A restated quota is a different pointer holding the same number.
+	restated := base()
+	restated.GrantQuota = lo.ToPtr(decimal.NewFromInt(1000))
+	if !base().GrantConfigEquals(restated) {
+		t.Error("an equal quota behind a different pointer is not a change")
+	}
+
+	for name, mutate := range map[string]func(*Entitlement){
+		"quota":     func(e *Entitlement) { e.GrantQuota = lo.ToPtr(decimal.NewFromInt(500)) },
+		"unlimited": func(e *Entitlement) { e.GrantQuota = nil },
+		"unit":      func(e *Entitlement) { e.GrantDurationUnit = types.EntitlementGrantDurationUnitDay },
+		"value":     func(e *Entitlement) { e.GrantDurationValue = lo.ToPtr(2) },
+		"measure":   func(e *Entitlement) { e.GrantMeasure = types.EntitlementGrantMeasureAmount },
+		"behavior":  func(e *Entitlement) { e.GrantAllocationBehavior = types.EntitlementGrantAllocationBehaviorUnitStart },
+		"stacking":  func(e *Entitlement) { e.AggregationMode = types.EntitlementAggregationModeParallel },
+	} {
+		moved := base()
+		mutate(moved)
+		if base().GrantConfigEquals(moved) {
+			t.Errorf("a changed %s must count as a change", name)
+		}
+	}
+}
+
+func TestEntitlement_LiveWindow(t *testing.T) {
+	day := func(n int) *time.Time { d := time.Date(2026, 7, n, 0, 0, 0, 0, time.UTC); return &d }
+
+	at := []struct {
+		name       string
+		start, end *time.Time
+		at         time.Time
+		want       bool
+	}{
+		{"no dates", nil, nil, *day(5), true},
+		{"inside", day(1), day(10), *day(5), true},
+		{"starts at instant", day(5), nil, *day(5), true},
+		{"not started", day(6), nil, *day(5), false},
+		{"ends at instant", nil, day(5), *day(5), false},
+		{"ended", nil, day(4), *day(5), false},
+	}
+	for _, tt := range at {
+		t.Run("at/"+tt.name, func(t *testing.T) {
+			e := &Entitlement{StartDate: tt.start, EndDate: tt.end}
+			if got := e.IsLiveAt(tt.at); got != tt.want {
+				t.Errorf("IsLiveAt() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// subscriptionEntitlementGrant returns a valid subscription entitlement grant: $30 per subscription period.
+func subscriptionEntitlementGrant() *Entitlement {
+	q := decimal.NewFromInt(30)
+	return &Entitlement{
+		EntityType:        types.ENTITLEMENT_ENTITY_TYPE_SUBSCRIPTION,
+		EntityID:          "subs_1",
+		GrantScope:        types.EntitlementGrantScopeSubscription,
+		GrantMeasure:      types.EntitlementGrantMeasureAmount,
+		GrantDurationUnit: types.EntitlementGrantDurationUnitSubscriptionPeriod,
+		GrantQuota:        &q,
+	}
+}
+
+func TestEntitlement_Validate_SubscriptionScope(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(e *Entitlement)
+		wantErr string
+	}{
+		{name: "valid", mutate: func(*Entitlement) {}},
+		{name: "parallel daily is valid", mutate: func(e *Entitlement) {
+			e.GrantDurationUnit = types.EntitlementGrantDurationUnitDay
+			e.GrantDurationValue = lo.ToPtr(1)
+			e.AggregationMode = types.EntitlementAggregationModeParallel
+		}},
+		{name: "owned by a plan", mutate: func(e *Entitlement) {
+			e.EntityType = types.ENTITLEMENT_ENTITY_TYPE_PLAN
+		}, wantErr: "must belong to a subscription"},
+		{name: "has a feature", mutate: func(e *Entitlement) {
+			e.FeatureID, e.FeatureType = "feat_1", types.FeatureTypeMetered
+		}, wantErr: "has no feature"},
+		{name: "measured in quantity", mutate: func(e *Entitlement) {
+			e.GrantMeasure = types.EntitlementGrantMeasureQuantity
+		}, wantErr: "measured in amount"},
+		{name: "no grant config", mutate: func(e *Entitlement) {
+			e.GrantMeasure, e.GrantDurationUnit, e.GrantQuota = "", "", nil
+		}, wantErr: "measured in amount"},
+		{name: "unlimited", mutate: func(e *Entitlement) {
+			e.GrantQuota = nil
+		}, wantErr: "requires grant_quota"},
+		{name: "zero quota", mutate: func(e *Entitlement) {
+			e.GrantQuota = lo.ToPtr(decimal.Zero)
+		}, wantErr: "grant_quota must be positive"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e := subscriptionEntitlementGrant()
+			tc.mutate(e)
+			err := e.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("expected valid, got %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error = %v; want it to mention %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestEntitlement_Validate_FeatureScopeStillNeedsFeature(t *testing.T) {
+	e := baseEntitlement()
+	e.FeatureID = ""
+	if err := e.Validate(); err == nil || !strings.Contains(err.Error(), "feature_id is required") {
+		t.Fatalf("error = %v; want feature_id is required", err)
+	}
+	e = baseEntitlement()
+	e.GrantScope = "group"
+	if err := e.Validate(); err == nil || !strings.Contains(err.Error(), "grant_scope must be") {
+		t.Fatalf("error = %v; want grant_scope rejected", err)
 	}
 }

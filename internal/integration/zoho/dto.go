@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
+	"github.com/flexprice/flexprice/internal/types"
 	"github.com/shopspring/decimal"
 )
 
@@ -28,25 +30,41 @@ func IsZohoErrorCode(err error, code int) bool {
 	return false
 }
 
+// IsZohoRequestRejected reports whether Zoho refused the request as invalid (HTTP 400).
+// Retrying such a request cannot succeed.
+func IsZohoRequestRejected(err error) bool {
+	var zohoErr *ZohoAPIError
+	return errors.As(err, &zohoErr) && zohoErr.HTTPStatus == http.StatusBadRequest
+}
+
 type ContactPerson struct {
-	FirstName        string `json:"first_name,omitempty"`
-	LastName         string `json:"last_name,omitempty"`
-	Email            string `json:"email,omitempty"`
-	Phone            string `json:"phone,omitempty"`
+	ContactPersonID  string `json:"contact_person_id,omitempty"`
+	Salutation       string `json:"salutation"`
+	FirstName        string `json:"first_name"`
+	LastName         string `json:"last_name"`
+	Email            string `json:"email"`
+	Mobile           string `json:"mobile"`
+	Designation      string `json:"designation"`
+	Department       string `json:"department"`
 	IsPrimaryContact bool   `json:"is_primary_contact,omitempty"`
 }
 
 type ContactAddress struct {
-	Address string `json:"address,omitempty"`
-	City    string `json:"city,omitempty"`
-	State   string `json:"state,omitempty"`
-	Zip     string `json:"zip,omitempty"`
-	Country string `json:"country,omitempty"`
+	Attention   string `json:"attention,omitempty"`
+	Address     string `json:"address,omitempty"`
+	Street2     string `json:"street2,omitempty"`
+	City        string `json:"city,omitempty"`
+	State       string `json:"state,omitempty"`
+	Zip         string `json:"zip,omitempty"`
+	Country     string `json:"country,omitempty"`
+	CountryCode string `json:"country_code,omitempty"`
 }
 
 type ContactCreateRequest struct {
 	ContactName     string          `json:"contact_name"`
 	CompanyName     string          `json:"company_name,omitempty"`
+	LegalName       string          `json:"legal_name,omitempty"`
+	TraderName      string          `json:"trader_name,omitempty"`
 	ContactType     string          `json:"contact_type,omitempty"`
 	CustomerSubType string          `json:"customer_sub_type,omitempty"`
 	BillingAddress  *ContactAddress `json:"billing_address,omitempty"`
@@ -64,10 +82,11 @@ type ContactCreateRequest struct {
 type ContactUpdateRequest = ContactCreateRequest
 
 type ContactResponse struct {
-	ContactID      string `json:"contact_id"`
-	ContactName    string `json:"contact_name,omitempty"`
-	Email          string `json:"email,omitempty"`
-	PrimaryContact string `json:"primary_contact_id,omitempty"`
+	ContactID      string          `json:"contact_id"`
+	ContactName    string          `json:"contact_name,omitempty"`
+	Email          string          `json:"email,omitempty"`
+	PrimaryContact string          `json:"primary_contact_id,omitempty"`
+	ContactPersons []ContactPerson `json:"contact_persons,omitempty"`
 }
 
 type ItemCreateRequest struct {
@@ -146,6 +165,8 @@ type InvoiceCreateRequest struct {
 	ExchangeRate        float64           `json:"exchange_rate,omitempty"`
 	Date                string            `json:"date,omitempty"`
 	DueDate             string            `json:"due_date,omitempty"`
+	PaymentTerms        *int              `json:"payment_terms,omitempty"`
+	PaymentTermsLabel   string            `json:"payment_terms_label,omitempty"`
 	ReferenceNumber     string            `json:"reference_number,omitempty"`
 	Notes               string            `json:"notes,omitempty"`
 	Terms               string            `json:"terms,omitempty"`
@@ -153,12 +174,27 @@ type InvoiceCreateRequest struct {
 	Adjustment          decimal.Decimal   `json:"adjustment,omitzero"`
 	DiscountType        string            `json:"discount_type,omitempty"`
 	IsDiscountBeforeTax bool              `json:"is_discount_before_tax,omitempty"`
+	AccountID           string            `json:"account_id,omitempty"`
 
 	// PlaceOfSupply is the GST state code the supply is made to. It drives Zoho's
 	// IGST vs CGST/SGST split. Zoho falls back to the contact's place_of_contact
 	// when omitted, but sending it pins the value at invoice time.
-	PlaceOfSupply string        `json:"place_of_supply,omitempty"`
-	CustomFields  []CustomField `json:"custom_fields,omitempty"`
+	PlaceOfSupply  string          `json:"place_of_supply,omitempty"`
+	CustomFields   []CustomField   `json:"custom_fields,omitempty"`
+	PaymentOptions *PaymentOptions `json:"payment_options,omitempty"`
+}
+
+// PaymentOptions lists the online payment gateways a Zoho invoice offers. A gateway shows on the
+// invoice only when it is also set up under the Zoho org's Online Payments.
+type PaymentOptions struct {
+	PaymentGateways []PaymentGateway `json:"payment_gateways"`
+}
+
+type PaymentGateway struct {
+	Configured  bool                     `json:"configured"`
+	GatewayName types.ZohoPaymentGateway `json:"gateway_name"`
+	// PayPal payment method (standard or adaptive), set only on the PayPal gateway.
+	AdditionalField1 string `json:"additional_field1,omitempty"`
 }
 
 type InvoiceResponse struct {
@@ -174,6 +210,11 @@ type InvoiceResponse struct {
 const (
 	InvoiceStatusDraft           = "draft"
 	InvoiceStatusPendingApproval = "pending_approval"
+	InvoiceStatusSent            = "sent"
+	InvoiceStatusApproved        = "approved"
+	InvoiceStatusUnpaid          = "unpaid"
+	InvoiceStatusOverdue         = "overdue"
+	InvoiceStatusViewed          = "viewed"
 	InvoiceStatusRejected        = "rejected"
 	InvoiceStatusPaid            = "paid"
 	InvoiceStatusVoid            = "void"
@@ -393,6 +434,8 @@ type customerPaymentResponseWire struct {
 
 type ZohoInvoiceSyncRequest struct {
 	InvoiceID string `json:"invoice_id"`
+	// Resync updates the Zoho invoice when one is already mapped.
+	Resync bool `json:"resync"`
 }
 
 type ZohoInvoiceSyncResponse struct {

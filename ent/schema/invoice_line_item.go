@@ -2,6 +2,7 @@ package schema
 
 import (
 	"entgo.io/ent"
+	"entgo.io/ent/dialect/entsql"
 	"entgo.io/ent/schema/edge"
 	"entgo.io/ent/schema/field"
 	"entgo.io/ent/schema/index"
@@ -131,12 +132,12 @@ func (InvoiceLineItem) Fields() []ent.Field {
 				"postgres": "numeric(20,8)",
 			}).
 			Default(decimal.Zero),
+		// Not immutable: conversion at finalize rewrites the line into the billing currency (§3.6).
 		field.String("currency").
 			SchemaType(map[string]string{
 				"postgres": "varchar(10)",
 			}).
-			NotEmpty().
-			Immutable(),
+			NotEmpty(),
 		field.Time("period_start").
 			Optional().
 			Nillable(),
@@ -192,6 +193,22 @@ func (InvoiceLineItem) Fields() []ent.Field {
 			Immutable().
 			Comment("ID of the subscription_line_item that generated this invoice line item"),
 
+		field.String("commitment_id").
+			SchemaType(map[string]string{
+				"postgres": "varchar(50)",
+			}).
+			Optional().
+			Nillable().
+			Immutable(),
+
+		field.String("billing_instalment_id").
+			SchemaType(map[string]string{
+				"postgres": "varchar(50)",
+			}).
+			Optional().
+			Nillable().
+			Immutable(),
+
 		field.Other("adjusted_entitlement_quantity", decimal.Decimal{}).
 			SchemaType(map[string]string{
 				"postgres": "numeric(20,8)",
@@ -214,6 +231,11 @@ func (InvoiceLineItem) Fields() []ent.Field {
 			SchemaType(map[string]string{
 				"postgres": "jsonb",
 			}),
+		field.JSON("fx_conversion", &types.FxConversion{}).
+			SchemaType(map[string]string{
+				"postgres": "jsonb",
+			}).
+			Optional(),
 	}
 }
 
@@ -241,5 +263,9 @@ func (InvoiceLineItem) Indexes() []ent.Index {
 		index.Fields("tenant_id", "environment_id", "meter_id", "status"),
 		index.Fields("period_start", "period_end"),
 		index.Fields("subscription_id", "status"),
+		index.Fields("tenant_id", "environment_id", "commitment_id").
+			Annotations(entsql.IndexWhere("(commitment_id IS NOT NULL)")),
+		index.Fields("tenant_id", "environment_id", "billing_instalment_id").
+			Annotations(entsql.IndexWhere("(billing_instalment_id IS NOT NULL)")),
 	}
 }

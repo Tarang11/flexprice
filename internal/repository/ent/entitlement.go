@@ -2,7 +2,10 @@ package ent
 
 import (
 	"context"
-	"time"
+
+	"github.com/flexprice/flexprice/internal/clock"
+
+	"github.com/samber/lo"
 
 	"github.com/flexprice/flexprice/ent"
 	"github.com/flexprice/flexprice/ent/entitlement"
@@ -14,7 +17,6 @@ import (
 	"github.com/flexprice/flexprice/internal/logger"
 	"github.com/flexprice/flexprice/internal/postgres"
 	"github.com/flexprice/flexprice/internal/types"
-	"github.com/samber/lo"
 )
 
 var cachedEntityTypes = []types.EntitlementEntityType{
@@ -68,8 +70,9 @@ func (r *entitlementRepository) Create(ctx context.Context, e *domainEntitlement
 		SetID(e.ID).
 		SetEntityType(e.EntityType).
 		SetEntityID(e.EntityID).
-		SetFeatureID(e.FeatureID).
-		SetFeatureType(e.FeatureType).
+		SetNillableFeatureID(lo.EmptyableToPtr(e.FeatureID)).
+		SetNillableFeatureType(lo.EmptyableToPtr(e.FeatureType)).
+		SetGrantScope(e.EffectiveGrantScope()).
 		SetIsEnabled(e.IsEnabled).
 		SetNillableUsageLimit(e.UsageLimit).
 		SetUsageResetPeriod(e.UsageResetPeriod).
@@ -119,6 +122,81 @@ func (r *entitlementRepository) Create(ctx context.Context, e *domainEntitlement
 	}
 
 	r.deleteEntityCache(ctx, e.EntityType, e.EntityID)
+	return domainEntitlement.FromEnt(result), nil
+}
+
+// GetForUpdate row-locks the entitlement, so a caller that reads it, decides from what
+// it read, and then writes is serialized against another transaction doing the same.
+// Uncached by nature: the point is to see the row as it stands right now.
+func (r *entitlementRepository) GetForUpdate(ctx context.Context, id string) (*domainEntitlement.Entitlement, error) {
+	span := StartRepositorySpan(ctx, "entitlement", "get_for_update", map[string]interface{}{
+		"entitlement_id": id,
+		"tenant_id":      types.GetTenantID(ctx),
+	})
+	defer FinishSpan(span)
+
+	client := r.client.Writer(ctx)
+	if client == nil {
+		err := ierr.NewError("failed to get database client").
+			WithHint("Database client is not available").
+			Mark(ierr.ErrDatabase)
+		SetSpanError(span, err)
+		return nil, err
+	}
+
+	tenantID := types.GetTenantID(ctx)
+	environmentID := types.GetEnvironmentID(ctx)
+
+	lockQuery := `SELECT id FROM entitlements WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 FOR UPDATE`
+	rows, err := client.QueryContext(ctx, lockQuery, id, tenantID, environmentID)
+	if err != nil {
+		SetSpanError(span, err)
+		return nil, ierr.WithError(err).
+			WithHint("Failed to lock entitlement").
+			WithReportableDetails(map[string]interface{}{"id": id}).
+			Mark(ierr.ErrDatabase)
+	}
+	// Check and close before running another query on the same connection.
+	hasRow := rows.Next()
+	rowErr := rows.Err()
+	rows.Close()
+	if rowErr != nil {
+		SetSpanError(span, rowErr)
+		return nil, ierr.WithError(rowErr).
+			WithHint("Failed to lock entitlement").
+			WithReportableDetails(map[string]interface{}{"id": id}).
+			Mark(ierr.ErrDatabase)
+	}
+	if !hasRow {
+		return nil, ierr.NewError("entitlement not found").
+			WithHintf("Entitlement with ID %s not found", id).
+			WithReportableDetails(map[string]interface{}{"id": id}).
+			Mark(ierr.ErrNotFound)
+	}
+
+	// Read on the same connection, so this sees the locked row.
+	result, err := client.Entitlement.Query().
+		Where(
+			entitlement.ID(id),
+			entitlement.TenantID(tenantID),
+			entitlement.EnvironmentID(environmentID),
+		).
+		Only(ctx)
+	if err != nil {
+		SetSpanError(span, err)
+		if ent.IsNotFound(err) {
+			return nil, ierr.WithError(err).
+				WithHint("Entitlement not found").
+				WithReportableDetails(map[string]interface{}{"id": id}).
+				Mark(ierr.ErrNotFound)
+		}
+		return nil, ierr.WithError(err).
+			WithHint("Failed to get entitlement").
+			WithReportableDetails(map[string]interface{}{"id": id}).
+			Mark(ierr.ErrDatabase)
+	}
+
+	SetSpanSuccess(span)
 	return domainEntitlement.FromEnt(result), nil
 }
 
@@ -309,8 +387,6 @@ func (r *entitlementRepository) Update(ctx context.Context, e *domainEntitlement
 		).
 		SetEntityType(e.EntityType).
 		SetEntityID(e.EntityID).
-		SetFeatureID(e.FeatureID).
-		SetFeatureType(e.FeatureType).
 		SetIsEnabled(e.IsEnabled).
 		SetIsSoftLimit(e.IsSoftLimit).
 		SetNillableUsageLimit(e.UsageLimit).
@@ -320,13 +396,18 @@ func (r *entitlementRepository) Update(ctx context.Context, e *domainEntitlement
 		SetNillableStartDate(e.StartDate).
 		SetNillableEndDate(e.EndDate).
 		SetStatus(string(e.Status)).
-		SetUpdatedAt(time.Now().UTC()).
+		SetUpdatedAt(clock.Now()).
 		SetUpdatedBy(types.GetUserID(ctx)).
 		SetGrantMeasure(e.GrantMeasure).
 		SetGrantDurationUnit(e.GrantDurationUnit).
 		SetGrantAllocationBehavior(e.GrantAllocationBehavior).
 		SetAggregationMode(defaultedAggregationMode(e.AggregationMode))
 	// SetNillable* with nil is a no-op, so clearing a grant config needs explicit Clear.
+	if e.FeatureID != "" {
+		updateQuery = updateQuery.SetFeatureID(e.FeatureID).SetFeatureType(e.FeatureType)
+	} else {
+		updateQuery = updateQuery.ClearFeatureID().ClearFeatureType()
+	}
 	if e.GrantDurationValue != nil {
 		updateQuery = updateQuery.SetGrantDurationValue(*e.GrantDurationValue)
 	} else {
@@ -387,7 +468,7 @@ func (r *entitlementRepository) Delete(ctx context.Context, id string) error {
 			entitlement.EnvironmentID(types.GetEnvironmentID(ctx)),
 		).
 		SetStatus(string(types.StatusArchived)).
-		SetUpdatedAt(time.Now().UTC()).
+		SetUpdatedAt(clock.Now()).
 		SetUpdatedBy(types.GetUserID(ctx)).
 		Save(ctx)
 
@@ -437,8 +518,9 @@ func (r *entitlementRepository) CreateBulk(ctx context.Context, entitlements []*
 			SetID(e.ID).
 			SetEntityType(e.EntityType).
 			SetEntityID(e.EntityID).
-			SetFeatureID(e.FeatureID).
-			SetFeatureType(e.FeatureType).
+			SetNillableFeatureID(lo.EmptyableToPtr(e.FeatureID)).
+			SetNillableFeatureType(lo.EmptyableToPtr(e.FeatureType)).
+			SetGrantScope(e.EffectiveGrantScope()).
 			SetIsEnabled(e.IsEnabled).
 			SetNillableUsageLimit(e.UsageLimit).
 			SetUsageResetPeriod(e.UsageResetPeriod).
@@ -529,7 +611,7 @@ func (r *entitlementRepository) DeleteBulk(ctx context.Context, ids []string) er
 			entitlement.EnvironmentID(types.GetEnvironmentID(ctx)),
 		).
 		SetStatus(string(types.StatusDeleted)).
-		SetUpdatedAt(time.Now().UTC()).
+		SetUpdatedAt(clock.Now()).
 		SetUpdatedBy(types.GetUserID(ctx)).
 		Save(ctx)
 
@@ -726,6 +808,7 @@ func (o EntitlementQueryOptions) GetFieldResolver(field string) (string, error) 
 
 func (o EntitlementQueryOptions) applyEntityQueryOptions(_ context.Context, f *types.EntitlementFilter, query EntitlementQuery) (EntitlementQuery, error) {
 	var err error
+	query = query.Where(entitlement.GrantScopeIn(f.EffectiveGrantScopes()...))
 	if f == nil {
 		return query, nil
 	}

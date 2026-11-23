@@ -7,17 +7,22 @@ package stripe
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/flexprice/flexprice/internal/api/dto"
 	"github.com/flexprice/flexprice/internal/cache"
+	"github.com/flexprice/flexprice/internal/domain/connection"
 	"github.com/flexprice/flexprice/internal/domain/customer"
 	"github.com/flexprice/flexprice/internal/domain/entityintegrationmapping"
+	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/interfaces"
 	"github.com/flexprice/flexprice/internal/logger"
 	"github.com/flexprice/flexprice/internal/types"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	stripeapi "github.com/stripe/stripe-go/v82"
 )
 
 // ── fake interfaces.CustomerService ──────────────────────────────────────────
@@ -31,6 +36,8 @@ type syncTestCustomerService struct {
 	stripeIDOnCall int
 	stripeID       string
 	updateCalls    []dto.UpdateCustomerRequest
+	updateErr      error
+	created        []dto.CreateCustomerRequest
 }
 
 func (s *syncTestCustomerService) GetCustomer(_ context.Context, _ string) (*dto.CustomerResponse, error) {
@@ -44,8 +51,16 @@ func (s *syncTestCustomerService) GetCustomer(_ context.Context, _ string) (*dto
 	return &dto.CustomerResponse{Customer: s.customer}, nil
 }
 
+func (s *syncTestCustomerService) CreateCustomer(_ context.Context, req dto.CreateCustomerRequest) (*dto.CustomerResponse, error) {
+	s.created = append(s.created, req)
+	return &dto.CustomerResponse{Customer: &customer.Customer{ID: "cust_test", Name: req.Name, Email: req.Email}}, nil
+}
+
 func (s *syncTestCustomerService) UpdateCustomer(_ context.Context, _ string, req dto.UpdateCustomerRequest) (*dto.CustomerResponse, error) {
 	s.updateCalls = append(s.updateCalls, req)
+	if s.updateErr != nil {
+		return nil, s.updateErr
+	}
 	s.customer.Metadata = req.Metadata
 	return &dto.CustomerResponse{Customer: s.customer}, nil
 }
@@ -95,6 +110,19 @@ func (l *syncTestLocker) AcquireLock(_ context.Context, _ string, _ time.Duratio
 	return syncTestLock{acquired: acquired, releaseCalls: &l.releaseCalls}, nil
 }
 
+// stubConnectionRepo resolves every provider to one published test connection.
+type stubConnectionRepo struct {
+	connection.Repository
+}
+
+func (stubConnectionRepo) GetByProvider(_ context.Context, provider types.SecretProvider) (*connection.Connection, error) {
+	return &connection.Connection{ID: "conn_test", ProviderType: provider}, nil
+}
+
+func testClient() *Client {
+	return NewClient(stubConnectionRepo{}, nil, logger.NewNoopLogger())
+}
+
 func testContext() context.Context {
 	ctx := types.SetTenantID(context.Background(), "tenant_test")
 	return types.SetEnvironmentID(ctx, "env_test")
@@ -116,6 +144,7 @@ func TestEnsureCustomerSyncedToStripe(t *testing.T) {
 		mappings           []*entityintegrationmapping.EntityIntegrationMapping
 		stripeIDOnCall     int
 		concurrentID       string
+		updateErr          error
 		wantStripeID       string
 		wantAcquireCalls   int
 		wantReleaseCalls   int
@@ -133,6 +162,16 @@ func TestEnsureCustomerSyncedToStripe(t *testing.T) {
 			mappings: []*entityintegrationmapping.EntityIntegrationMapping{
 				{EntityID: customerID, ProviderEntityID: mappedCus},
 			},
+			wantStripeID:    mappedCus,
+			wantUpdateCalls: 1,
+		},
+		{
+			name:               "mapping present still returns the id when the metadata backfill fails",
+			lockAcquiredOnCall: 1,
+			mappings: []*entityintegrationmapping.EntityIntegrationMapping{
+				{EntityID: customerID, ProviderEntityID: mappedCus},
+			},
+			updateErr:       errors.New("db unavailable"),
 			wantStripeID:    mappedCus,
 			wantUpdateCalls: 1,
 		},
@@ -162,11 +201,12 @@ func TestEnsureCustomerSyncedToStripe(t *testing.T) {
 				customer:       &customer.Customer{ID: customerID, Metadata: tt.metadata},
 				stripeIDOnCall: tt.stripeIDOnCall,
 				stripeID:       tt.concurrentID,
+				updateErr:      tt.updateErr,
 			}
 			mappingRepo := &syncTestMappingRepo{mappings: tt.mappings}
 			locker := &syncTestLocker{acquiredOnCall: tt.lockAcquiredOnCall}
 
-			svc := NewCustomerService(nil, nil, mappingRepo, locker, logger.NewNoopLogger())
+			svc := NewCustomerService(testClient(), nil, mappingRepo, locker, logger.NewNoopLogger())
 
 			resp, err := svc.EnsureCustomerSyncedToStripe(testContext(), customerID, customerSvc)
 
@@ -176,6 +216,71 @@ func TestEnsureCustomerSyncedToStripe(t *testing.T) {
 			require.Equal(t, tt.wantAcquireCalls, locker.acquireCalls)
 			require.Equal(t, tt.wantReleaseCalls, locker.releaseCalls)
 			require.Len(t, customerSvc.updateCalls, tt.wantUpdateCalls)
+		})
+	}
+}
+
+// GetStripeCustomerID must never create a Stripe customer, so no case takes the sync lock.
+func TestGetStripeCustomerID(t *testing.T) {
+	const (
+		customerID = "cust_test001"
+		metaCus    = "cus_frommetadata"
+		mappedCus  = "cus_frommapping"
+	)
+
+	tests := []struct {
+		name         string
+		metadata     map[string]string
+		mappings     []*entityintegrationmapping.EntityIntegrationMapping
+		updateErr    error
+		wantStripeID string
+		wantNotFound bool
+	}{
+		{
+			name:         "metadata set",
+			metadata:     map[string]string{"stripe_customer_id": metaCus},
+			wantStripeID: metaCus,
+		},
+		{
+			name: "linked only through the mapping",
+			mappings: []*entityintegrationmapping.EntityIntegrationMapping{
+				{EntityID: customerID, ProviderEntityID: mappedCus},
+			},
+			wantStripeID: mappedCus,
+		},
+		{
+			name: "linked through the mapping and the metadata backfill fails",
+			mappings: []*entityintegrationmapping.EntityIntegrationMapping{
+				{EntityID: customerID, ProviderEntityID: mappedCus},
+			},
+			updateErr:    errors.New("db unavailable"),
+			wantStripeID: mappedCus,
+		},
+		{
+			name:         "never synced is not found",
+			wantNotFound: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			customerSvc := &syncTestCustomerService{
+				customer:  &customer.Customer{ID: customerID, Metadata: tt.metadata},
+				updateErr: tt.updateErr,
+			}
+			locker := &syncTestLocker{acquiredOnCall: 1}
+			svc := NewCustomerService(testClient(), nil, &syncTestMappingRepo{mappings: tt.mappings}, locker, logger.NewNoopLogger())
+
+			stripeID, err := svc.GetStripeCustomerID(testContext(), customerID, customerSvc)
+
+			require.Zero(t, locker.acquireCalls)
+			if tt.wantNotFound {
+				require.True(t, ierr.IsNotFound(err), "got %v", err)
+				require.Empty(t, stripeID)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.wantStripeID, stripeID)
 		})
 	}
 }
@@ -197,4 +302,133 @@ func TestCustomerCreateIdempotencyKeyIsStablePerCustomer(t *testing.T) {
 		customerCreateIdempotencyKey(ctx, "cust_test001"),
 		customerCreateIdempotencyKey(otherEnv, "cust_test001"),
 	)
+}
+
+func TestDefaultPaymentMethodID(t *testing.T) {
+	assert.Equal(t, "", defaultPaymentMethodID(nil))
+	assert.Equal(t, "", defaultPaymentMethodID(&stripeapi.Customer{}))
+	assert.Equal(t, "", defaultPaymentMethodID(&stripeapi.Customer{
+		InvoiceSettings: &stripeapi.CustomerInvoiceSettings{},
+	}))
+	assert.Equal(t, "pm_default", defaultPaymentMethodID(&stripeapi.Customer{
+		InvoiceSettings: &stripeapi.CustomerInvoiceSettings{
+			DefaultPaymentMethod: &stripeapi.PaymentMethod{ID: "pm_default"},
+		},
+	}))
+}
+
+// The service has no Stripe client, so reaching Stripe would panic: an unlinked customer must
+// return first.
+func TestUpdateCustomerInStripe_UnlinkedCustomerIsSkipped(t *testing.T) {
+	customerSvc := &syncTestCustomerService{
+		customer: &customer.Customer{
+			ID:   "cust_test001",
+			Name: "Acme",
+		},
+	}
+	svc := NewCustomerService(testClient(), nil, &syncTestMappingRepo{}, &syncTestLocker{}, logger.NewNoopLogger())
+
+	err := svc.UpdateCustomerInStripe(testContext(), customerSvc.customer, customerSvc)
+
+	require.NoError(t, err)
+}
+
+func TestCustomerUpdateParams(t *testing.T) {
+	tests := []struct {
+		name        string
+		customer    *customer.Customer
+		wantAddress *stripeapi.AddressParams
+	}{
+		{
+			name: "full address",
+			customer: &customer.Customer{
+				Name:              "Acme",
+				Email:             "billing@acme.test",
+				AddressLine1:      "1 Main St",
+				AddressLine2:      "Suite 2",
+				AddressCity:       "Austin",
+				AddressState:      "TX",
+				AddressPostalCode: "78701",
+				AddressCountry:    "US",
+			},
+			wantAddress: &stripeapi.AddressParams{
+				Line1:      stripeapi.String("1 Main St"),
+				Line2:      stripeapi.String("Suite 2"),
+				City:       stripeapi.String("Austin"),
+				State:      stripeapi.String("TX"),
+				PostalCode: stripeapi.String("78701"),
+				Country:    stripeapi.String("US"),
+			},
+		},
+		{
+			name: "country and postal code alone are still sent, which is all Stripe Tax needs",
+			customer: &customer.Customer{
+				Name:              "Acme",
+				Email:             "billing@acme.test",
+				AddressPostalCode: "78701",
+				AddressCountry:    "US",
+			},
+			wantAddress: &stripeapi.AddressParams{
+				Line1:      stripeapi.String(""),
+				Line2:      stripeapi.String(""),
+				City:       stripeapi.String(""),
+				State:      stripeapi.String(""),
+				PostalCode: stripeapi.String("78701"),
+				Country:    stripeapi.String("US"),
+			},
+		},
+		{
+			name: "no address leaves Stripe's alone",
+			customer: &customer.Customer{
+				Name:  "Acme",
+				Email: "billing@acme.test",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			params := customerUpdateParams(tt.customer)
+
+			assert.Equal(t, tt.customer.Name, *params.Name)
+			assert.Equal(t, tt.customer.Email, *params.Email)
+			assert.Equal(t, tt.wantAddress, params.Address)
+		})
+	}
+}
+
+func TestCreateCustomerFromStripe_NameFallsBackToEmail(t *testing.T) {
+	tests := []struct {
+		name      string
+		stripe    *stripeapi.Customer
+		wantName  string
+		wantEmail string
+	}{
+		{
+			name:      "blank stripe name uses email",
+			stripe:    &stripeapi.Customer{ID: "cus_noname", Email: "ada@example.com"},
+			wantName:  "ada@example.com",
+			wantEmail: "ada@example.com",
+		},
+		{
+			name:      "stripe name is kept",
+			stripe:    &stripeapi.Customer{ID: "cus_named", Name: "Ada Lovelace", Email: "ada@example.com"},
+			wantName:  "Ada Lovelace",
+			wantEmail: "ada@example.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			customers := &syncTestCustomerService{}
+			svc := NewCustomerService(testClient(), nil, nil, nil, logger.NewNoopLogger())
+
+			err := svc.CreateCustomerFromStripe(context.Background(), tt.stripe, "env_test", customers)
+			require.NoError(t, err)
+			require.Len(t, customers.created, 1)
+			assert.Equal(t, tt.wantName, customers.created[0].Name)
+			assert.Equal(t, tt.wantEmail, customers.created[0].Email)
+			assert.Equal(t, tt.stripe.ID, customers.created[0].ExternalID)
+		})
+	}
 }

@@ -3,15 +3,17 @@ package service
 import (
 	"context"
 	"strings"
-	"time"
+
+	"github.com/flexprice/flexprice/internal/clock"
+
+	"github.com/samber/lo"
+	"github.com/shopspring/decimal"
 
 	"github.com/flexprice/flexprice/internal/api/dto"
 	domainCheckout "github.com/flexprice/flexprice/internal/domain/checkout"
 	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/interfaces"
 	"github.com/flexprice/flexprice/internal/types"
-	"github.com/samber/lo"
-	"github.com/shopspring/decimal"
 )
 
 func (s *checkoutSessionService) executeCheckoutAction(ctx context.Context, session *domainCheckout.CheckoutSession) error {
@@ -37,10 +39,17 @@ func (s *checkoutSessionService) executeCheckoutAction(ctx context.Context, sess
 		result.CreateSubscriptionResult.PaymentID = payResp.ID
 		session.CheckoutInvoiceID = &invResp.ID
 		session.CheckoutPaymentID = &payResp.ID
+		// A gateway that charges inside the call can webhook before it returns.
+		if err := s.CheckoutSessionRepo.Update(ctx, session); err != nil {
+			return err
+		}
 
 		// Contact the payment gateway and get the hosted checkout URL.
 		providerResult, err := s.callCheckoutProvider(ctx, session, payResp)
 		if err != nil {
+			if s.completedDuringProviderCall(ctx, session) {
+				return nil
+			}
 			return err
 		}
 		s.recordGatewayHandles(ctx, payResp.ID, providerResult)
@@ -54,7 +63,32 @@ func (s *checkoutSessionService) executeCheckoutAction(ctx context.Context, sess
 			Mark(ierr.ErrValidation)
 	}
 
-	return s.CheckoutSessionRepo.Update(ctx, session)
+	return s.savePendingSession(ctx, session)
+}
+
+// savePendingSession keeps a session the webhook already finished instead of failing on it.
+func (s *checkoutSessionService) savePendingSession(ctx context.Context, session *domainCheckout.CheckoutSession) error {
+	err := s.CheckoutSessionRepo.Update(ctx, session)
+	if !ierr.IsNotFound(err) {
+		return err
+	}
+	current, getErr := s.CheckoutSessionRepo.Get(ctx, session.ID)
+	if getErr != nil || !current.CheckoutStatus.IsTerminal() {
+		return err
+	}
+	*session = *current
+	return nil
+}
+
+// completedDuringProviderCall loads a session the webhook completed although the provider
+// call failed, such as a charge that went through before the call timed out.
+func (s *checkoutSessionService) completedDuringProviderCall(ctx context.Context, session *domainCheckout.CheckoutSession) bool {
+	current, err := s.CheckoutSessionRepo.Get(ctx, session.ID)
+	if err != nil || current.CheckoutStatus != types.CheckoutStatusCompleted {
+		return false
+	}
+	*session = *current
+	return true
 }
 
 // callCheckoutProvider contacts the payment gateway, tightens ExpiresAt if the provider URL
@@ -82,21 +116,22 @@ func (s *checkoutSessionService) callCheckoutProvider(
 		return nil, err
 	}
 
-	req := interfaces.CheckoutProviderRequest{
-		InvoiceID:  *session.CheckoutInvoiceID,
-		CustomerID: session.CustomerID,
-		Amount:     payResp.Amount,
-		Currency:   payResp.Currency,
-		PaymentID:  payResp.ID,
-		SuccessURL: lo.FromPtr(session.SuccessURL),
-		FailureURL: lo.FromPtr(session.FailureURL),
-		CancelURL:  lo.FromPtr(session.CancelURL),
-		Metadata:   session.Metadata,
-		ExpiresAt:  &linkExpiresAt,
-		LineItems:  checkoutLineItemsFor(inv),
-	}
-
 	cfg := lo.FromPtr(session.PaymentProviderConfig.ToCheckoutPaymentProviderConfig())
+
+	req := interfaces.CheckoutProviderRequest{
+		InvoiceID:      *session.CheckoutInvoiceID,
+		CustomerID:     session.CustomerID,
+		Amount:         payResp.Amount,
+		Currency:       payResp.Currency,
+		PaymentID:      payResp.ID,
+		SuccessURL:     lo.FromPtr(session.SuccessURL),
+		FailureURL:     lo.FromPtr(session.FailureURL),
+		CancelURL:      lo.FromPtr(session.CancelURL),
+		Metadata:       session.Metadata,
+		ExpiresAt:      &linkExpiresAt,
+		LineItems:      checkoutLineItemsFor(inv),
+		NotifyCustomer: cfg.NotifyCustomer,
+	}
 
 	var resp *interfaces.CheckoutProviderResponse
 
@@ -124,6 +159,7 @@ func (s *checkoutSessionService) callCheckoutProvider(
 			CancelURL:       req.CancelURL,
 			Metadata:        req.Metadata,
 			LineItems:       req.LineItems,
+			NotifyCustomer:  req.NotifyCustomer,
 		}
 
 		// Prefer an existing confirmed token (off-session). If none / amount above
@@ -132,6 +168,11 @@ func (s *checkoutSessionService) callCheckoutProvider(
 			return nil, chargeErr
 		} else if charged {
 			resp = chargedResp
+			// The debit lands after the settlement window, so the session must outlive it
+			// or the late capture is refunded.
+			if settleBy := clock.Now().Add(session.PaymentProvider.SavedMethodSettlement(chargedResp.PaymentMethod)); settleBy.After(session.ExpiresAt) {
+				session.ExpiresAt = settleBy
+			}
 			break
 		}
 
@@ -141,6 +182,17 @@ func (s *checkoutSessionService) callCheckoutProvider(
 		if cfg.CustomerNotPresent {
 			return nil, ierr.NewError("no saved payment method could be charged").
 				WithHint("The customer has no payment method that can be charged automatically").
+				WithReportableDetails(map[string]any{
+					"customer_id": req.CustomerID,
+					"invoice_id":  req.InvoiceID,
+				}).
+				Mark(ierr.ErrInvalidOperation)
+		}
+
+		// eNACH mandates are set up through setup intents, never at checkout.
+		if cfg.PaymentMethod == types.PaymentMethodTypeENACH {
+			return nil, ierr.NewError("no active eNACH mandate covers this amount").
+				WithHint("No active eNACH mandate covers this amount. Set one up first.").
 				WithReportableDetails(map[string]any{
 					"customer_id": req.CustomerID,
 					"invoice_id":  req.InvoiceID,
@@ -327,12 +379,9 @@ func (s *checkoutSessionService) completeModifySubscriptionCheckout(
 	invoiceID := *session.CheckoutInvoiceID
 	paymentID := *session.CheckoutPaymentID
 
-	modSvc := &subscriptionModificationService{serviceParams: s.ServiceParams}
-	quantityChangeReq, err := modSvc.requestFromModifySubscriptionParams(ctx, params)
-	if err != nil {
-		return err
-	}
-	if _, err := modSvc.applyQuantityChange(ctx, quantityChangeReq); err != nil {
+	modSvc := NewSubscriptionModificationService(s.ServiceParams).(*subscriptionModificationService)
+	// TODO: pay-first flows don't handle a sub cancelled mid-checkout or finalize failing until expiry; handle generically.
+	if err := modSvc.applyModifySubscriptionParams(ctx, params); err != nil {
 		return err
 	}
 
@@ -357,12 +406,20 @@ func (s *checkoutSessionService) completeAddAddonCheckout(
 	}
 
 	cfg := session.Configuration.ToCheckoutConfiguration()
-	params := cfg.AddAddonParams
+	entries := cfg.AddAddonEntries()
 	invoiceID := *session.CheckoutInvoiceID
 	paymentID := *session.CheckoutPaymentID
 
 	subSvc := &subscriptionService{ServiceParams: s.ServiceParams}
-	if err := subSvc.applyAddAddonCheckoutParams(ctx, params); err != nil {
+	err := s.DB.WithTx(ctx, func(ctx context.Context) error {
+		for _, params := range entries {
+			if err := subSvc.applyAddAddonCheckoutParams(ctx, params); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
 		return err
 	}
 
@@ -370,8 +427,10 @@ func (s *checkoutSessionService) completeAddAddonCheckout(
 		return err
 	}
 
-	subSvc.publishSystemEvent(ctx, types.WebhookEventSubscriptionUpdated, params.SubscriptionID)
-	triggerHubSpotDealSync(ctx, s.ServiceParams, params.SubscriptionID)
+	for _, params := range entries {
+		subSvc.publishSystemEvent(ctx, types.WebhookEventSubscriptionUpdated, params.SubscriptionID)
+		triggerHubSpotDealSync(ctx, s.ServiceParams, params.SubscriptionID)
+	}
 	return nil
 }
 
@@ -490,7 +549,7 @@ func (s *checkoutSessionService) finalizeCheckoutInvoiceAndPayment(
 	}
 
 	statusStr := string(types.PaymentStatusSucceeded)
-	now := time.Now().UTC()
+	now := clock.Now()
 	updateReq := dto.UpdatePaymentRequest{
 		PaymentStatus: &statusStr,
 		SucceededAt:   &now,

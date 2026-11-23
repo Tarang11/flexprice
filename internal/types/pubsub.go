@@ -12,3 +12,12 @@ type IntegrationEventsPubSub struct {
 	pubsub.PubSub
 }
 
+// ActivityPubSub carries activity log messages.
+type ActivityPubSub struct {
+	pubsub.PubSub
+}
+
+// EmailEventsPubSub consumes webhook.topic under the email-events consumer group.
+type EmailEventsPubSub struct {
+	pubsub.PubSub
+}

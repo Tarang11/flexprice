@@ -6,9 +6,11 @@ import (
 	"testing"
 	"time"
 
+	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/types"
 	"github.com/samber/lo"
 	"github.com/shopspring/decimal"
+	"github.com/stretchr/testify/require"
 )
 
 func TestLineItemCommitmentConfig_Validate_OverageFactor(t *testing.T) {
@@ -37,6 +39,26 @@ func TestLineItemCommitmentConfig_Validate_OverageFactor(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "overage_factor must be at least 1.0") {
 			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("defaults overage factor when only time buckets are set", func(t *testing.T) {
+		c := &LineItemCommitmentConfig{
+			IsWindowCommitment: lo.ToPtr(true),
+			CommitmentTimeBuckets: []CommitmentBucketRequest{{
+				ID:              "bkt_existing",
+				Start:           types.Bucket{Hour: 8},
+				End:             types.Bucket{Hour: 20},
+				CommitmentType:  types.COMMITMENT_TYPE_QUANTITY,
+				CommitmentValue: decimal.NewFromInt(10),
+			}},
+		}
+		c.ApplyDefaults()
+		if err := c.Validate(); err != nil {
+			t.Fatalf("expected no error, got: %v", err)
+		}
+		if c.OverageFactor == nil || !c.OverageFactor.Equal(decimal.NewFromInt(1)) {
+			t.Fatalf("expected default overage factor 1, got: %v", c.OverageFactor)
 		}
 	})
 }
@@ -356,6 +378,78 @@ func TestCreateSubscriptionRequestValidate_IncludePriceIDs(t *testing.T) {
 	}
 }
 
+func TestCreateSubscriptionRequestValidate_InlineCommitments(t *testing.T) {
+	start := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
+	inline := func(key string, scope CommitmentScopeInput) CreateCommitmentRequest {
+		return CreateCommitmentRequest{
+			IdempotencyKey: lo.EmptyableToPtr(key),
+			Name:           "Floor",
+			Scope:          scope,
+			Type:           types.COMMITMENT_TYPE_AMOUNT,
+			Value:          decimal.NewFromInt(100),
+			Measurement:    types.CommitmentMeasurementBillingPeriod,
+			StartDate:      start,
+			EndDate:        lo.ToPtr(start.AddDate(1, 0, 0)),
+		}
+	}
+	subscriptionScope := CommitmentScopeInput{EntityType: types.CommitmentScopeSubscription}
+	priceScope := CommitmentScopeInput{EntityType: types.CommitmentScopePrice, EntityID: "price_a"}
+	longLabel := inline("", priceScope)
+	longLabel.BillingTerms = []BillingTermInput{
+		{ValueType: types.BillingTermValueRemainder, InvoiceLabel: lo.ToPtr(strings.Repeat("a", 256))},
+	}
+
+	tests := []struct {
+		name        string
+		commitments []CreateCommitmentRequest
+		errSub      string
+	}{
+		{
+			name:        "no subscription_id needed inline",
+			commitments: []CreateCommitmentRequest{inline("", priceScope)},
+		},
+		{
+			name:        "subscription scope may omit entity_id",
+			commitments: []CreateCommitmentRequest{inline("", subscriptionScope)},
+		},
+		{
+			name:        "price scope needs entity_id",
+			commitments: []CreateCommitmentRequest{inline("", CommitmentScopeInput{EntityType: types.CommitmentScopePrice})},
+			errSub:      "scope.entity_id is required",
+		},
+		{
+			name:        "distinct idempotency keys",
+			commitments: []CreateCommitmentRequest{inline("k1", priceScope), inline("k2", subscriptionScope)},
+		},
+		{
+			name:        "duplicate idempotency keys rejected",
+			commitments: []CreateCommitmentRequest{inline("k1", priceScope), inline("k1", subscriptionScope)},
+			errSub:      "more than once",
+		},
+		{
+			name:        "billing term invoice_label over 255 characters",
+			commitments: []CreateCommitmentRequest{longLabel},
+			errSub:      "BillingTerms[0].InvoiceLabel",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := baseCreateSubscriptionRequest()
+			req.Commitments = tc.commitments
+			err := req.Validate()
+			if tc.errSub == "" {
+				require.NoError(t, err)
+				return
+			}
+
+			require.Error(t, err)
+			require.True(t, ierr.IsValidation(err), "want validation error, got %v", err)
+			require.Contains(t, err.Error(), tc.errSub)
+			require.Empty(t, req.Commitments[0].SubscriptionID, "validation must not write to the request")
+		})
+	}
+}
+
 func TestCreateSubscriptionRequestValidate_LineItemGrouping(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -400,5 +494,78 @@ func TestCreateSubscriptionRequestToSubscription_DefaultsLineItemGrouping(t *tes
 
 	if sub.LineItemGrouping != types.LineItemGroupingPerChargePeriod {
 		t.Errorf("LineItemGrouping = %q, want %q when omitted", sub.LineItemGrouping, types.LineItemGroupingPerChargePeriod)
+	}
+}
+
+func TestCreateSubscriptionRequestValidate_FxRates(t *testing.T) {
+	at := func(day int) *time.Time {
+		v := time.Date(2026, 1, day, 0, 0, 0, 0, time.UTC)
+		return &v
+	}
+	rate := func(r string, from, to *time.Time) InlineFXRate {
+		return InlineFXRate{Rate: decimal.RequireFromString(r), StartDate: from, EndDate: to}
+	}
+	cases := []struct {
+		name    string
+		rates   []InlineFXRate
+		wantErr string
+	}{
+		{name: "none"},
+		{name: "single open-ended", rates: []InlineFXRate{rate("83", nil, nil)}},
+		{name: "consecutive windows", rates: []InlineFXRate{rate("83", nil, at(5)), rate("84", at(5), nil)}},
+		{name: "zero rate", rates: []InlineFXRate{rate("0", nil, nil)}, wantErr: "fx_rates[0].rate"},
+		{name: "start not before end", rates: []InlineFXRate{rate("83", at(5), at(5))}, wantErr: "fx_rates[0].start_date"},
+		{name: "two open-ended rows overlap", rates: []InlineFXRate{rate("83", nil, nil), rate("84", nil, nil)}, wantErr: "overlap"},
+		{name: "partial overlap", rates: []InlineFXRate{rate("83", at(1), at(6)), rate("84", at(5), at(9))}, wantErr: "overlap"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := baseCreateSubscriptionRequest()
+			req.FxRates = tc.rates
+			err := req.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("expected no error, got %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestAddAddonRequestValidate_CheckoutAllowsOverridesNotCommitments(t *testing.T) {
+	request := func(mutate func(*AddAddonRequest)) *AddAddonRequest {
+		req := &AddAddonRequest{
+			SubscriptionID: "subs_123",
+			Checkout: &CheckoutParams{
+				PaymentParams: PaymentParams{PaymentProvider: types.CheckoutPaymentProviderRazorpay},
+			},
+			AddAddonToSubscriptionRequest: AddAddonToSubscriptionRequest{
+				AddonID: "addon_123",
+				Cadence: types.AddonCadenceRecurring,
+			},
+		}
+		mutate(req)
+		return req
+	}
+
+	withOverride := request(func(r *AddAddonRequest) {
+		r.OverrideLineItems = []OverrideLineItemRequest{{PriceID: "price_123", Amount: lo.ToPtr(decimal.NewFromInt(10))}}
+	})
+	if err := withOverride.Validate(); err != nil {
+		t.Fatalf("override_line_items with checkout must validate, got %v", err)
+	}
+
+	withCommitment := request(func(r *AddAddonRequest) {
+		r.LineItemCommitments = map[string]*LineItemCommitmentConfig{"price_123": {}}
+	})
+	if err := withCommitment.Validate(); err == nil {
+		t.Fatal("line_item_commitments with checkout must still be rejected")
 	}
 }

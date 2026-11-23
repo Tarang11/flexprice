@@ -61,10 +61,12 @@ func TestValidate_QuotaAndUsageSigns(t *testing.T) {
 		t.Fatalf("negative quota should be rejected")
 	}
 
+	// Zero is a deliberate state: the successor of a spent pool carries no balance
+	// and exists only to hold the slot on a live config.
 	g = baseGrant()
 	g.Quota = decimal.Zero
-	if err := g.Validate(); err == nil {
-		t.Fatalf("zero quota should be rejected — grants must be positive")
+	if err := g.Validate(); err != nil {
+		t.Fatalf("zero quota must be accepted: %v", err)
 	}
 
 	g = baseGrant()
@@ -116,15 +118,15 @@ func TestOverage(t *testing.T) {
 func TestIsExhausted(t *testing.T) {
 	g := baseGrant()
 	g.Usage = decimal.NewFromInt(99)
-	if g.IsExhausted() {
+	if g.IsExhausted(g.Usage) {
 		t.Fatalf("99/100 should not be exhausted")
 	}
 	g.Usage = decimal.NewFromInt(100)
-	if !g.IsExhausted() {
+	if !g.IsExhausted(g.Usage) {
 		t.Fatalf("100/100 should be exhausted")
 	}
 	g.Usage = decimal.NewFromInt(101)
-	if !g.IsExhausted() {
+	if !g.IsExhausted(g.Usage) {
 		t.Fatalf("101/100 should be exhausted")
 	}
 }
@@ -237,5 +239,31 @@ func TestBuilder_MetadataIsDeepCopied(t *testing.T) {
 
 	if _, leaked := g.Metadata["added"]; leaked {
 		t.Fatalf("builder shares the source grant's metadata map: %v", g.Metadata)
+	}
+}
+
+func TestRemainingBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		usage, quota, want int64
+	}{
+		{"unused", 0, 100, 100},
+		{"recovered", 80, 100, 20},
+		{"exhausted", 120, 100, 0},
+		{"zero quota", 0, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := baseGrant()
+			g.Usage = decimal.NewFromInt(tc.usage)
+			g.Quota = decimal.NewFromInt(tc.quota)
+			remaining, bounded := g.Remaining()
+			if !bounded || !remaining.Equal(decimal.NewFromInt(tc.want)) {
+				t.Fatalf("remaining = %s, bounded = %t; want %d", remaining, bounded, tc.want)
+			}
+			g.Unlimited = true
+			if _, bounded := g.Remaining(); bounded {
+				t.Fatal("unlimited grant must remain unbounded")
+			}
+		})
 	}
 }

@@ -3,20 +3,24 @@ package stripe
 import (
 	"time"
 
+	"github.com/flexprice/flexprice/internal/types"
 	"github.com/shopspring/decimal"
 )
 
 // CreateStripePaymentLinkRequest represents a request to create a Stripe payment link
 type CreateStripePaymentLinkRequest struct {
-	InvoiceID              string            `json:"invoice_id" validate:"required"`
-	CustomerID             string            `json:"customer_id" validate:"required"`
-	Amount                 decimal.Decimal   `json:"amount" validate:"required,gt=0"`
-	Currency               string            `json:"currency" validate:"required,len=3"`
-	SuccessURL             string            `json:"success_url,omitempty"`
-	CancelURL              string            `json:"cancel_url,omitempty"`
-	Metadata               map[string]string `json:"metadata,omitempty"`
-	SaveCardAndMakeDefault bool              `json:"save_card_and_make_default,omitempty"`
-	PaymentID              string            `json:"payment_id" validate:"required"`
+	InvoiceID              string          `json:"invoice_id" validate:"required"`
+	CustomerID             string          `json:"customer_id" validate:"required"`
+	Amount                 decimal.Decimal `json:"amount" validate:"required,gt=0"`
+	Currency               string          `json:"currency" validate:"required,len=3"`
+	SuccessURL             string          `json:"success_url,omitempty"`
+	CancelURL              string          `json:"cancel_url,omitempty"`
+	Metadata               types.Metadata  `json:"metadata,omitempty"`
+	SaveCard               bool            `json:"save_card,omitempty"`
+	PaymentID              string          `json:"payment_id" validate:"required"`
+	TaxIDCollectionEnabled bool            `json:"tax_id_collection_enabled,omitempty"`
+	AllowPromotionCodes    bool            `json:"allow_promotion_codes,omitempty"`
+	ExpiresAt              *time.Time      `json:"expires_at,omitempty"`
 }
 
 // StripePaymentLinkResponse represents the response from creating a Stripe payment link
@@ -29,15 +33,17 @@ type StripePaymentLinkResponse struct {
 	Status          string          `json:"status"`
 	CreatedAt       int64           `json:"created_at"`
 	PaymentID       string          `json:"payment_id,omitempty"`
+	ExpiresAt       *time.Time      `json:"expires_at,omitempty"`
 }
 
 // ChargeSavedPaymentMethodRequest represents a request to charge a saved payment method
 type ChargeSavedPaymentMethodRequest struct {
 	CustomerID      string          `json:"customer_id" validate:"required"`
-	InvoiceID       string          `json:"invoice_id" validate:"required"`
+	InvoiceID       string          `json:"invoice_id,omitempty"`
 	PaymentMethodID string          `json:"payment_method_id" validate:"required"`
 	Amount          decimal.Decimal `json:"amount" validate:"required,gt=0"`
 	Currency        string          `json:"currency" validate:"required,len=3"`
+	PaymentID       string          `json:"payment_id,omitempty"`
 }
 
 // PaymentIntentResponse represents a Stripe PaymentIntent response
@@ -95,6 +101,8 @@ type StripeInvoiceSyncRequest struct {
 	CollectionMethod string `json:"collection_method" validate:"required,oneof=charge_automatically send_invoice"`
 	// LinkStripeProduct links invoice items to a synced Stripe Product instead of a bare amount.
 	LinkStripeProduct bool `json:"link_stripe_product,omitempty"`
+	AutoAdvance       bool `json:"auto_advance,omitempty"`
+	SendInvoiceEmail  bool `json:"send_invoice_email,omitempty"`
 }
 
 // StripeInvoiceSyncResponse represents the response from syncing an invoice to Stripe

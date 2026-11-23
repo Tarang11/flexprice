@@ -51,25 +51,27 @@ type UsageAnalyticsParams struct {
 
 // DetailedUsageAnalytic represents detailed usage and cost data for analytics
 type DetailedUsageAnalytic struct {
-	FeatureID       string
-	FeatureName     string
-	EventName       string
-	Source          string
-	Sources         []string // List of distinct sources when source is not in group_by
-	MeterID         string
-	PriceID         string // Price ID used for this usage - allows tracking different prices per subscription
-	SubLineItemID   string // Subscription line item ID
-	SubscriptionID  string // Subscription ID
-	AggregationType types.AggregationType
-	Unit            string
-	UnitPlural      string
-	TotalUsage      decimal.Decimal `swaggertype:"string"`
-	TotalCost       decimal.Decimal `swaggertype:"string"` // Always gross (pre-discount); the DTO layer may reinterpret its own same-named TotalCost as final cost after discount
-	Currency        string
-	EventCount      uint64                // Number of events that contributed to this aggregation
-	Properties      map[string]string     // Stores property values for flexible grouping (e.g., org_id -> "org123")
-	CommitmentInfo  *types.CommitmentInfo // Stores commitment info if applicable
-	Points          []UsageAnalyticPoint
+	FeatureID   string
+	FeatureName string
+	EventName   string
+	Source      string
+	Sources     []string // List of distinct sources when source is not in group_by
+	// ExternalCustomerID is populated only when "external_customer_id" is a group_by dimension.
+	ExternalCustomerID string
+	MeterID            string
+	PriceID            string // Price ID used for this usage - allows tracking different prices per subscription
+	SubLineItemID      string // Subscription line item ID
+	SubscriptionID     string // Subscription ID
+	AggregationType    types.AggregationType
+	Unit               string
+	UnitPlural         string
+	TotalUsage         decimal.Decimal `swaggertype:"string"`
+	TotalCost          decimal.Decimal `swaggertype:"string"` // Always gross (pre-discount); the DTO layer may reinterpret its own same-named TotalCost as final cost after discount
+	Currency           string
+	EventCount         uint64                // Number of events that contributed to this aggregation
+	Properties         map[string]string     // Stores property values for flexible grouping (e.g., org_id -> "org123")
+	CommitmentInfo     *types.CommitmentInfo // Stores commitment info if applicable
+	Points             []UsageAnalyticPoint
 
 	// BucketPoints holds the bucket-grain (meter BucketSize) points BEFORE they are
 	// rolled up to the requested window in Points. Each carries its BucketID from the
@@ -103,10 +105,28 @@ type UsageAnalyticPoint struct {
 	ComputedOverageAmount            decimal.Decimal `swaggertype:"string"` // Overage charge amount
 	ComputedTrueUpAmount             decimal.Decimal `swaggertype:"string"` // True-up amount charged
 
+	// Usage units behind the commitment breakdown, for v2 commitments
+	ComputedCommitmentUtilizedQuantity decimal.Decimal `swaggertype:"string"`
+	ComputedOverageQuantity            decimal.Decimal `swaggertype:"string"`
+	ComputedTrueUpQuantity             decimal.Decimal `swaggertype:"string"`
+
+	// BilledUsage is what billing prices in the window when it merges a bucketed meter's buckets: their sum, where
+	// Usage holds the peak for MAX. It is zero for points read straight from meter_usage.
+	BilledUsage decimal.Decimal `swaggertype:"string"`
+
 	// All aggregation values for this time point
 	MaxUsage         decimal.Decimal `swaggertype:"string"` // MAX(qty_total * sign)
 	LatestUsage      decimal.Decimal `swaggertype:"string"` // argMax(qty_total, timestamp)
 	CountUniqueUsage uint64          // COUNT(DISTINCT unique_hash)
+}
+
+// Billed returns the quantity billing prices in the point's window: its buckets' sum when merged, else its usage.
+func (p UsageAnalyticPoint) Billed() decimal.Decimal {
+	if !p.BilledUsage.IsZero() {
+		return p.BilledUsage
+	}
+
+	return p.Usage
 }
 
 // MaxBucketFeatureInfo describes a feature aggregated as MAX over bucketed windows.

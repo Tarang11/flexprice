@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	"github.com/flexprice/flexprice/internal/clock"
+
 	"entgo.io/ent/dialect/sql"
 
 	"github.com/flexprice/flexprice/ent"
@@ -68,6 +70,7 @@ func (r *entitlementGrantRepository) Create(ctx context.Context, g *domainGrant.
 		SetScopeEntityID(g.ScopeEntityID).
 		SetMeasure(g.Measure).
 		SetQuota(g.Quota).
+		SetUnlimited(g.Unlimited).
 		SetUsage(g.Usage).
 		SetValidFrom(g.ValidFrom).
 		SetValidTo(g.ValidTo).
@@ -144,7 +147,7 @@ func (r *entitlementGrantRepository) Update(ctx context.Context, g *domainGrant.
 		SetGrantStatus(defaultedGrantStatus(g.GrantStatus)).
 		SetNillableLastComputedAt(g.LastComputedAt).
 		SetStatus(string(g.Status)).
-		SetUpdatedAt(time.Now().UTC()).
+		SetUpdatedAt(clock.Now()).
 		SetUpdatedBy(types.GetUserID(ctx)).
 		Save(ctx)
 
@@ -197,8 +200,9 @@ func (r *entitlementGrantRepository) UpdateSnapshot(ctx context.Context, g *doma
 	})
 	defer FinishSpan(span)
 
-	q := r.client.Writer(ctx).EntitlementGrant.UpdateOneID(g.ID).
+	q := r.client.Writer(ctx).EntitlementGrant.Update().
 		Where(
+			entitlementgrant.ID(g.ID),
 			entitlementgrant.TenantID(g.TenantID),
 			entitlementgrant.EnvironmentID(types.GetEnvironmentID(ctx)),
 		).
@@ -206,15 +210,20 @@ func (r *entitlementGrantRepository) UpdateSnapshot(ctx context.Context, g *doma
 		SetGrantStatus(defaultedGrantStatus(g.GrantStatus)).
 		SetNillableLastComputedAt(g.LastComputedAt).
 		SetNillableQuotaCrossedAt(g.QuotaCrossedAt).
-		SetUpdatedAt(time.Now().UTC())
+		SetUpdatedAt(clock.Now())
+	// Concurrent evaluators race: an older measurement must not overwrite a newer one. A rejected guard is a no-op.
+	if g.LastComputedAt != nil {
+		q.Where(entitlementgrant.Or(
+			entitlementgrant.LastComputedAtIsNil(),
+			entitlementgrant.LastComputedAtLTE(*g.LastComputedAt),
+		))
+	}
+	if g.QuotaCrossedAt == nil {
+		q.ClearQuotaCrossedAt()
+	}
 
-	if err := q.Exec(ctx); err != nil {
+	if _, err := q.Save(ctx); err != nil {
 		SetSpanError(span, err)
-		if ent.IsNotFound(err) {
-			return ierr.WithError(err).
-				WithHint("Entitlement grant not found for snapshot update").
-				Mark(ierr.ErrNotFound)
-		}
 		return ierr.WithError(err).
 			WithHint("Failed to update entitlement grant snapshot").
 			Mark(ierr.ErrDatabase)
@@ -248,7 +257,7 @@ func (r *entitlementGrantRepository) CloseWindow(ctx context.Context, id string,
 			entitlementgrant.ValidToGT(validTo),
 		).
 		SetValidTo(validTo.UTC()).
-		SetUpdatedAt(time.Now().UTC()).
+		SetUpdatedAt(clock.Now()).
 		SetUpdatedBy(types.GetUserID(ctx)).
 		Save(ctx); err != nil {
 		SetSpanError(span, err)
@@ -404,6 +413,61 @@ func (r *entitlementGrantRepository) List(ctx context.Context, filter *types.Ent
 			Mark(ierr.ErrDatabase)
 	}
 	return domainGrant.FromEntList(rows), nil
+}
+
+func (r *entitlementGrantRepository) ListLatestWindows(
+	ctx context.Context,
+	filter *types.EntitlementGrantFilter,
+	perSlot int,
+) ([]*domainGrant.EntitlementGrant, error) {
+	span := StartRepositorySpan(ctx, "entitlement_grant", "list_latest_windows", map[string]interface{}{
+		"tenant_id": types.GetTenantID(ctx),
+		"per_slot":  perSlot,
+	})
+	defer FinishSpan(span)
+
+	if filter == nil {
+		filter = types.NewNoLimitEntitlementGrantFilter()
+	}
+	if err := filter.Validate(); err != nil {
+		return nil, err
+	}
+	if perSlot <= 0 {
+		return nil, nil
+	}
+
+	// The slots first, so the per-slot reads below are each a plain index lookup.
+	configIDs, err := applyEntitlementGrantFilter(r.scoped(ctx), filter).
+		GroupBy(entitlementgrant.FieldEntitlementConfigID).
+		Strings(ctx)
+	if err != nil {
+		SetSpanError(span, err)
+		return nil, ierr.WithError(err).
+			WithHint("Failed to list entitlement grant slots").
+			Mark(ierr.ErrDatabase)
+	}
+	if len(configIDs) == 0 {
+		return nil, nil
+	}
+
+	out := make([]*domainGrant.EntitlementGrant, 0, len(configIDs)*perSlot)
+	for _, configID := range configIDs {
+		rows, err := applyEntitlementGrantFilter(r.scoped(ctx), filter).
+			Where(entitlementgrant.EntitlementConfigID(configID)).
+			Order(ent.Desc(entitlementgrant.FieldValidFrom)).
+			Limit(perSlot).
+			All(ctx)
+		if err != nil {
+			SetSpanError(span, err)
+			return nil, ierr.WithError(err).
+				WithHint("Failed to list entitlement grants for slot").
+				WithReportableDetails(map[string]interface{}{"entitlement_config_id": configID}).
+				Mark(ierr.ErrDatabase)
+		}
+		out = append(out, domainGrant.FromEntList(rows)...)
+	}
+
+	return out, nil
 }
 
 func (r *entitlementGrantRepository) Count(ctx context.Context, filter *types.EntitlementGrantFilter) (int, error) {

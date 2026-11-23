@@ -268,7 +268,7 @@ func (s *temporalService) RegisterWorkflow(taskQueue types.TemporalTaskQueue, wo
 			Mark(errors.ErrValidation)
 	}
 
-	options := s.buildWorkerOptions()
+	options := s.buildWorkerOptions(taskQueue)
 
 	w, err := s.workerManager.GetOrCreateWorker(taskQueue, options)
 	if err != nil {
@@ -293,7 +293,7 @@ func (s *temporalService) RegisterActivity(taskQueue types.TemporalTaskQueue, ac
 			Mark(errors.ErrValidation)
 	}
 
-	options := s.buildWorkerOptions()
+	options := s.buildWorkerOptions(taskQueue)
 
 	w, err := s.workerManager.GetOrCreateWorker(taskQueue, options)
 	if err != nil {
@@ -327,8 +327,9 @@ func (s *temporalService) StopWorker(taskQueue types.TemporalTaskQueue) error {
 	return s.workerManager.StopWorker(taskQueue)
 }
 
-// buildWorkerOptions creates worker options from config with interceptors
-func (s *temporalService) buildWorkerOptions() *models.WorkerOptions {
+// buildWorkerOptions creates worker options for a task queue, applying global
+// config then that queue's overrides, with interceptors.
+func (s *temporalService) buildWorkerOptions(taskQueue types.TemporalTaskQueue) *models.WorkerOptions {
 	options := models.DefaultWorkerOptions()
 
 	// Apply config overrides (0 values mean use defaults)
@@ -345,18 +346,35 @@ func (s *temporalService) buildWorkerOptions() *models.WorkerOptions {
 		options.TaskQueueActivitiesPerSecond = s.workerConfig.TaskQueueActivitiesPerSecond
 	}
 
-	// Add interceptors
+	if q, ok := s.workerConfig.Queues[taskQueue.String()]; ok {
+		if q.MaxConcurrentActivityExecutionSize > 0 {
+			options.MaxConcurrentActivityExecutionSize = q.MaxConcurrentActivityExecutionSize
+		}
+		if q.MaxConcurrentWorkflowTaskExecutionSize > 0 {
+			options.MaxConcurrentWorkflowTaskExecutionSize = q.MaxConcurrentWorkflowTaskExecutionSize
+		}
+		if q.WorkerActivitiesPerSecond > 0 {
+			options.WorkerActivitiesPerSecond = q.WorkerActivitiesPerSecond
+		}
+		if q.TaskQueueActivitiesPerSecond > 0 {
+			options.TaskQueueActivitiesPerSecond = q.TaskQueueActivitiesPerSecond
+		}
+	}
+
+	options.Interceptors = []interceptor.WorkerInterceptor{
+		temporalInterceptor.NewWorkflowTrackingInterceptor(),
+		temporalInterceptor.NewWriterPinInterceptor(),
+		temporalInterceptor.NewActorInterceptor(),
+		temporalInterceptor.NewRequestIDInterceptor(),
+		temporalInterceptor.NewTimePrecisionInterceptor(),
+	}
+
+	// Tracing goes first so its span wraps every other interceptor.
 	if s.tracing != nil && s.tracing.IsEnabled() {
-		options.Interceptors = []interceptor.WorkerInterceptor{
-			temporalInterceptor.NewTracingInterceptor(s.tracing),
-			temporalInterceptor.NewWorkflowTrackingInterceptor(),
-			temporalInterceptor.NewWriterPinInterceptor(),
-		}
-	} else {
-		options.Interceptors = []interceptor.WorkerInterceptor{
-			temporalInterceptor.NewWorkflowTrackingInterceptor(),
-			temporalInterceptor.NewWriterPinInterceptor(),
-		}
+		options.Interceptors = append(
+			[]interceptor.WorkerInterceptor{temporalInterceptor.NewTracingInterceptor(s.tracing)},
+			options.Interceptors...,
+		)
 	}
 
 	return options
@@ -419,7 +437,20 @@ func (s *temporalService) ExecuteWorkflow(ctx context.Context, workflowType type
 	}
 
 	// Execute workflow using existing StartWorkflow method
-	return s.StartWorkflow(ctx, options, workflowType, input)
+	return s.startUnique(ctx, options, workflowType, input)
+}
+
+// startUnique maps an already-started rejection to ErrAlreadyExists.
+func (s *temporalService) startUnique(ctx context.Context, options models.StartWorkflowOptions, workflowType types.TemporalWorkflowType, input interface{}) (models.WorkflowRun, error) {
+	options.WorkflowExecutionErrorWhenAlreadyStarted = true
+	run, err := s.StartWorkflow(ctx, options, workflowType, input)
+	if _, ok := stderrors.AsType[*serviceerror.WorkflowExecutionAlreadyStarted](err); ok {
+		return nil, errors.WithError(err).
+			WithHint("A workflow is already running for this entity. Try again once it finishes.").
+			WithReportableDetails(map[string]interface{}{"workflow_id": options.ID}).
+			Mark(errors.ErrAlreadyExists)
+	}
+	return run, err
 }
 
 func (s *temporalService) ExecuteWorkflowWithDelay(ctx context.Context, workflowType types.TemporalWorkflowType, params interface{}, delaySeconds int) (models.WorkflowRun, error) {
@@ -443,12 +474,27 @@ func (s *temporalService) ExecuteWorkflowWithDelay(ctx context.Context, workflow
 		StartDelay: time.Duration(delaySeconds) * time.Second,
 	}
 
-	// Execute workflow using existing StartWorkflow method
-	return s.StartWorkflow(ctx, options, workflowType, input)
+	return s.startUnique(ctx, options, workflowType, input)
+}
+
+// exclusiveWorkflowIDKeys lists workflow types that allow one open run per entity. Their ID is fixed
+// (no UUID suffix), so Temporal rejects a start while a run is open.
+var exclusiveWorkflowIDKeys = map[types.TemporalWorkflowType]string{
+	types.TemporalPriceSyncV2Workflow:         "price_sync_plan",
+	types.TemporalAddonPriceSyncWorkflow:      "price_sync_addon",
+	types.TemporalBillingEntityEnableWorkflow: "billing_entity_enable",
+
+	types.TemporalProcessSubscriptionBillingWorkflow: "process_subscription_billing",
+	types.TemporalProcessInvoiceWorkflow:             "process_invoice",
+
+	types.TemporalRazorpayInvoiceSyncWorkflow: "razorpay_invoice_sync",
 }
 
 func (s *temporalService) generateWorkflowID(workflowType types.TemporalWorkflowType, params interface{}) string {
 	contextID := s.extractWorkflowContextID(workflowType, params)
+	if key, ok := exclusiveWorkflowIDKeys[workflowType]; ok && contextID != "" {
+		return fmt.Sprintf("%s_%s_%s", types.UUID_PREFIX_WORKFLOW, key, contextID)
+	}
 	if contextID != "" {
 		return types.GenerateWorkflowIDWithContext(workflowType.String(), contextID)
 	}
@@ -459,6 +505,10 @@ func (s *temporalService) generateWorkflowID(workflowType types.TemporalWorkflow
 // for deterministic workflow ID generation. Returns empty string if no context ID is applicable.
 func (s *temporalService) extractWorkflowContextID(workflowType types.TemporalWorkflowType, params interface{}) string {
 	switch workflowType {
+	case types.TemporalPriceSyncV2Workflow:
+		if input, ok := params.(models.PriceSyncWorkflowInput); ok {
+			return input.PlanID
+		}
 	case types.TemporalProcessSubscriptionBillingWorkflow:
 		// Extract subscription ID from ProcessSubscriptionBillingWorkflowInput
 		if input, ok := params.(subscriptionModels.ProcessSubscriptionBillingWorkflowInput); ok {
@@ -562,6 +612,10 @@ func (s *temporalService) extractWorkflowContextID(workflowType types.TemporalWo
 		if input, ok := params.(models.MarketplaceSubscriptionFinalUsageFlushWorkflowInput); ok {
 			return input.SubscriptionID
 		}
+	case types.TemporalAddonPriceSyncWorkflow:
+		if input, ok := params.(models.AddonPriceSyncWorkflowInput); ok {
+			return input.AddonID
+		}
 	case types.TemporalRecalculateInvoiceWorkflow:
 		// Extract invoice ID from RecalculateInvoiceWorkflowInput
 		if input, ok := params.(invoiceModels.RecalculateInvoiceWorkflowInput); ok {
@@ -579,6 +633,10 @@ func (s *temporalService) extractWorkflowContextID(workflowType types.TemporalWo
 	case types.TemporalEnvironmentCloneWorkflow:
 		if input, ok := params.(models.EnvironmentCloneWorkflowInput); ok {
 			return input.SourceEnvironmentID + "-" + input.TargetEnvironmentID
+		}
+	case types.TemporalBillingEntityEnableWorkflow:
+		if input, ok := params.(models.BillingEntityEnableWorkflowInput); ok {
+			return input.TenantID + "-" + input.EnvironmentID
 		}
 	case types.TemporalPrepareProcessedEventsWorkflow:
 		// Extract event ID from PrepareProcessedEventsWorkflowInput
@@ -635,6 +693,8 @@ func (s *temporalService) buildWorkflowInput(ctx context.Context, workflowType t
 	switch workflowType {
 	case types.TemporalPriceSyncWorkflow, types.TemporalPriceSyncV2Workflow:
 		return s.buildPriceSyncInput(ctx, tenantID, environmentID, userID, params)
+	case types.TemporalAddonPriceSyncWorkflow:
+		return s.buildAddonPriceSyncInput(ctx, tenantID, environmentID, userID, params)
 	case types.TemporalQuickBooksPriceSyncWorkflow:
 		return s.buildQuickBooksPriceSyncInput(ctx, tenantID, environmentID, userID, params)
 	case types.TemporalTaskProcessingWorkflow:
@@ -707,6 +767,8 @@ func (s *temporalService) buildWorkflowInput(ctx context.Context, workflowType t
 		return s.buildReprocessRawEventsInput(ctx, tenantID, environmentID, userID, params)
 	case types.TemporalEnvironmentCloneWorkflow:
 		return s.buildEnvironmentCloneInput(ctx, tenantID, environmentID, userID, params)
+	case types.TemporalBillingEntityEnableWorkflow:
+		return s.buildBillingEntityEnableInput(ctx, tenantID, environmentID, userID, params)
 	default:
 		return nil, errors.NewError("unsupported workflow type").
 			WithHintf("Workflow type %s is not supported", workflowType.String()).
@@ -721,6 +783,9 @@ func (s *temporalService) buildPriceSyncInput(_ context.Context, tenantID, envir
 		input.TenantID = tenantID
 		input.EnvironmentID = environmentID
 		input.UserID = userID
+		if err := input.Validate(); err != nil {
+			return nil, err
+		}
 		return input, nil
 	}
 
@@ -732,12 +797,47 @@ func (s *temporalService) buildPriceSyncInput(_ context.Context, tenantID, envir
 			Mark(errors.ErrValidation)
 	}
 
-	return models.PriceSyncWorkflowInput{
+	input := models.PriceSyncWorkflowInput{
 		PlanID:        planID,
 		TenantID:      tenantID,
 		EnvironmentID: environmentID,
 		UserID:        userID,
-	}, nil
+	}
+	if err := input.Validate(); err != nil {
+		return nil, err
+	}
+	return input, nil
+}
+
+// buildAddonPriceSyncInput builds input for the addon usage-price sync workflow
+func (s *temporalService) buildAddonPriceSyncInput(_ context.Context, tenantID, environmentID, userID string, params interface{}) (interface{}, error) {
+	if input, ok := params.(models.AddonPriceSyncWorkflowInput); ok {
+		input.TenantID = tenantID
+		input.EnvironmentID = environmentID
+		input.UserID = userID
+		if err := input.Validate(); err != nil {
+			return nil, err
+		}
+		return input, nil
+	}
+
+	addonID, ok := params.(string)
+	if !ok || addonID == "" {
+		return nil, errors.NewError("addon ID is required").
+			WithHint("Provide addon ID as string or AddonPriceSyncWorkflowInput").
+			Mark(errors.ErrValidation)
+	}
+
+	input := models.AddonPriceSyncWorkflowInput{
+		AddonID:       addonID,
+		TenantID:      tenantID,
+		EnvironmentID: environmentID,
+		UserID:        userID,
+	}
+	if err := input.Validate(); err != nil {
+		return nil, err
+	}
+	return input, nil
 }
 
 // buildQuickBooksPriceSyncInput builds input for QuickBooks price sync workflow
@@ -1694,6 +1794,22 @@ func (s *temporalService) buildEnvironmentCloneInput(_ context.Context, tenantID
 			Mark(errors.ErrValidation)
 	}
 	input.TenantID = tenantID
+	input.UserID = userID
+	if err := input.Validate(); err != nil {
+		return nil, err
+	}
+	return input, nil
+}
+
+func (s *temporalService) buildBillingEntityEnableInput(_ context.Context, tenantID, environmentID, userID string, params interface{}) (interface{}, error) {
+	input, ok := params.(models.BillingEntityEnableWorkflowInput)
+	if !ok {
+		return nil, errors.NewError("invalid input for billing entity enable workflow").
+			WithHint("Provide a BillingEntityEnableWorkflowInput struct").
+			Mark(errors.ErrValidation)
+	}
+	input.TenantID = tenantID
+	input.EnvironmentID = environmentID
 	input.UserID = userID
 	if err := input.Validate(); err != nil {
 		return nil, err

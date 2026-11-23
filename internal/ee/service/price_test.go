@@ -16,12 +16,14 @@ import (
 	"github.com/flexprice/flexprice/internal/domain/price"
 	"github.com/flexprice/flexprice/internal/domain/priceunit"
 	"github.com/flexprice/flexprice/internal/domain/settings"
+	"github.com/flexprice/flexprice/internal/domain/subscription"
 	"github.com/flexprice/flexprice/internal/logger"
 	"github.com/flexprice/flexprice/internal/testutil"
 	"github.com/flexprice/flexprice/internal/types"
 	"github.com/flexprice/flexprice/internal/utils"
 	"github.com/samber/lo"
 	"github.com/shopspring/decimal"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -29,6 +31,7 @@ type PriceServiceSuite struct {
 	suite.Suite
 	ctx           context.Context
 	priceService  PriceService
+	serviceParams ServiceParams
 	priceRepo     *testutil.InMemoryPriceStore
 	meterRepo     *testutil.InMemoryMeterStore
 	planRepo      *testutil.InMemoryPlanStore
@@ -64,6 +67,7 @@ func (s *PriceServiceSuite) SetupTest() {
 		Logger:        s.logger,
 		DB:            testutil.NewMockPostgresClient(s.logger),
 	}
+	s.serviceParams = serviceParams
 	s.priceService = NewPriceService(serviceParams)
 }
 
@@ -149,6 +153,63 @@ func (s *PriceServiceSuite) TestGetPrice() {
 	resp, err = s.priceService.GetPrice(s.ctx, "nonexistent-id")
 	s.Error(err)
 	s.Nil(resp)
+}
+
+func (s *PriceServiceSuite) TestGetPriceHistory() {
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	t1, t2 := t0.AddDate(0, 1, 0), t0.AddDate(0, 2, 0)
+
+	newPrice := func(id string, entityType types.PriceEntityType, entityID, parentID string, start time.Time, end *time.Time) *price.Price {
+		return &price.Price{
+			ID:            id,
+			Amount:        decimal.NewFromInt(100),
+			Currency:      "usd",
+			EntityType:    entityType,
+			EntityID:      entityID,
+			ParentPriceID: parentID,
+			StartDate:     lo.ToPtr(start),
+			EndDate:       end,
+			BaseModel:     types.GetDefaultBaseModel(s.ctx),
+		}
+	}
+
+	// Created newest first so the result order comes from the sort, not insertion.
+	for _, p := range []*price.Price{
+		newPrice("p3", types.PRICE_ENTITY_TYPE_PLAN, "plan-1", "p1", t2, nil),
+		newPrice("p2", types.PRICE_ENTITY_TYPE_PLAN, "plan-1", "p1", t1, lo.ToPtr(t2)),
+		newPrice("p1", types.PRICE_ENTITY_TYPE_PLAN, "plan-1", "", t0, lo.ToPtr(t1)),
+		newPrice("override", types.PRICE_ENTITY_TYPE_SUBSCRIPTION, "sub-1", "p1", t1, nil),
+		newPrice("unrelated", types.PRICE_ENTITY_TYPE_PLAN, "plan-1", "", t0, nil),
+	} {
+		s.Require().NoError(s.priceRepo.Create(s.ctx, p))
+	}
+
+	tests := []struct {
+		name    string
+		id      string
+		wantIDs []string
+		wantErr bool
+	}{
+		{name: "from root", id: "p1", wantIDs: []string{"p1", "p2", "p3"}},
+		{name: "from latest version", id: "p3", wantIDs: []string{"p1", "p2", "p3"}},
+		{name: "never edited", id: "unrelated", wantIDs: []string{"unrelated"}},
+		{name: "subscription override rejected", id: "override", wantErr: true},
+		{name: "not found", id: "missing", wantErr: true},
+		{name: "empty id", id: "", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		s.Run(tt.name, func() {
+			resp, err := s.priceService.GetPriceHistory(s.ctx, tt.id)
+			if tt.wantErr {
+				s.Error(err)
+				s.Nil(resp)
+				return
+			}
+			s.Require().NoError(err)
+			s.Equal(tt.wantIDs, lo.Map(resp.Items, func(r *dto.PriceResponse, _ int) string { return r.ID }))
+		})
+	}
 }
 
 func (s *PriceServiceSuite) TestGetPrices() {
@@ -258,6 +319,81 @@ func (s *PriceServiceSuite) TestGetPrices_ExpandFeatures() {
 	s.Equal("minute", resp.Items[0].Feature.ReportingUnit.UnitSingular)
 	s.Equal("minutes", resp.Items[0].Feature.ReportingUnit.UnitPlural)
 	s.True(conversionRate.Equal(*resp.Items[0].Feature.ReportingUnit.ConversionRate))
+}
+
+// meterRepoSpy records how GetPrices resolves meters.
+type meterRepoSpy struct {
+	meter.Repository
+	listByIDsRequests [][]string
+	listAllCalls      int
+	countCalls        int
+}
+
+func (m *meterRepoSpy) ListByIDs(ctx context.Context, ids []string) ([]*meter.Meter, error) {
+	m.listByIDsRequests = append(m.listByIDsRequests, ids)
+	return m.Repository.ListByIDs(ctx, ids)
+}
+
+func (m *meterRepoSpy) ListAll(ctx context.Context, filter *types.MeterFilter) ([]*meter.Meter, error) {
+	m.listAllCalls++
+	return m.Repository.ListAll(ctx, filter)
+}
+
+func (m *meterRepoSpy) Count(ctx context.Context, filter *types.MeterFilter) (int, error) {
+	m.countCalls++
+	return m.Repository.Count(ctx, filter)
+}
+
+func (s *PriceServiceSuite) TestGetPrices_ExpandMeters_AttachesOnlyReferencedMeters() {
+	for _, id := range []string{"meter-a", "meter-b", "meter-unused"} {
+		s.Require().NoError(s.meterRepo.CreateMeter(s.ctx, &meter.Meter{
+			ID:          id,
+			Name:        id,
+			EventName:   id,
+			Aggregation: meter.Aggregation{Type: types.AggregationSum},
+			BaseModel:   types.GetDefaultBaseModel(s.ctx),
+		}))
+	}
+
+	prices := []*price.Price{
+		{ID: "price-a", MeterID: "meter-a"},
+		{ID: "price-b", MeterID: "meter-b"},
+		{ID: "price-no-meter"},
+	}
+	for _, p := range prices {
+		p.Amount = decimal.NewFromInt(1)
+		p.Currency = "usd"
+		p.EntityType = types.PRICE_ENTITY_TYPE_PLAN
+		p.EntityID = "plan-expand-meters"
+		p.BaseModel = types.GetDefaultBaseModel(s.ctx)
+		s.Require().NoError(s.priceRepo.Create(s.ctx, p))
+	}
+
+	priceFilter := types.NewPriceFilter()
+	priceFilter.EntityType = lo.ToPtr(types.PRICE_ENTITY_TYPE_PLAN)
+	priceFilter.Expand = lo.ToPtr(string(types.ExpandMeters))
+
+	spy := &meterRepoSpy{Repository: s.meterRepo}
+	params := s.serviceParams
+	params.MeterRepo = spy
+	resp, err := NewPriceService(params).GetPrices(s.ctx, priceFilter)
+	s.Require().NoError(err)
+
+	s.Require().Len(spy.listByIDsRequests, 1)
+	s.ElementsMatch([]string{"meter-a", "meter-b"}, spy.listByIDsRequests[0])
+	s.Zero(spy.listAllCalls)
+	s.Zero(spy.countCalls)
+
+	meterByPrice := make(map[string]*dto.MeterResponse, len(resp.Items))
+	for _, item := range resp.Items {
+		meterByPrice[item.ID] = item.Meter
+	}
+	s.Require().Len(meterByPrice, 3)
+	s.Require().NotNil(meterByPrice["price-a"])
+	s.Equal("meter-a", meterByPrice["price-a"].ID)
+	s.Require().NotNil(meterByPrice["price-b"])
+	s.Equal("meter-b", meterByPrice["price-b"].ID)
+	s.Nil(meterByPrice["price-no-meter"])
 }
 
 // TestGetPrices_ExpandFeatures_IgnoresDeletedFeature verifies that a deleted feature
@@ -1416,6 +1552,86 @@ func (s *PriceServiceSuite) TestCalculateCostWithBreakup_TieredSlabEdgeCases() {
 				tc.description)
 		})
 	}
+}
+
+func (s *PriceServiceSuite) TestCalculateCost_PackageTiers() {
+	d := decimal.RequireFromString
+	upTo := func(v uint64) *uint64 { return &v }
+	pkg := func(size int, round types.RoundType) *price.TransformQuantity {
+		return &price.TransformQuantity{DivideBy: size, Round: round}
+	}
+	tiered := func(mode types.BillingTier, tiers ...price.PriceTier) func() *price.Price {
+		return func() *price.Price {
+			return &price.Price{
+				ID:           "price-package-tiers",
+				Currency:     "inr",
+				BillingModel: types.BILLING_MODEL_TIERED,
+				TierMode:     mode,
+				Tiers:        append([]price.PriceTier(nil), tiers...),
+			}
+		}
+	}
+
+	slabCustomer := tiered(types.BILLING_TIER_SLAB,
+		price.PriceTier{UpTo: upTo(200), UnitAmount: d("0"), FlatAmount: lo.ToPtr(d("10000"))},
+		price.PriceTier{UpTo: upTo(500), UnitAmount: d("0"), FlatAmount: lo.ToPtr(d("20000"))},
+		price.PriceTier{UpTo: upTo(1000), UnitAmount: d("0"), FlatAmount: lo.ToPtr(d("40000"))},
+		price.PriceTier{UnitAmount: d("1000"), TransformQuantity: pkg(100, types.ROUND_UP)},
+	)
+	// API calls: up to 100,000 at ₹50 per 1,000; above that every call at ₹40 per 1,000.
+	volumeAPICalls := tiered(types.BILLING_TIER_VOLUME,
+		price.PriceTier{UpTo: upTo(100_000), UnitAmount: d("50"), TransformQuantity: pkg(1000, types.ROUND_UP)},
+		price.PriceTier{UnitAmount: d("40"), TransformQuantity: pkg(1000, types.ROUND_UP)},
+	)
+
+	testCases := []struct {
+		name     string
+		price    func() *price.Price
+		quantity string
+		want     string
+	}{
+		{"slab band 1", slabCustomer, "150", "10000"},
+		{"slab bands 1 and 2", slabCustomer, "400", "30000"},
+		{"slab at boundary", slabCustomer, "1000", "70000"},
+		{"slab just over boundary", slabCustomer, "1001", "71000"},
+		{"slab partial package", slabCustomer, "1050", "71000"},
+		{"slab exact multiple", slabCustomer, "1500", "75000"},
+		{"slab zero usage", slabCustomer, "0", "0"},
+		{"volume partial package", volumeAPICalls, "45500", "2300"},
+		{"volume at boundary", volumeAPICalls, "100000", "5000"},
+		{"volume above boundary prices all units at the next tier", volumeAPICalls, "250000", "10000"},
+		{"decimal usage rounds up", tiered(types.BILLING_TIER_SLAB,
+			price.PriceTier{UnitAmount: d("7"), TransformQuantity: pkg(100, types.ROUND_UP)},
+		), "50.5", "7"},
+		{"empty round rounds up", tiered(types.BILLING_TIER_SLAB,
+			price.PriceTier{UnitAmount: d("7"), TransformQuantity: pkg(100, "")},
+		), "150", "14"},
+		{"slab round down drops partial package", tiered(types.BILLING_TIER_SLAB,
+			price.PriceTier{UpTo: upTo(1000), UnitAmount: d("0"), FlatAmount: lo.ToPtr(d("40000"))},
+			price.PriceTier{UnitAmount: d("1000"), TransformQuantity: pkg(100, types.ROUND_DOWN)},
+		), "1250", "42000"},
+		{"volume round down", tiered(types.BILLING_TIER_VOLUME,
+			price.PriceTier{UnitAmount: d("7"), TransformQuantity: pkg(100, types.ROUND_DOWN)},
+		), "250", "14"},
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			want := d(tc.want)
+			quantity := d(tc.quantity)
+
+			cost := s.priceService.CalculateCost(s.ctx, tc.price(), quantity)
+			s.True(want.Equal(cost), "CalculateCost: want %s, got %s", want, cost)
+
+			breakup := s.priceService.CalculateCostWithBreakup(s.ctx, tc.price(), quantity, false)
+			s.True(want.Equal(breakup.FinalCost), "CalculateCostWithBreakup: want %s, got %s", want, breakup.FinalCost)
+		})
+	}
+
+	s.Run("breakup reports per-unit rate of a package tier", func() {
+		s.True(d("0.05").Equal(s.priceService.CalculateCostWithBreakup(s.ctx, volumeAPICalls(), d("45500"), false).TierUnitAmount))
+		s.True(d("10").Equal(s.priceService.CalculateCostWithBreakup(s.ctx, slabCustomer(), d("1050"), false).TierUnitAmount))
+	})
 }
 
 func (s *PriceServiceSuite) TestDeletePrice_Comprehensive() {
@@ -3105,4 +3321,146 @@ func (s *PriceServiceSuite) TestEnforceCurrency_UnconfiguredEnvironmentAllowsOnl
 		s.Require().Error(err, "%s is not a known fiat currency", currency)
 		s.Contains(err.Error(), strings.ToLower(currency))
 	}
+}
+
+type pricingShape struct {
+	model types.BillingModel
+	mode  types.BillingTier
+}
+
+var pricingShapes = map[string]pricingShape{
+	"flat":    {types.BILLING_MODEL_FLAT_FEE, ""},
+	"package": {types.BILLING_MODEL_PACKAGE, ""},
+	"volume":  {types.BILLING_MODEL_TIERED, types.BILLING_TIER_VOLUME},
+	"slab":    {types.BILLING_MODEL_TIERED, types.BILLING_TIER_SLAB},
+}
+
+var testTiers = []dto.CreatePriceTier{
+	{UpTo: lo.ToPtr(uint64(720)), UnitAmount: decimal.RequireFromString("3.6")},
+	{UpTo: nil, UnitAmount: decimal.RequireFromString("4.5")},
+}
+
+func shapedPrice(s pricingShape, unit types.PriceUnitType) *price.Price {
+	p := &price.Price{
+		ID: "price_1", Currency: "usd", Type: types.PRICE_TYPE_USAGE, MeterID: "meter_1",
+		BillingPeriod: types.BILLING_PERIOD_MONTHLY, BillingPeriodCount: 1, InvoiceCadence: types.InvoiceCadenceArrear,
+		EntityType: types.PRICE_ENTITY_TYPE_PLAN, EntityID: "plan_1", PriceUnitType: unit,
+		BillingModel: s.model, TierMode: s.mode, Amount: decimal.NewFromInt(3),
+		Tiers:             price.JSONBTiers{{UpTo: nil, UnitAmount: decimal.NewFromInt(1)}},
+		TransformQuantity: price.JSONBTransformQuantity{DivideBy: 10, Round: types.ROUND_UP},
+	}
+	if unit == types.PRICE_UNIT_TYPE_CUSTOM {
+		p.PriceUnit = lo.ToPtr("crd")
+		p.PriceUnitAmount = lo.ToPtr(decimal.NewFromInt(3))
+		p.PriceUnitTiers = p.Tiers
+		p.Tiers = nil
+	}
+	return p
+}
+
+// shapedOverride is the payload the dashboard sends to move a price to shape s.
+func shapedOverride(s pricingShape, unit types.PriceUnitType) dto.OverrideLineItemRequest {
+	o := dto.OverrideLineItemRequest{PriceID: "price_1", BillingModel: s.model, TierMode: s.mode}
+	custom := unit == types.PRICE_UNIT_TYPE_CUSTOM
+	switch {
+	case s.model == types.BILLING_MODEL_TIERED && custom:
+		o.PriceUnitTiers = testTiers
+	case s.model == types.BILLING_MODEL_TIERED:
+		o.Tiers = testTiers
+	case custom:
+		o.PriceUnitAmount = lo.ToPtr(decimal.RequireFromString("3.6"))
+	default:
+		o.Amount = lo.ToPtr(decimal.RequireFromString("3.6"))
+	}
+	if s.model == types.BILLING_MODEL_PACKAGE {
+		o.TransformQuantity = &price.TransformQuantity{DivideBy: 60, Round: types.ROUND_UP}
+	}
+	return o
+}
+
+func TestBillingModelChange_AnyToAny(t *testing.T) {
+	for _, unit := range []types.PriceUnitType{types.PRICE_UNIT_TYPE_FIAT, types.PRICE_UNIT_TYPE_CUSTOM} {
+		for fromName, from := range pricingShapes {
+			for toName, to := range pricingShapes {
+				t.Run(string(unit)+"/"+fromName+"_to_"+toName, func(t *testing.T) {
+					existing := shapedPrice(from, unit)
+					o := shapedOverride(to, unit)
+
+					priceMap := map[string]*dto.PriceResponse{existing.ID: {Price: existing}}
+					lineItems := map[string]*subscription.SubscriptionLineItem{existing.ID: {PriceID: existing.ID}}
+					require.NoError(t, o.Validate(priceMap, lineItems, "plan_1"))
+					req, err := buildOverridePriceRequest(priceMap[existing.ID], o, "subs_1")
+					require.NoError(t, err)
+					require.NoError(t, req.Validate())
+					require.Equal(t, to.model, req.BillingModel)
+					require.Equal(t, to.mode, req.TierMode)
+
+					update := dto.UpdatePriceRequest{
+						BillingModel: o.BillingModel, TierMode: o.TierMode, Amount: o.Amount, Tiers: o.Tiers,
+						PriceUnitAmount: o.PriceUnitAmount, PriceUnitTiers: o.PriceUnitTiers, TransformQuantity: o.TransformQuantity,
+					}
+					require.NoError(t, update.ValidateAgainst(existing))
+					created := update.ToCreatePriceRequest(existing)
+					require.NoError(t, created.Validate())
+					require.Equal(t, to.model, created.BillingModel)
+					require.Equal(t, to.mode, created.TierMode)
+				})
+			}
+		}
+	}
+}
+
+func TestBillingModelChange_Rejects(t *testing.T) {
+	flat := shapedPrice(pricingShapes["flat"], types.PRICE_UNIT_TYPE_FIAT)
+
+	tests := []struct {
+		name     string
+		existing *price.Price
+		override dto.OverrideLineItemRequest
+		wantErr  string
+	}{
+		// The payload the line item edit dialog sent for "Slab Tiered" on a flat price.
+		{"tiers on a flat price", flat, dto.OverrideLineItemRequest{Tiers: testTiers}, "tiers can only be set on a TIERED price"},
+		{"tiered without tier mode", flat, dto.OverrideLineItemRequest{BillingModel: types.BILLING_MODEL_TIERED, Tiers: testTiers}, "tier_mode is required"},
+		{"amount only on a tiered price", shapedPrice(pricingShapes["slab"], types.PRICE_UNIT_TYPE_FIAT), dto.OverrideLineItemRequest{Amount: lo.ToPtr(decimal.NewFromInt(4))}, "amount cannot be set on a TIERED price"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.override.PriceID = tt.existing.ID
+			priceMap := map[string]*dto.PriceResponse{tt.existing.ID: {Price: tt.existing}}
+			lineItems := map[string]*subscription.SubscriptionLineItem{tt.existing.ID: {PriceID: tt.existing.ID}}
+			require.ErrorContains(t, tt.override.Validate(priceMap, lineItems, "plan_1"), tt.wantErr)
+		})
+	}
+
+	update := dto.UpdatePriceRequest{BillingModel: types.BILLING_MODEL_FLAT_FEE}
+	require.ErrorContains(t, update.ValidateAgainst(shapedPrice(pricingShapes["slab"], types.PRICE_UNIT_TYPE_FIAT)), "amount is required")
+}
+
+func (s *PriceServiceSuite) TestCreatePrice_FixedWithoutStartDateReturnsWarning() {
+	_ = s.planRepo.Create(s.ctx, &plan.Plan{ID: "plan-warn", Name: "Warn Plan", BaseModel: types.GetDefaultBaseModel(s.ctx)})
+	amount := decimal.RequireFromString("8000")
+	req := dto.CreatePriceRequest{
+		Amount:             &amount,
+		Currency:           "usd",
+		EntityType:         types.PRICE_ENTITY_TYPE_PLAN,
+		EntityID:           "plan-warn",
+		Type:               types.PRICE_TYPE_FIXED,
+		BillingPeriod:      types.BILLING_PERIOD_MONTHLY,
+		BillingPeriodCount: 1,
+		BillingModel:       types.BILLING_MODEL_FLAT_FEE,
+		InvoiceCadence:     types.InvoiceCadenceAdvance,
+	}
+
+	resp, err := s.priceService.CreatePrice(s.ctx, req)
+	s.Require().NoError(err)
+	s.True(resp.Price.StartDate.Equal(price.DefaultFixedPriceStartDate()))
+	s.Len(resp.Warnings, 1)
+
+	start := time.Date(2026, time.October, 21, 18, 30, 0, 0, time.UTC)
+	req.StartDate = &start
+	resp, err = s.priceService.CreatePrice(s.ctx, req)
+	s.Require().NoError(err)
+	s.True(resp.Price.StartDate.Equal(start))
+	s.Empty(resp.Warnings)
 }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	"github.com/flexprice/flexprice/internal/clock"
+
 	"github.com/flexprice/flexprice/ent"
 	"github.com/flexprice/flexprice/ent/predicate"
 	"github.com/flexprice/flexprice/ent/subscriptionlineitem"
@@ -19,6 +21,43 @@ import (
 // bulk operation. PostgreSQL limits the total number of parameters to 65535; batching
 // prevents hitting that ceiling when a subscription has many line items.
 const subscriptionLineItemBatchSize = 1000
+
+// lineItemLineageMaxDepth bounds each direction of the lineage walk so a corrupt pointer cycle cannot loop forever.
+const lineItemLineageMaxDepth = 100
+
+// lineItemLineageQuery walks predecessor pointers up and successor pointers down from the anchor,
+// within its subscription. Rows versioned before the lineage columns existed hold the pointers in metadata.
+const lineItemLineageQuery = `
+	WITH RECURSIVE
+	anchor AS (
+		SELECT id, subscription_id
+		FROM subscription_line_items
+		WHERE id = $1 AND tenant_id = $2 AND environment_id = $3
+	),
+	up AS (
+		SELECT li.id, COALESCE(li.predecessor_line_item_id, li.metadata->>$4) AS next_id, 0 AS depth
+		FROM subscription_line_items li JOIN anchor a ON li.id = a.id
+		UNION
+		SELECT li.id, COALESCE(li.predecessor_line_item_id, li.metadata->>$4), up.depth + 1
+		FROM subscription_line_items li
+		JOIN up ON li.id = up.next_id
+		JOIN anchor a ON li.subscription_id = a.subscription_id
+		WHERE li.tenant_id = $2 AND li.environment_id = $3 AND up.depth < $6
+	),
+	down AS (
+		SELECT li.id, COALESCE(li.successor_line_item_id, li.metadata->>$5) AS next_id, 0 AS depth
+		FROM subscription_line_items li JOIN anchor a ON li.id = a.id
+		UNION
+		SELECT li.id, COALESCE(li.successor_line_item_id, li.metadata->>$5), down.depth + 1
+		FROM subscription_line_items li
+		JOIN down ON li.id = down.next_id
+		JOIN anchor a ON li.subscription_id = a.subscription_id
+		WHERE li.tenant_id = $2 AND li.environment_id = $3 AND down.depth < $6
+	)
+	SELECT id FROM up
+	UNION
+	SELECT id FROM down
+`
 
 type subscriptionLineItemRepository struct {
 	client    postgres.IClient
@@ -104,10 +143,13 @@ func (r *subscriptionLineItemRepository) Create(ctx context.Context, item *subsc
 		SetQuantity(item.Quantity).
 		SetCurrency(item.Currency).
 		SetBillingPeriod(item.BillingPeriod).
+		SetBillingPeriodCount(max(item.BillingPeriodCount, 1)).
 		SetNillableStartDate(types.ToNillableTime(item.StartDate)).
 		SetNillableEndDate(types.ToNillableTime(item.EndDate)).
 		SetNillableSubscriptionPhaseID(item.SubscriptionPhaseID).
 		SetNillableAddonAssociationID(item.AddonAssociationID).
+		SetNillablePredecessorLineItemID(item.PredecessorLineItemID).
+		SetNillableSuccessorLineItemID(item.SuccessorLineItemID).
 		SetInvoiceCadence(item.InvoiceCadence).
 		SetMetadata(item.Metadata).
 		// Commitment fields
@@ -117,6 +159,7 @@ func (r *subscriptionLineItemRepository) Create(ctx context.Context, item *subsc
 		SetNillableCommitmentOverageFactor(item.CommitmentOverageFactor).
 		SetCommitmentTrueUpEnabled(item.CommitmentTrueUpEnabled).
 		SetCommitmentWindowed(item.CommitmentWindowed).
+		SetNillableCommitmentDuration(item.CommitmentDuration).
 		SetCommitmentTimeBuckets(item.CommitmentTimeBuckets).
 		SetTenantID(item.TenantID).
 		SetEnvironmentID(item.EnvironmentID).
@@ -312,6 +355,7 @@ func (r *subscriptionLineItemRepository) Update(ctx context.Context, item *subsc
 		SetQuantity(item.Quantity).
 		SetCurrency(item.Currency).
 		SetBillingPeriod(item.BillingPeriod).
+		SetBillingPeriodCount(max(item.BillingPeriodCount, 1)).
 		SetNillableStartDate(types.ToNillableTime(item.StartDate)).
 		SetMetadata(item.Metadata).
 		// Commitment fields
@@ -321,14 +365,20 @@ func (r *subscriptionLineItemRepository) Update(ctx context.Context, item *subsc
 		SetNillableCommitmentOverageFactor(item.CommitmentOverageFactor).
 		SetCommitmentTrueUpEnabled(item.CommitmentTrueUpEnabled).
 		SetCommitmentWindowed(item.CommitmentWindowed).
+		SetNillableCommitmentDuration(item.CommitmentDuration).
 		SetCommitmentTimeBuckets(item.CommitmentTimeBuckets).
 		SetStatus(string(item.Status)).
 		SetUpdatedBy(item.UpdatedBy).
-		SetUpdatedAt(time.Now())
+		SetUpdatedAt(clock.Now())
 	if item.EndDate.IsZero() {
 		builder.ClearEndDate()
 	} else {
 		builder.SetEndDate(item.EndDate)
+	}
+	if item.SuccessorLineItemID == nil {
+		builder.ClearSuccessorLineItemID()
+	} else {
+		builder.SetSuccessorLineItemID(*item.SuccessorLineItemID)
 	}
 	_, err := builder.Save(ctx)
 
@@ -370,6 +420,7 @@ func (r *subscriptionLineItemRepository) BulkTerminate(ctx context.Context, subs
 			subscriptionlineitem.TenantID(types.GetTenantID(ctx)),
 			subscriptionlineitem.EnvironmentID(types.GetEnvironmentID(ctx)),
 			subscriptionlineitem.SubscriptionID(subscriptionID),
+			subscriptionlineitem.Status(string(types.StatusPublished)),
 			subscriptionlineitem.StartDateLTE(effectiveDate),
 			subscriptionlineitem.Or(
 				subscriptionlineitem.EndDateIsNil(),
@@ -478,19 +529,22 @@ func (r *subscriptionLineItemRepository) CreateBulk(ctx context.Context, items [
 			SetQuantity(item.Quantity).
 			SetCurrency(item.Currency).
 			SetBillingPeriod(item.BillingPeriod).
+			SetBillingPeriodCount(max(item.BillingPeriodCount, 1)).
 			SetInvoiceCadence(item.InvoiceCadence).
 			SetNillableStartDate(types.ToNillableTime(item.StartDate)).
 			SetNillableEndDate(types.ToNillableTime(item.EndDate)).
 			SetNillableSubscriptionPhaseID(item.SubscriptionPhaseID).
 			SetNillableAddonAssociationID(item.AddonAssociationID).
-			SetQuantity(item.Quantity).
-			SetCurrency(item.Currency).
-			SetBillingPeriod(item.BillingPeriod).
-			SetInvoiceCadence(item.InvoiceCadence).
-			SetNillableStartDate(types.ToNillableTime(item.StartDate)).
-			SetNillableEndDate(types.ToNillableTime(item.EndDate)).
-			SetNillableSubscriptionPhaseID(item.SubscriptionPhaseID).
+			SetNillablePredecessorLineItemID(item.PredecessorLineItemID).
+			SetNillableSuccessorLineItemID(item.SuccessorLineItemID).
 			SetMetadata(item.Metadata).
+			SetNillableCommitmentAmount(item.CommitmentAmount).
+			SetNillableCommitmentQuantity(item.CommitmentQuantity).
+			SetNillableCommitmentType(types.ToNillableString(string(item.CommitmentType))).
+			SetNillableCommitmentOverageFactor(item.CommitmentOverageFactor).
+			SetCommitmentTrueUpEnabled(item.CommitmentTrueUpEnabled).
+			SetCommitmentWindowed(item.CommitmentWindowed).
+			SetNillableCommitmentDuration(item.CommitmentDuration).
 			SetCommitmentTimeBuckets(item.CommitmentTimeBuckets).
 			SetTenantID(item.TenantID).
 			SetEnvironmentID(item.EnvironmentID).
@@ -561,6 +615,82 @@ func (r *subscriptionLineItemRepository) ListBySubscription(ctx context.Context,
 			WithReportableDetails(map[string]interface{}{
 				"subscription_id": sub.ID,
 			}).
+			Mark(ierr.ErrDatabase)
+	}
+
+	SetSpanSuccess(span)
+	return subscription.GetLineItemFromEntList(items), nil
+}
+
+func (r *subscriptionLineItemRepository) ListLineage(ctx context.Context, id string) ([]*subscription.SubscriptionLineItem, error) {
+	span := StartRepositorySpan(ctx, "subscription_line_item", "list_lineage", map[string]interface{}{
+		"line_item_id": id,
+		"tenant_id":    types.GetTenantID(ctx),
+	})
+	defer FinishSpan(span)
+
+	client := r.client.Reader(ctx)
+	rows, err := client.QueryContext(ctx, lineItemLineageQuery,
+		id,
+		types.GetTenantID(ctx),
+		types.GetEnvironmentID(ctx),
+		types.SubscriptionLineItemMetadataKeyPredecessorID,
+		types.SubscriptionLineItemMetadataKeySuccessorID,
+		lineItemLineageMaxDepth,
+	)
+	if err != nil {
+		SetSpanError(span, err)
+		return nil, ierr.WithError(err).
+			WithHint("Failed to read subscription line item lineage").
+			WithReportableDetails(map[string]interface{}{"line_item_id": id}).
+			Mark(ierr.ErrDatabase)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var lineageID string
+		if err := rows.Scan(&lineageID); err != nil {
+			SetSpanError(span, err)
+			return nil, ierr.WithError(err).
+				WithHint("Failed to scan subscription line item lineage").
+				Mark(ierr.ErrDatabase)
+		}
+		ids = append(ids, lineageID)
+	}
+	if err := rows.Err(); err != nil {
+		SetSpanError(span, err)
+		return nil, ierr.WithError(err).
+			WithHint("Failed to read subscription line item lineage").
+			Mark(ierr.ErrDatabase)
+	}
+
+	if len(ids) == 0 {
+		err := ierr.NewErrorf("subscription line item %s not found", id).
+			WithHintf("Subscription line item with ID %s not found", id).
+			WithReportableDetails(map[string]interface{}{"line_item_id": id}).
+			Mark(ierr.ErrNotFound)
+		SetSpanError(span, err)
+		return nil, err
+	}
+
+	items, err := client.SubscriptionLineItem.Query().
+		Where(
+			subscriptionlineitem.IDIn(ids...),
+			subscriptionlineitem.TenantID(types.GetTenantID(ctx)),
+			subscriptionlineitem.EnvironmentID(types.GetEnvironmentID(ctx)),
+			subscriptionlineitem.Or(
+				subscriptionlineitem.StatusNEQ(string(types.StatusDeleted)),
+				subscriptionlineitem.ID(id),
+			),
+		).
+		Order(ent.Asc(subscriptionlineitem.FieldStartDate), ent.Asc(subscriptionlineitem.FieldCreatedAt)).
+		All(ctx)
+	if err != nil {
+		SetSpanError(span, err)
+		return nil, ierr.WithError(err).
+			WithHint("Failed to list subscription line item lineage").
+			WithReportableDetails(map[string]interface{}{"line_item_id": id}).
 			Mark(ierr.ErrDatabase)
 	}
 
@@ -654,6 +784,36 @@ func (r *subscriptionLineItemRepository) Count(ctx context.Context, filter *type
 
 // GetDistinctCustomerIDsWithCommitmentTrueUp returns distinct customer IDs from published
 // subscription line items with commitment true-up enabled.
+func (r *subscriptionLineItemRepository) SubscriptionIDsWithWindowedCommitment(ctx context.Context) ([]string, error) {
+	tenantID := types.GetTenantID(ctx)
+	envID := types.GetEnvironmentID(ctx)
+
+	span := StartRepositorySpan(ctx, "subscription_line_item", "subscription_ids_windowed_commitment", map[string]interface{}{
+		"tenant_id":      tenantID,
+		"environment_id": envID,
+	})
+	defer FinishSpan(span)
+
+	ids, err := r.client.Reader(ctx).SubscriptionLineItem.Query().
+		Where(
+			subscriptionlineitem.TenantID(tenantID),
+			subscriptionlineitem.EnvironmentID(envID),
+			subscriptionlineitem.Status(string(types.StatusPublished)),
+			subscriptionlineitem.CommitmentWindowed(true),
+		).
+		GroupBy(subscriptionlineitem.FieldSubscriptionID).
+		Strings(ctx)
+	if err != nil {
+		SetSpanError(span, err)
+		return nil, ierr.WithError(err).
+			WithHint("Failed to list subscriptions with windowed commitments").
+			Mark(ierr.ErrDatabase)
+	}
+
+	SetSpanSuccess(span)
+	return ids, nil
+}
+
 func (r *subscriptionLineItemRepository) GetDistinctCustomerIDsWithCommitmentTrueUp(ctx context.Context) ([]string, error) {
 	tenantID := types.GetTenantID(ctx)
 	envID := types.GetEnvironmentID(ctx)

@@ -3,8 +3,12 @@ package subscription
 import (
 	"context"
 	"fmt"
-	"math/rand" // nosemgrep: go.lang.security.audit.crypto.math_random.math-random-used -- jitter, not security-sensitive
 	"time"
+
+	"github.com/flexprice/flexprice/internal/clock"
+
+	"github.com/samber/lo"
+	"go.temporal.io/sdk/temporal"
 
 	"github.com/flexprice/flexprice/internal/api/dto"
 	"github.com/flexprice/flexprice/internal/domain/subscription"
@@ -15,8 +19,6 @@ import (
 	subscriptionModels "github.com/flexprice/flexprice/internal/temporal/models/subscription"
 	temporalService "github.com/flexprice/flexprice/internal/temporal/service"
 	"github.com/flexprice/flexprice/internal/types"
-	"github.com/samber/lo"
-	"go.temporal.io/sdk/temporal"
 )
 
 type BillingActivities struct {
@@ -152,6 +154,10 @@ func (s *BillingActivities) CreateDraftInvoicesActivity(
 			return nil, fmt.Errorf("CreateDraftInvoiceForSubscription returned nil for subscription %s period %s-%s",
 				input.SubscriptionID, period.Start, period.End)
 		}
+		// A paused period's invoice is final as SKIPPED and has nothing left to process.
+		if types.InvoiceBillingReason(draft.BillingReason) == types.InvoiceBillingReasonSubscriptionPaused {
+			continue
+		}
 		invoices = append(invoices, draft.ID)
 	}
 
@@ -205,13 +211,56 @@ func (s *BillingActivities) UpdateCurrentPeriodActivity(
 		"new_period_start", input.PeriodStart,
 		"new_period_end", input.PeriodEnd)
 
-	if err := s.advanceGroupedInvoicingChildrenPeriod(ctx, sub, input.PeriodStart, input.PeriodEnd); err != nil {
+	children, err := s.advanceGroupedInvoicingChildrenPeriod(ctx, sub, input.PeriodStart, input.PeriodEnd)
+	if err != nil {
 		return nil, err
 	}
+	s.refreshEntitlementGrantsAfterRollover(ctx, append([]*subscription.Subscription{sub}, children...)...)
+
+	service.NotifySubscriptionChanged(ctx, s.serviceParams, sub.ID)
 
 	return &subscriptionModels.UpdateSubscriptionPeriodActivityOutput{
 		Success: true,
 	}, nil
+}
+
+// refreshEntitlementGrantsAfterRollover evaluates the new period of each advanced subscription that
+// holds a NEVER-meter grant, so a quiet period still opens its allowance.
+func (s *BillingActivities) refreshEntitlementGrantsAfterRollover(ctx context.Context, subs ...*subscription.Subscription) {
+	if s.serviceParams.EntitlementGrantRepo == nil {
+		return
+	}
+	alertService := service.NewAlertService(s.serviceParams)
+	for _, sub := range subs {
+		if !s.hasNeverResetGrant(ctx, sub) {
+			continue
+		}
+		cust, err := s.serviceParams.CustomerRepo.Get(ctx, sub.CustomerID)
+		if err == nil {
+			err = alertService.EvaluateAndAlertEntitlementGrants(ctx, cust, []*subscription.Subscription{sub}, clock.Now())
+		}
+		if err != nil {
+			s.logger.Error(ctx, "entitlement grant refresh after rollover failed",
+				"error", err, "subscription_id", sub.ID)
+		}
+	}
+}
+
+// hasNeverResetGrant reports whether a live subscription has a grant entitlement on a never-reset meter.
+func (s *BillingActivities) hasNeverResetGrant(ctx context.Context, sub *subscription.Subscription) bool {
+	if sub.SubscriptionStatus != types.SubscriptionStatusActive && sub.SubscriptionStatus != types.SubscriptionStatusTrialing {
+		return false
+	}
+	entitlements, err := s.subscriptionService.GetSubscriptionEntitlementsForSubscription(ctx, sub)
+	if err != nil {
+		s.logger.Error(ctx, "failed to resolve entitlements for rollover refresh",
+			"error", err, "subscription_id", sub.ID)
+		return false
+	}
+	return lo.SomeBy(entitlements, func(ec *dto.EntitlementResponse) bool {
+		return ec != nil && ec.Entitlement != nil && ec.HasGrantConfig() &&
+			ec.Feature != nil && ec.Feature.Meter != nil && ec.Feature.Meter.ResetUsage == types.ResetUsageNever
+	})
 }
 
 func (s *BillingActivities) advanceGroupedInvoicingChildrenPeriod(
@@ -219,9 +268,9 @@ func (s *BillingActivities) advanceGroupedInvoicingChildrenPeriod(
 	parent *subscription.Subscription,
 	periodStart time.Time,
 	periodEnd time.Time,
-) error {
+) ([]*subscription.Subscription, error) {
 	if parent.SubscriptionType != types.SubscriptionTypeParent {
-		return nil
+		return nil, nil
 	}
 
 	filter := types.NewNoLimitSubscriptionFilter()
@@ -238,7 +287,7 @@ func (s *BillingActivities) advanceGroupedInvoicingChildrenPeriod(
 		s.logger.Error(ctx, "failed to list grouped_invoicing children for period cascade",
 			"error", err,
 			"parent_subscription_id", parent.ID)
-		return err
+		return nil, err
 	}
 
 	for _, child := range children {
@@ -249,12 +298,15 @@ func (s *BillingActivities) advanceGroupedInvoicingChildrenPeriod(
 				"error", err,
 				"child_subscription_id", child.ID,
 				"parent_subscription_id", parent.ID)
-			return err
+			return nil, err
 		}
 	}
 
-	return nil
+	return children, nil
 }
+
+// Lets late-arriving events and pipeline lag settle.
+const processInvoiceStartDelay = 1 * time.Hour
 
 // TriggerInvoiceWorkflowActivity triggers invoice workflows for each invoice (fire-and-forget)
 // If triggering fails for any invoice, it logs the error and continues with the rest
@@ -289,8 +341,13 @@ func (s *BillingActivities) TriggerInvoiceWorkflowActivity(
 				EnvironmentID: input.EnvironmentID,
 				UserID:        input.UserID,
 			},
-			900+rand.Intn(300), // #nosec G404 -- jitter, not security-sensitive
+			int(processInvoiceStartDelay/time.Second),
 		)
+		if ierr.IsAlreadyExists(err) {
+			s.logger.Info(ctx, "invoice workflow already scheduled, skipping",
+				"invoice_id", invoiceID)
+			continue
+		}
 		if err != nil {
 			s.logger.Error(ctx, "failed to trigger invoice workflow",
 				"invoice_id", invoiceID,
@@ -359,14 +416,33 @@ func (s *BillingActivities) CheckCancellationActivity(
 
 	// Perform cancellation if required
 	if shouldCancel {
+		// A subscription that reaches its end date while paused ends its pause with it.
+		var endedPauseID *string
+		if sub.SubscriptionStatus == types.SubscriptionStatusPaused {
+			endedPauseID = sub.ActivePauseID
+			sub.PauseStatus = types.PauseStatusNone
+			sub.ActivePauseID = nil
+		}
 		sub.SubscriptionStatus = types.SubscriptionStatusCancelled
 		sub.CancelledAt = cancelledAt
 		subscriptionService := service.NewSubscriptionService(s.serviceParams)
+		var cancelledGroupedChildren []*subscription.Subscription
 
 		err := s.serviceParams.DB.WithTx(ctx, func(ctx context.Context) error {
 			// Update subscription
 			if err := s.serviceParams.SubRepo.Update(ctx, sub); err != nil {
 				return err
+			}
+
+			if endedPauseID != nil {
+				pause, err := s.serviceParams.SubRepo.GetPause(ctx, *endedPauseID)
+				if err != nil {
+					return err
+				}
+				pause.PauseStatus = types.PauseStatusCompleted
+				if err := s.serviceParams.SubRepo.UpdatePause(ctx, pause); err != nil {
+					return err
+				}
 			}
 
 			// Terminate line items, addon associations, and credit grants now that the
@@ -397,6 +473,11 @@ func (s *BillingActivities) CheckCancellationActivity(
 			if err := subscriptionService.CascadeCancelToInheritedSubscriptions(ctx, sub); err != nil {
 				return err
 			}
+			children, err := subscriptionService.CascadeCancelToGroupedInvoicingSubscriptions(ctx, sub)
+			if err != nil {
+				return err
+			}
+			cancelledGroupedChildren = children
 
 			return nil
 		})
@@ -408,6 +489,11 @@ func (s *BillingActivities) CheckCancellationActivity(
 		}
 
 		subscriptionService.PublishCancellationEvents(ctx, sub)
+		service.NotifySubscriptionChanged(ctx, s.serviceParams, sub.ID)
+		for _, child := range cancelledGroupedChildren {
+			subscriptionService.PublishCancellationEvents(ctx, child)
+			service.NotifySubscriptionChanged(ctx, s.serviceParams, child.ID)
+		}
 
 		s.logger.Info(ctx, "subscription cancelled successfully",
 			"subscription_id", sub.ID,
@@ -478,12 +564,12 @@ func (s *BillingActivities) ProcessPendingPlanChangesActivity(
 	}
 
 	// Guard: Check if schedule is due (scheduled_at <= now)
-	if schedule.ScheduledAt.After(time.Now()) {
+	if schedule.ScheduledAt.After(clock.Now()) {
 		s.logger.Info(ctx, "schedule not yet due, skipping execution",
 			"schedule_id", schedule.ID,
 			"subscription_id", sub.ID,
 			"scheduled_at", schedule.ScheduledAt,
-			"current_time", time.Now())
+			"current_time", clock.Now())
 		return &subscriptionModels.ProcessPendingPlanChangesActivityOutput{
 			Success:    true,
 			WasChanged: false,
@@ -562,7 +648,7 @@ func (s *BillingActivities) executeScheduledPlanChange(
 	if err != nil {
 		// Mark schedule as failed
 		schedule.Status = types.ScheduleStatusFailed
-		schedule.ExecutedAt = lo.ToPtr(time.Now().UTC())
+		schedule.ExecutedAt = lo.ToPtr(clock.Now())
 		schedule.ErrorMessage = lo.ToPtr(err.Error())
 		if updateErr := s.serviceParams.SubScheduleRepo.Update(ctx, schedule); updateErr != nil {
 			s.logger.Error(ctx, "failed to update schedule status to failed",
@@ -579,7 +665,7 @@ func (s *BillingActivities) executeScheduledPlanChange(
 	if response == nil {
 		err := fmt.Errorf("subscription change returned nil response")
 		schedule.Status = types.ScheduleStatusFailed
-		schedule.ExecutedAt = lo.ToPtr(time.Now().UTC())
+		schedule.ExecutedAt = lo.ToPtr(clock.Now())
 		schedule.ErrorMessage = lo.ToPtr(err.Error())
 		if updateErr := s.serviceParams.SubScheduleRepo.Update(ctx, schedule); updateErr != nil {
 			s.logger.Error(ctx, "failed to update schedule status to failed",
@@ -594,7 +680,7 @@ func (s *BillingActivities) executeScheduledPlanChange(
 	if response.OldSubscription.ID == "" || response.NewSubscription.ID == "" {
 		err := fmt.Errorf("subscription change response missing required subscription IDs")
 		schedule.Status = types.ScheduleStatusFailed
-		schedule.ExecutedAt = lo.ToPtr(time.Now().UTC())
+		schedule.ExecutedAt = lo.ToPtr(clock.Now())
 		schedule.ErrorMessage = lo.ToPtr(err.Error())
 		if updateErr := s.serviceParams.SubScheduleRepo.Update(ctx, schedule); updateErr != nil {
 			s.logger.Error(ctx, "failed to update schedule status to failed",
@@ -608,7 +694,7 @@ func (s *BillingActivities) executeScheduledPlanChange(
 
 	// Mark schedule as completed
 	schedule.Status = types.ScheduleStatusExecuted
-	schedule.ExecutedAt = lo.ToPtr(time.Now().UTC())
+	schedule.ExecutedAt = lo.ToPtr(clock.Now())
 
 	// Set execution result
 	result := &subscription.PlanChangeResult{

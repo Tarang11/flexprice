@@ -47,8 +47,11 @@ const (
 	ScheduledTaskEntityTypeEvents         ScheduledTaskEntityType = "events"
 	ScheduledTaskEntityTypeInvoice        ScheduledTaskEntityType = "invoice"
 	ScheduledTaskEntityTypeCreditTopups   ScheduledTaskEntityType = "credit_topups"
+	ScheduledTaskEntityTypeWalletDebits   ScheduledTaskEntityType = "wallet_debits"
+	ScheduledTaskEntityTypeWalletLedger   ScheduledTaskEntityType = "wallet_ledger"
 	ScheduledTaskEntityTypeCreditUsage    ScheduledTaskEntityType = "credit_usage"
 	ScheduledTaskEntityTypeUsageAnalytics ScheduledTaskEntityType = "usage_analytics"
+	ScheduledTaskEntityTypeRevenueFacts   ScheduledTaskEntityType = "revenue_facts"
 )
 
 // Validate validates the entity type
@@ -57,8 +60,11 @@ func (e ScheduledTaskEntityType) Validate() error {
 		ScheduledTaskEntityTypeEvents,
 		ScheduledTaskEntityTypeInvoice,
 		ScheduledTaskEntityTypeCreditTopups,
+		ScheduledTaskEntityTypeWalletDebits,
+		ScheduledTaskEntityTypeWalletLedger,
 		ScheduledTaskEntityTypeCreditUsage,
 		ScheduledTaskEntityTypeUsageAnalytics,
+		ScheduledTaskEntityTypeRevenueFacts,
 	}
 	if e == "" {
 		return ierr.NewError("entity type is required").
@@ -71,7 +77,7 @@ func (e ScheduledTaskEntityType) Validate() error {
 		}
 	}
 	return ierr.NewError("invalid entity type").
-		WithHint("Entity type must be one of: events, invoice, credit_topups, credit_usage, usage_analytics").
+		WithHint("Entity type must be one of: events, invoice, credit_topups, wallet_debits, wallet_ledger, credit_usage, usage_analytics, revenue_facts").
 		Mark(ierr.ErrValidation)
 }
 

@@ -11,7 +11,6 @@ import (
 
 	dto "github.com/flexprice/flexprice/internal/api/dto"
 	"github.com/flexprice/flexprice/internal/config"
-	domainTenant "github.com/flexprice/flexprice/internal/domain/tenant"
 	"github.com/flexprice/flexprice/internal/ee/service"
 	"github.com/flexprice/flexprice/internal/logger"
 	"github.com/flexprice/flexprice/internal/rbac"
@@ -25,6 +24,7 @@ import (
 type mockTenantService struct {
 	status types.TenantInternalStatus
 	err    error
+	tenant *dto.TenantResponse
 }
 
 func (m *mockTenantService) GetTenantInternalStatus(_ context.Context, _ string) (types.TenantInternalStatus, error) {
@@ -34,7 +34,7 @@ func (m *mockTenantService) CreateTenant(_ context.Context, _ dto.CreateTenantRe
 	return nil, nil
 }
 func (m *mockTenantService) GetTenantByID(_ context.Context, _ string) (*dto.TenantResponse, error) {
-	return nil, nil
+	return m.tenant, nil
 }
 func (m *mockTenantService) AssignTenantToUser(_ context.Context, _ dto.AssignTenantRequest) error {
 	return nil
@@ -44,12 +44,6 @@ func (m *mockTenantService) GetAllTenants(_ context.Context) ([]*dto.TenantRespo
 }
 func (m *mockTenantService) UpdateTenant(_ context.Context, _ string, _ dto.UpdateTenantRequest) (*dto.TenantResponse, error) {
 	return nil, nil
-}
-func (m *mockTenantService) GetBillingUsage(_ context.Context) (*dto.TenantBillingUsage, error) {
-	return nil, nil
-}
-func (m *mockTenantService) CreateTenantAsBillingCustomer(_ context.Context, _ *domainTenant.Tenant) error {
-	return nil
 }
 
 var _ service.TenantService = (*mockTenantService)(nil)

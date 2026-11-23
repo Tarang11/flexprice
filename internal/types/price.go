@@ -106,6 +106,9 @@ type PriceTier struct {
 	// flat_amount is the flat amount for the given tier (optional)
 	// Applied on top of unit_amount*quantity. Useful for cases like "2.7$ + 5c"
 	FlatAmount *decimal.Decimal `json:"flat_amount,omitempty"`
+
+	// transform_quantity bills unit_amount per package of divide_by units; round defaults to up
+	TransformQuantity *TransformQuantity `json:"transform_quantity,omitempty"`
 }
 
 type TransformQuantity struct {
@@ -291,13 +294,18 @@ func BillingPeriodOrder(b BillingPeriod) int {
 	}
 }
 
-// BillingPeriodGreaterThan returns true when a has a longer cadence than b (Order(a) > Order(b)).
-// Returns false if either period is ONETIME, as it is not on the recurring cadence scale.
-func BillingPeriodGreaterThan(a, b BillingPeriod) bool {
-	if a == BILLING_PERIOD_ONETIME || b == BILLING_PERIOD_ONETIME {
+// IsLongerCadence reports whether the item cadence is longer than the subscription's. Month-based
+// cadences compare effective months; daily and weekly fall back to the period order.
+// e.g. MONTHLY×3 on MONTHLY → true (3 > 1); QUARTERLY on MONTHLY×3 → false (3 = 3).
+func IsLongerCadence(itemPeriod BillingPeriod, itemCount int, subPeriod BillingPeriod, subCount int) bool {
+	if itemPeriod == BILLING_PERIOD_ONETIME || subPeriod == BILLING_PERIOD_ONETIME {
 		return false
 	}
-	return BillingPeriodOrder(a) > BillingPeriodOrder(b)
+	itemMonths, subMonths := EffectiveMonths(itemPeriod, itemCount), EffectiveMonths(subPeriod, subCount)
+	if itemMonths > 0 && subMonths > 0 {
+		return itemMonths > subMonths
+	}
+	return BillingPeriodOrder(itemPeriod) > BillingPeriodOrder(subPeriod)
 }
 
 // BillingPeriodToMonths converts a BillingPeriod to its month-equivalent.
@@ -400,6 +408,14 @@ func IsCadenceCompatible(subPeriod BillingPeriod, subCount int, itemPeriod Billi
 	return subMonths%itemMonths == 0
 }
 
+// IsCadenceAllowed reports whether an item cadence can run on a subscription: equal to it, dividing
+// it, or a whole multiple of it.
+// e.g. on QUARTERLY: MONTHLY and ANNUAL are allowed; MONTHLY×2 and WEEKLY are not.
+func IsCadenceAllowed(subPeriod BillingPeriod, subCount int, itemPeriod BillingPeriod, itemCount int) bool {
+	return IsCadenceCompatible(subPeriod, subCount, itemPeriod, itemCount) ||
+		IsCadenceCompatible(itemPeriod, itemCount, subPeriod, subCount)
+}
+
 // IsBillingPeriodMultiple returns true when longer is an exact multiple of shorter
 // (e.g. QUARTERLY is 3× MONTHLY). Both periods must be month-based; sub-month
 // periods always return false when compared with month-based periods.
@@ -482,9 +498,15 @@ type PriceFilter struct {
 	SubscriptionID     *string          `json:"subscription_id,omitempty" form:"subscription_id"`
 	ParentPriceID      *string          `json:"parent_price_id,omitempty" form:"parent_price_id"`
 	MeterIDs           []string         `json:"meter_ids,omitempty" form:"meter_ids"`
+	ProductIDs         []string         `json:"product_ids,omitempty" form:"product_ids"`
 	AllowExpiredPrices bool             `json:"allow_expired_prices,omitempty" form:"allow_expired_prices" default:"false"`
 
 	StartDateLT *time.Time `json:"start_date_lt,omitempty" form:"start_date_lt"`
+
+	// UpdatedAfter matches prices edited since the given time. TimeRangeFilter
+	// above filters on created_at, so it cannot see an edit to an existing
+	// price.
+	UpdatedAfter *time.Time `json:"updated_after,omitempty" form:"updated_after"`
 
 	// DSL filters
 	Filters []*FilterCondition `json:"filters,omitempty" form:"filters"`

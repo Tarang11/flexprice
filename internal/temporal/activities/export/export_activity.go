@@ -11,6 +11,7 @@ import (
 	"github.com/flexprice/flexprice/internal/domain/events"
 	"github.com/flexprice/flexprice/internal/domain/invoice"
 	"github.com/flexprice/flexprice/internal/domain/price"
+	"github.com/flexprice/flexprice/internal/domain/revenuefact"
 	"github.com/flexprice/flexprice/internal/domain/subscription"
 	"github.com/flexprice/flexprice/internal/domain/wallet"
 	syncExport "github.com/flexprice/flexprice/internal/ee/service/sync/export"
@@ -38,6 +39,7 @@ type ExportActivity struct {
 	usageAnalyticsGetter     syncExport.UsageAnalyticsGetter
 	eventRepo                events.Repository
 	subscriptionLineItemRepo subscription.LineItemRepository
+	revenueFactRepo          revenuefact.Repository
 }
 
 // NewExportActivity creates a new export activity
@@ -56,6 +58,7 @@ func NewExportActivity(
 	usageAnalyticsGetter syncExport.UsageAnalyticsGetter,
 	eventRepo events.Repository,
 	subscriptionLineItemRepo subscription.LineItemRepository,
+	revenueFactRepo revenuefact.Repository,
 ) *ExportActivity {
 	return &ExportActivity{
 		meterUsageRepo:           meterUsageRepo,
@@ -72,18 +75,20 @@ func NewExportActivity(
 		usageAnalyticsGetter:     usageAnalyticsGetter,
 		eventRepo:                eventRepo,
 		subscriptionLineItemRepo: subscriptionLineItemRepo,
+		revenueFactRepo:          revenueFactRepo,
 	}
 }
 
 // ExportDataInput represents input for exporting data
 type ExportDataInput struct {
-	EntityType   types.ScheduledTaskEntityType
-	ConnectionID string
-	TenantID     string
-	EnvID        string
-	StartTime    time.Time
-	EndTime      time.Time
-	JobConfig    *types.S3JobConfig
+	EntityType          types.ScheduledTaskEntityType
+	ConnectionID        string
+	TenantID            string
+	EnvID               string
+	StartTime           time.Time
+	EndTime             time.Time
+	JobConfig           *types.S3JobConfig
+	CustomerExternalIDs []string
 }
 
 // ExportDataOutput represents output from export
@@ -108,17 +113,18 @@ func (a *ExportActivity) ExportData(ctx context.Context, input ExportDataInput) 
 
 	// Create export request
 	request := &dto.ExportRequest{
-		EntityType:   input.EntityType,
-		ConnectionID: input.ConnectionID,
-		TenantID:     input.TenantID,
-		EnvID:        input.EnvID,
-		StartTime:    input.StartTime,
-		EndTime:      input.EndTime,
-		JobConfig:    input.JobConfig,
+		EntityType:          input.EntityType,
+		ConnectionID:        input.ConnectionID,
+		TenantID:            input.TenantID,
+		EnvID:               input.EnvID,
+		StartTime:           input.StartTime,
+		EndTime:             input.EndTime,
+		JobConfig:           input.JobConfig,
+		CustomerExternalIDs: input.CustomerExternalIDs,
 	}
 
 	// Use the ExportService which handles routing to the correct exporter
-	exportService := syncExport.NewExportServiceWithWallet(a.meterUsageRepo, a.priceRepo, a.invoiceRepo, a.walletRepo, a.walletBalanceGetter, a.customerRepo, a.connectionRepo, a.integrationFactory, a.storageResolver, a.config, a.logger, a.usageAnalyticsGetter, a.eventRepo, a.subscriptionLineItemRepo)
+	exportService := syncExport.NewExportServiceWithWallet(a.meterUsageRepo, a.priceRepo, a.invoiceRepo, a.walletRepo, a.walletBalanceGetter, a.customerRepo, a.connectionRepo, a.integrationFactory, a.storageResolver, a.config, a.logger, a.usageAnalyticsGetter, a.eventRepo, a.subscriptionLineItemRepo, a.revenueFactRepo)
 	response, err := exportService.Export(ctx, request)
 	if err != nil {
 		a.logger.Error(ctx, "export failed", "error", err, "entity_type", input.EntityType)

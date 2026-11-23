@@ -252,13 +252,17 @@ func (s *InMemoryWalletStore) FindEligibleCredits(ctx context.Context, walletID 
 		if t.WalletID != walletID ||
 			t.Type != types.TransactionTypeCredit ||
 			t.CreditsAvailable.LessThanOrEqual(decimal.Zero) ||
-			t.Status != types.StatusPublished {
+			t.Status != types.StatusPublished ||
+			t.TxStatus != types.TransactionStatusCompleted {
 			return false
 		}
 
 		// Check expiry date against the caller's time reference (mirrors the ent
 		// repository's expiry_date >= time_reference predicate)
 		if t.ExpiryDate != nil && t.ExpiryDate.Before(timeReference) {
+			return false
+		}
+		if !t.CreatedAt.Before(timeReference) {
 			return false
 		}
 
@@ -319,7 +323,7 @@ func (s *InMemoryWalletStore) FindEligibleCredits(ctx context.Context, walletID 
 
 // ConsumeCredits consumes credits from a wallet
 func (s *InMemoryWalletStore) ConsumeCredits(ctx context.Context, credits []*wallet.Transaction, amount decimal.Decimal) ([]*wallet.Transaction, error) {
-	consumedCredits := make([]*wallet.Transaction, 0)
+	consumedCredits := make([]*wallet.Transaction, 0, len(credits))
 	remainingAmount := amount
 
 	for _, credit := range credits {
@@ -628,6 +632,12 @@ func (s *InMemoryWalletStore) UpdateTransaction(ctx context.Context, tx *wallet.
 	existing.CreditBalanceBefore = tx.CreditBalanceBefore
 	existing.CreditBalanceAfter = tx.CreditBalanceAfter
 	existing.CreditsAvailable = tx.CreditsAvailable
+	if tx.SourceType != "" {
+		existing.SourceType = tx.SourceType
+	}
+	if tx.SourceID != "" {
+		existing.SourceID = tx.SourceID
+	}
 	existing.UpdatedAt = time.Now().UTC()
 	existing.UpdatedBy = types.GetUserID(ctx)
 
@@ -797,6 +807,160 @@ func (s *InMemoryWalletStore) GetCreditTopupsForExport(ctx context.Context, tena
 	}
 
 	return results[start:end], nil
+}
+
+// GetWalletDebitsForExport mirrors the Postgres export: one row per consumed batch, no paid amounts.
+func (s *InMemoryWalletStore) GetWalletDebitsForExport(ctx context.Context, tenantID, envID string, after wallet.WalletDebitsExportCursor, endTime time.Time, limit int) ([]*wallet.WalletDebitsExportData, error) {
+	allTransactions, err := s.transactions.List(ctx, nil, nil, nil)
+	if err != nil {
+		return nil, ierr.WithError(err).
+			WithHint("Failed to retrieve transactions for export").
+			Mark(ierr.ErrDatabase)
+	}
+
+	var results []*wallet.WalletDebitsExportData
+	for _, tx := range allTransactions {
+		if tx.TenantID != tenantID || tx.EnvironmentID != envID || tx.Type != types.TransactionTypeDebit {
+			continue
+		}
+		if !tx.CreatedAt.Before(endTime) {
+			continue
+		}
+		if tx.CreatedAt.Before(after.CreatedAt) || (tx.CreatedAt.Equal(after.CreatedAt) && tx.ID <= after.DebitID) {
+			continue
+		}
+		row := wallet.WalletDebitsExportData{
+			DebitID:           tx.ID,
+			WalletID:          tx.WalletID,
+			Currency:          tx.Currency,
+			TransactionReason: tx.TransactionReason,
+			InvoiceID:         tx.SourceID,
+			Credits:           tx.CreditAmount,
+			CreatedAt:         tx.CreatedAt,
+		}
+		if len(tx.ConsumptionBreakdown) == 0 {
+			results = append(results, &row)
+			continue
+		}
+		for _, c := range tx.ConsumptionBreakdown {
+			batch := row
+			batch.CreditTransactionID = c.CreditTransactionID
+			batch.Credits = c.Credits
+			results = append(results, &batch)
+		}
+	}
+
+	sort.SliceStable(results, func(i, j int) bool {
+		if !results[i].CreatedAt.Equal(results[j].CreatedAt) {
+			return results[i].CreatedAt.Before(results[j].CreatedAt)
+		}
+		return results[i].DebitID < results[j].DebitID
+	})
+
+	// limit counts debits, not batch rows.
+	debits := 0
+	for i, r := range results {
+		if i == 0 || r.DebitID != results[i-1].DebitID {
+			debits++
+			if debits > limit {
+				return results[:i], nil
+			}
+		}
+	}
+	return results, nil
+}
+
+// ListWalletIDsForLedgerExport mirrors the Postgres listing without the customer filter or late
+// payments, which need other stores.
+func (s *InMemoryWalletStore) ListWalletIDsForLedgerExport(ctx context.Context, tenantID, envID string, startTime, endTime time.Time, customerExternalIDs []string) ([]string, error) {
+	allTransactions, err := s.transactions.List(ctx, nil, nil, nil)
+	if err != nil {
+		return nil, ierr.WithError(err).
+			WithHint("Failed to retrieve transactions for export").
+			Mark(ierr.ErrDatabase)
+	}
+	var walletIDs []string
+	for _, tx := range allTransactions {
+		if tx.TenantID == tenantID && tx.EnvironmentID == envID && tx.TxStatus == types.TransactionStatusCompleted &&
+			!tx.CreatedAt.Before(startTime) && tx.CreatedAt.Before(endTime) {
+			walletIDs = append(walletIDs, tx.WalletID)
+		}
+	}
+	walletIDs = lo.Uniq(walletIDs)
+	sort.Strings(walletIDs)
+	return walletIDs, nil
+}
+
+// GetWalletLedgerForExport mirrors the Postgres export without paid amounts or invoice paid times,
+// which need other stores.
+func (s *InMemoryWalletStore) GetWalletLedgerForExport(ctx context.Context, tenantID, envID string, walletIDs []string, startTime, endTime time.Time) ([]*wallet.WalletLedgerExportData, error) {
+	allTransactions, err := s.transactions.List(ctx, nil, nil, nil)
+	if err != nil {
+		return nil, ierr.WithError(err).
+			WithHint("Failed to retrieve transactions for export").
+			Mark(ierr.ErrDatabase)
+	}
+
+	var results []*wallet.WalletLedgerExportData
+	isChild := make(map[string]bool)
+	for _, tx := range allTransactions {
+		if tx.TenantID != tenantID || tx.EnvironmentID != envID || tx.TxStatus != types.TransactionStatusCompleted {
+			continue
+		}
+		isChild[tx.ID] = tx.ParentTransactionID != ""
+		if !lo.Contains(walletIDs, tx.WalletID) || tx.CreatedAt.Before(startTime) || !tx.CreatedAt.Before(endTime) {
+			continue
+		}
+		row := wallet.WalletLedgerExportData{
+			TransactionID:       tx.ID,
+			Type:                tx.Type,
+			TransactionReason:   tx.TransactionReason,
+			WalletID:            tx.WalletID,
+			Currency:            tx.Currency,
+			InvoiceID:           tx.SourceID,
+			Credits:             tx.CreditAmount,
+			CreditBalanceBefore: tx.CreditBalanceBefore,
+			CreditBalanceAfter:  tx.CreditBalanceAfter,
+			EffectiveAt:         tx.CreatedAt,
+			CreatedAt:           tx.CreatedAt,
+		}
+		if tx.Type != types.TransactionTypeDebit || len(tx.ConsumptionBreakdown) == 0 {
+			results = append(results, &row)
+			continue
+		}
+		balance := tx.CreditBalanceBefore
+		for _, c := range tx.ConsumptionBreakdown {
+			batch := row
+			batch.CreditTransactionID = c.CreditTransactionID
+			batch.Credits = c.Credits
+			batch.CreditBalanceBefore = balance
+			balance = balance.Sub(c.Credits)
+			batch.CreditBalanceAfter = balance
+			results = append(results, &batch)
+		}
+		if drawn := tx.CreditBalanceBefore.Sub(balance); tx.CreditAmount.GreaterThan(drawn) {
+			rest := row
+			rest.Credits = tx.CreditAmount.Sub(drawn)
+			rest.CreditBalanceBefore = balance
+			rest.CreditBalanceAfter = balance.Sub(rest.Credits)
+			results = append(results, &rest)
+		}
+	}
+
+	sort.SliceStable(results, func(i, j int) bool {
+		a, b := results[i], results[j]
+		if a.WalletID != b.WalletID {
+			return a.WalletID < b.WalletID
+		}
+		if !a.EffectiveAt.Equal(b.EffectiveAt) {
+			return a.EffectiveAt.Before(b.EffectiveAt)
+		}
+		if aBonus, bBonus := isChild[a.TransactionID], isChild[b.TransactionID]; aBonus != bBonus {
+			return bBonus
+		}
+		return a.TransactionID < b.TransactionID
+	})
+	return results, nil
 }
 
 // GetCreditsAvailableBreakdown retrieves the breakdown of available credits by type

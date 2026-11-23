@@ -8,6 +8,7 @@ import (
 	"github.com/flexprice/flexprice/internal/integration/paddle"
 	"github.com/flexprice/flexprice/internal/interfaces"
 	"github.com/flexprice/flexprice/internal/logger"
+	"github.com/flexprice/flexprice/internal/temporal/activities/billingentity"
 	"github.com/flexprice/flexprice/internal/temporal/models"
 	"github.com/flexprice/flexprice/internal/types"
 	"go.temporal.io/sdk/temporal"
@@ -17,6 +18,7 @@ import (
 type InvoiceSyncActivities struct {
 	integrationFactory *integration.Factory
 	customerService    interfaces.CustomerService
+	entityScope        interfaces.BillingEntityScope
 	logger             *logger.Logger
 }
 
@@ -24,11 +26,13 @@ type InvoiceSyncActivities struct {
 func NewInvoiceSyncActivities(
 	integrationFactory *integration.Factory,
 	customerService interfaces.CustomerService,
+	entityScope interfaces.BillingEntityScope,
 	logger *logger.Logger,
 ) *InvoiceSyncActivities {
 	return &InvoiceSyncActivities{
 		integrationFactory: integrationFactory,
 		customerService:    customerService,
+		entityScope:        entityScope,
 		logger:             logger,
 	}
 }
@@ -52,6 +56,11 @@ func (a *InvoiceSyncActivities) SyncInvoiceToPaddle(
 	ctx = types.SetTenantID(ctx, input.TenantID)
 	ctx = types.SetEnvironmentID(ctx, input.EnvironmentID)
 
+	ctx, err := billingentity.ScopeActivity(ctx, a.entityScope, input.CustomerID, input.InvoiceID, "")
+	if err != nil {
+		return err
+	}
+
 	// Get Paddle integration with runtime context
 	paddleIntegration, err := a.integrationFactory.GetPaddleIntegration(ctx)
 	if err != nil {
@@ -61,7 +70,7 @@ func (a *InvoiceSyncActivities) SyncInvoiceToPaddle(
 				"customer_id", input.CustomerID)
 			return temporal.NewNonRetryableApplicationError(
 				"Paddle connection not configured",
-				"ConnectionNotFound",
+				ierr.ErrConnectionNotFound,
 				err,
 			)
 		}
@@ -116,6 +125,11 @@ func (a *InvoiceSyncActivities) PullAndUpdatePaddleInvoice(
 	ctx = types.SetTenantID(ctx, input.TenantID)
 	ctx = types.SetEnvironmentID(ctx, input.EnvironmentID)
 
+	ctx, err := billingentity.ScopeActivity(ctx, a.entityScope, "", input.InvoiceID, "")
+	if err != nil {
+		return err
+	}
+
 	paddleIntegration, err := a.integrationFactory.GetPaddleIntegration(ctx)
 	if err != nil {
 		if ierr.IsNotFound(err) {
@@ -123,7 +137,7 @@ func (a *InvoiceSyncActivities) PullAndUpdatePaddleInvoice(
 				"invoice_id", input.InvoiceID)
 			return temporal.NewNonRetryableApplicationError(
 				"Paddle connection not configured",
-				"ConnectionNotFound",
+				ierr.ErrConnectionNotFound,
 				err,
 			)
 		}

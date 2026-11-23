@@ -15,6 +15,7 @@ type ScheduleID string
 const (
 	ScheduleIDCreditGrantProcessing                   ScheduleID = "credit-grants-processing"
 	ScheduleIDSubscriptionAutoCancellation            ScheduleID = "subscription-auto-cancellation"
+	ScheduleIDSubscriptionOverdueInvoices             ScheduleID = "subscription-overdue-invoices"
 	ScheduleIDWalletCreditExpiry                      ScheduleID = "wallet-credit-expiry"
 	ScheduleIDSubscriptionBilling                     ScheduleID = "subscription-billing"
 	ScheduleIDSubscriptionRenewalAlerts               ScheduleID = "subscription-renewal-due-alerts"
@@ -23,11 +24,23 @@ const (
 	ScheduleIDOutboundWebhookStaleRetry               ScheduleID = "webhook-stale-retry"
 	ScheduleIDPaddleInvoicePullSync                   ScheduleID = "paddle-invoice-pull-sync"
 	ScheduleIDMoyasarAuthPaymentSettlement            ScheduleID = "moyasar-auth-payment-settlement"
+	ScheduleIDRazorpayPaymentStatusSync               ScheduleID = "razorpay-payment-status-sync"
 	ScheduleIDCheckoutSessionExpiry                   ScheduleID = "checkout-session-expiry"
 	ScheduleIDMarketplaceUsageSnapshot                ScheduleID = "marketplace-usage-snapshot"
 	ScheduleIDMarketplaceUsageReport                  ScheduleID = "marketplace-usage-report"
 	ScheduleIDDailyDraftAndCompute                    ScheduleID = "daily-draft-and-compute"
 	ScheduleIDDraftInvoiceFinalization                ScheduleID = "draft-invoice-finalization"
+	// ScheduleIDRevenueRollup drives RevenueRollupWorkflow; gated off by default
+	// via analytics.revenue_rollup.enabled (see EnsureSchedules).
+	ScheduleIDRevenueRollup ScheduleID = "revenue-rollup"
+	// ScheduleIDRevenueRecognition drives RevenueRecognitionWorkflow; a no-op unless an environment enables revenue recognition.
+	ScheduleIDRevenueRecognition ScheduleID = "revenue-recognition"
+	// ScheduleIDSelfBillingHourly drives SelfBillingHourlyWorkflow; a no-op unless self-billing is enabled.
+	ScheduleIDSelfBillingHourly ScheduleID = "self-billing-hourly"
+	// ScheduleIDBillingInstalmentsDue drives BillingInstalmentsDueWorkflow, billing due separate-invoice instalments.
+	ScheduleIDBillingInstalmentsDue ScheduleID = "billing-instalments-due"
+	// ScheduleIDEmailDispatch drives EmailDispatchWorkflow, sending queued customer emails.
+	ScheduleIDEmailDispatch ScheduleID = "email-dispatch"
 )
 
 // String returns the raw schedule id.
@@ -39,6 +52,7 @@ func AllTemporalServerScheduleIDs() []ScheduleID {
 	return []ScheduleID{
 		ScheduleIDCreditGrantProcessing,
 		ScheduleIDSubscriptionAutoCancellation,
+		ScheduleIDSubscriptionOverdueInvoices,
 		ScheduleIDWalletCreditExpiry,
 		ScheduleIDSubscriptionBilling,
 		ScheduleIDSubscriptionRenewalAlerts,
@@ -47,11 +61,17 @@ func AllTemporalServerScheduleIDs() []ScheduleID {
 		ScheduleIDOutboundWebhookStaleRetry,
 		ScheduleIDPaddleInvoicePullSync,
 		ScheduleIDMoyasarAuthPaymentSettlement,
+		ScheduleIDRazorpayPaymentStatusSync,
 		ScheduleIDCheckoutSessionExpiry,
 		ScheduleIDMarketplaceUsageSnapshot,
 		ScheduleIDMarketplaceUsageReport,
 		ScheduleIDDailyDraftAndCompute,
 		ScheduleIDDraftInvoiceFinalization,
+		ScheduleIDRevenueRollup,
+		ScheduleIDRevenueRecognition,
+		ScheduleIDSelfBillingHourly,
+		ScheduleIDBillingInstalmentsDue,
+		ScheduleIDEmailDispatch,
 	}
 }
 

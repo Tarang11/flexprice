@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	"github.com/flexprice/flexprice/internal/clock"
+
 	"github.com/flexprice/flexprice/internal/domain/addon"
 	"github.com/flexprice/flexprice/internal/domain/addonassociation"
 	ierr "github.com/flexprice/flexprice/internal/errors"
@@ -63,6 +65,10 @@ type AddonResponse struct {
 	Prices       []*PriceResponse       `json:"prices,omitempty"`
 	Entitlements []*EntitlementResponse `json:"entitlements,omitempty"`
 	CreditGrants []*CreditGrantResponse `json:"credit_grants,omitempty"`
+	// PriceSyncStatus reports how many associations are still behind this addon's
+	// current usage-price sequence. Only populated on GetAddons when
+	// `expand=price_sync_status` is requested.
+	PriceSyncStatus *AddonPriceSyncStatusResponse `json:"price_sync_status,omitempty"`
 }
 
 // CreateAddonResponse represents the response after creating an addon
@@ -78,20 +84,24 @@ type AddAddonToSubscriptionRequest struct {
 	AddonID           string                  `json:"addon_id" validate:"required"`
 	Cadence           types.AddonCadence      `json:"cadence"`
 	ProrationBehavior types.ProrationBehavior `json:"proration_behavior,omitempty"`
+	ProrationSettings ProrationSettings       `json:"-"`
 	StartDate         *time.Time              `json:"start_date,omitempty"`
-	Metadata          map[string]interface{}  `json:"metadata"`
+	// ChangeAt names when the attach applies without computing a date. Mutually exclusive
+	// with StartDate; omit both to attach now.
+	ChangeAt *types.ScheduleType    `json:"change_at,omitempty"`
+	Metadata map[string]interface{} `json:"metadata"`
 
-	// LineItemCommitments allows setting commitment configuration per addon line item (keyed by price_id)
+	// Deprecated: use POST /commitments instead.
 	LineItemCommitments map[string]*LineItemCommitmentConfig `json:"line_item_commitments,omitempty" validate:"omitempty,dive"`
 
 	// OverrideLineItems allows overriding price/quantity/billing model for specific addon prices
 	OverrideLineItems []OverrideLineItemRequest `json:"override_line_items,omitempty" validate:"omitempty,dive"`
 
-	// SkipEntityValidation is used to skip the entitlement check for the addon
-	// This is used to add an addon to a subscription without checking the entitlement compatibility
-	// This is used when we are adding an addon to a subscription that already has an active instance of the addon
-	// In that case we don't need to check the entitlement compatibility
-	SkipEntityValidation bool `json:"-"`
+	// Coupons apply to this addon's line items; price_id targets one price, omitted targets all.
+	Coupons []SubscriptionCouponInput `json:"coupons,omitempty"`
+
+	// CouponRefs are the coupons resolved at quote time. Server-set on replay.
+	CouponRefs []types.CouponRef `json:"-"`
 
 	// PreviewOnly quotes the attach without writing anything. Server-set: callers reach it
 	// through the preview endpoint, never by sending it.
@@ -100,7 +110,7 @@ type AddAddonToSubscriptionRequest struct {
 
 func (a *AddAddonToSubscriptionRequest) ToAddonAssociation(ctx context.Context, enitiyId string, enitityType types.AddonAssociationEntityType) *addonassociation.AddonAssociation {
 
-	now := time.Now()
+	now := clock.Now()
 	startDate := now
 	if a.StartDate != nil {
 		startDate = *a.StartDate
@@ -118,9 +128,28 @@ func (a *AddAddonToSubscriptionRequest) ToAddonAssociation(ctx context.Context, 
 	}
 }
 
+func (r *AddAddonToSubscriptionRequest) ApplyDefaults() {
+	if r == nil {
+		return
+	}
+	applyLineItemCommitmentDefaults(r.LineItemCommitments)
+}
+
 func (r *AddAddonToSubscriptionRequest) Validate() error {
 	if err := validator.ValidateRequest(r); err != nil {
 		return err
+	}
+
+	if r.ChangeAt != nil {
+		if err := r.ChangeAt.Validate(); err != nil {
+			return err
+		}
+		if r.StartDate != nil {
+			return ierr.NewError("change_at and start_date are mutually exclusive").
+				WithHint("Provide change_at for immediate or end_of_period, or start_date for any other date").
+				WithReportableDetails(map[string]any{"addon_id": r.AddonID}).
+				Mark(ierr.ErrValidation)
+		}
 	}
 
 	// Default to recurring when not provided for backward compatibility.
@@ -196,4 +225,29 @@ func (r *GetActiveAddonAssociationRequest) Validate() error {
 			Mark(ierr.ErrValidation)
 	}
 	return nil
+}
+
+// SyncAddonPricesResponse is returned by the addon usage-price sync. Uses the
+// SyncPlanPricesResponse shape, the one the plan sync (including V2) actually
+// returns.
+type SyncAddonPricesResponse struct {
+	AddonID string                 `json:"addon_id"`
+	Message string                 `json:"message"`
+	Summary SyncAddonPricesSummary `json:"summary"`
+}
+
+type SyncAddonPricesSummary struct {
+	LineItemsFoundForCreation int `json:"line_items_found_for_creation"`
+	LineItemsCreated          int `json:"line_items_created"`
+	LineItemsTerminated       int `json:"line_items_terminated"`
+}
+
+// AddonPriceSyncStatusResponse reports how many of an addon's associations are
+// still behind the addon's current usage-price sequence. UnsyncedAssociationCount
+// == 0 means every active recurring association is caught up and a sync run would
+// be a no-op.
+type AddonPriceSyncStatusResponse struct {
+	CurrentSequence          int64 `json:"current_sequence"`
+	UnsyncedAssociationCount int64 `json:"unsynced_association_count"`
+	Synced                   bool  `json:"synced"`
 }

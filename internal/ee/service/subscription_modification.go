@@ -7,6 +7,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/flexprice/flexprice/internal/clock"
+
+	"github.com/samber/lo"
+	"github.com/shopspring/decimal"
+
 	"github.com/flexprice/flexprice/internal/api/dto"
 	"github.com/flexprice/flexprice/internal/domain/customer"
 	"github.com/flexprice/flexprice/internal/domain/invoice"
@@ -15,8 +20,15 @@ import (
 	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/types"
 	webhookDto "github.com/flexprice/flexprice/internal/webhook/dto"
-	"github.com/samber/lo"
-	"github.com/shopspring/decimal"
+)
+
+const (
+	previewInvoiceID       = "(preview-invoice)"
+	previewWalletCreditID  = "(preview-wallet-credit)"
+	previewLineItemID      = "(preview-line)"
+	previewCreatedID       = "(preview-created)"
+	previewEndedLineItemID = "(preview-ended)"
+	previewPriceID         = "(preview-price)"
 )
 
 // SubscriptionModificationService handles mid-cycle subscription modifications.
@@ -29,13 +41,15 @@ type SubscriptionModificationService interface {
 }
 
 type subscriptionModificationService struct {
-	serviceParams ServiceParams
+	serviceParams       ServiceParams
+	subscriptionService *subscriptionService
 }
 
 // NewSubscriptionModificationService creates a new SubscriptionModificationService.
 func NewSubscriptionModificationService(serviceParams ServiceParams) SubscriptionModificationService {
 	return &subscriptionModificationService{
-		serviceParams: serviceParams,
+		serviceParams:       serviceParams,
+		subscriptionService: NewSubscriptionService(serviceParams).(*subscriptionService),
 	}
 }
 
@@ -50,19 +64,28 @@ func (s *subscriptionModificationService) Execute(ctx context.Context, subscript
 		return s.executeInheritance(ctx, subscriptionID, req.InheritanceParams)
 	case dto.SubscriptionModifyTypeQuantityChange:
 		return s.executeQuantityChange(ctx, subscriptionID, req.QuantityChangeParams, req.Checkout)
+	case dto.SubscriptionModifyTypeLineItemChange:
+		return s.executeLineItemChange(ctx, subscriptionID, req.LineItemChangeParams, req.Checkout)
 	case dto.SubscriptionModifyTypeGroupedInvoicing:
+		if req.GroupedInvoicingParams.Action == dto.GroupedInvoicingActionModify {
+			return s.executeGroupedAddonChange(ctx, subscriptionID, req.GroupedInvoicingParams, req.Checkout)
+		}
 		return s.executeGroupedInvoicingMembership(ctx, req.GroupedInvoicingParams)
 	case dto.SubscriptionModifyTypeTrialEnd:
-		return s.executeTrialEnd(ctx, subscriptionID, req.TrialEndParams)
+		return s.executeTrialEnd(ctx, subscriptionID, req.TrialEndParams, req.Checkout)
 	case dto.SubscriptionModifyTypeCoupon:
 		return s.executeCouponModification(ctx, subscriptionID, req.CouponParams)
 	case dto.SubscriptionModifyTypeTax:
 		return s.executeTaxModification(ctx, subscriptionID, req.TaxParams)
 	case dto.SubscriptionModifyTypeAddon:
-		return s.executeAddonModification(ctx, subscriptionID, req.AddonParams, req.Checkout)
+		params, err := addonBulkParams(req)
+		if err != nil {
+			return nil, err
+		}
+		return s.executeBulkAddonModification(ctx, subscriptionID, params, req.Checkout)
 	default:
 		return nil, ierr.NewError("unknown modification type: " + string(req.Type)).
-			WithHint("Valid values: inheritance, quantity_change, grouped_invoicing, trial_end, coupon, tax, addon").
+			WithHint("Valid values: inheritance, quantity_change, line_item_change, grouped_invoicing, trial_end, coupon, tax, addon").
 			Mark(ierr.ErrValidation)
 	}
 }
@@ -78,7 +101,12 @@ func (s *subscriptionModificationService) Preview(ctx context.Context, subscript
 		return s.previewInheritance(ctx, subscriptionID, req.InheritanceParams)
 	case dto.SubscriptionModifyTypeQuantityChange:
 		return s.previewQuantityChange(ctx, subscriptionID, req.QuantityChangeParams)
+	case dto.SubscriptionModifyTypeLineItemChange:
+		return s.previewLineItemChange(ctx, subscriptionID, req.LineItemChangeParams)
 	case dto.SubscriptionModifyTypeGroupedInvoicing:
+		if req.GroupedInvoicingParams.Action == dto.GroupedInvoicingActionModify {
+			return s.previewGroupedAddonChange(ctx, subscriptionID, req.GroupedInvoicingParams)
+		}
 		return s.previewGroupedInvoicingMembership(ctx, req.GroupedInvoicingParams)
 	case dto.SubscriptionModifyTypeTrialEnd:
 		return s.previewTrialEnd(ctx, subscriptionID, req.TrialEndParams)
@@ -87,10 +115,14 @@ func (s *subscriptionModificationService) Preview(ctx context.Context, subscript
 	case dto.SubscriptionModifyTypeTax:
 		return s.previewTaxModification(ctx, subscriptionID, req.TaxParams)
 	case dto.SubscriptionModifyTypeAddon:
-		return s.previewAddonModification(ctx, subscriptionID, req.AddonParams)
+		params, err := addonBulkParams(req)
+		if err != nil {
+			return nil, err
+		}
+		return s.previewBulkAddonModification(ctx, subscriptionID, params)
 	default:
 		return nil, ierr.NewError("unknown modification type: " + string(req.Type)).
-			WithHint("Valid values: inheritance, quantity_change, grouped_invoicing, trial_end, coupon, tax, addon").
+			WithHint("Valid values: inheritance, quantity_change, line_item_change, grouped_invoicing, trial_end, coupon, tax, addon").
 			Mark(ierr.ErrValidation)
 	}
 }
@@ -287,7 +319,7 @@ func (s *subscriptionModificationService) previewInheritance(
 	}
 	for range childCustomerIDs {
 		changedSubs = append(changedSubs, dto.ChangedSubscription{
-			ID:     "(preview-created)",
+			ID:     previewCreatedID,
 			Action: dto.ChangedSubscriptionActionCreated,
 			Status: types.SubscriptionStatusActive,
 		})
@@ -365,6 +397,95 @@ func (s *subscriptionModificationService) executeQuantityChange(
 	}, nil
 }
 
+func (s *subscriptionModificationService) executeLineItemChange(
+	ctx context.Context,
+	subscriptionID string,
+	params *dto.SubModifyLineItemChangeRequest,
+	checkout *dto.CheckoutParams,
+) (*dto.SubscriptionModifyResponse, error) {
+	sp := s.serviceParams
+
+	request, err := s.buildLineItemChangeRequest(ctx, subscriptionID, params)
+	if err != nil {
+		return nil, err
+	}
+
+	settleReq, err := s.quoteLineItemChange(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+
+	// Pay-first only when the batch nets to a charge; a net credit has nothing to collect.
+	if checkout != nil {
+		if err := checkout.Validate(); err != nil {
+			return nil, err
+		}
+		if settleReq.Quote.NetAmount().IsPositive() {
+			return s.settleLineItemChangePayFirst(ctx, request, settleReq, checkout)
+		}
+	}
+
+	changedLineItems, changedInvoices, err := s.settleLineItemChangePayLater(ctx, request, settleReq)
+	if err != nil {
+		return nil, err
+	}
+
+	s.publishSystemEvent(ctx, types.WebhookEventSubscriptionUpdated, subscriptionID)
+	triggerHubSpotDealSync(ctx, sp, subscriptionID)
+
+	subResp, err := NewSubscriptionService(sp).GetSubscription(ctx, subscriptionID)
+	if err != nil {
+		return nil, err
+	}
+
+	return &dto.SubscriptionModifyResponse{
+		Subscription: subResp,
+		ChangedResources: dto.ChangedResources{
+			LineItems: changedLineItems,
+			Invoices:  changedInvoices,
+		},
+	}, nil
+}
+
+func (s *subscriptionModificationService) previewLineItemChange(
+	ctx context.Context,
+	subscriptionID string,
+	params *dto.SubModifyLineItemChangeRequest,
+) (*dto.SubscriptionModifyResponse, error) {
+	sp := s.serviceParams
+
+	request, err := s.buildLineItemChangeRequest(ctx, subscriptionID, params)
+	if err != nil {
+		return nil, err
+	}
+
+	settleReq, err := s.quoteLineItemChange(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+
+	// A preview writes nothing, so it carries no key to deduplicate against.
+	settleReq.Mode = SettleModePreview
+	settleReq.IdempotencyKey = ""
+	settled, err := NewLineItemProrationService(sp).Settle(ctx, settleReq)
+	if err != nil {
+		return nil, err
+	}
+
+	subResp, err := NewSubscriptionService(sp).GetSubscription(ctx, subscriptionID)
+	if err != nil {
+		return nil, err
+	}
+
+	return &dto.SubscriptionModifyResponse{
+		Subscription: subResp,
+		ChangedResources: dto.ChangedResources{
+			LineItems: request.previewChangedLineItems(),
+			Invoices:  settled.GetChanged(),
+		},
+	}, nil
+}
+
 func (s *subscriptionModificationService) previewQuantityChange(
 	ctx context.Context,
 	subscriptionID string,
@@ -431,7 +552,7 @@ func (s *subscriptionModificationService) toPreviewChangedInvoices(
 		if netAmount.GreaterThan(decimal.Zero) {
 			invResp := previewProrationQuantityChangeInvoiceResponse(ctx, sub, oldItem, newItem, mod.getEffectiveDate(), price, netAmount)
 			out = append(out, dto.ChangedInvoice{
-				ID:      "(preview-invoice)",
+				ID:      previewInvoiceID,
 				Action:  dto.ChangedInvoiceActionCreated,
 				Status:  dto.ChangedInvoiceStatusPreview,
 				Invoice: invResp,
@@ -443,7 +564,7 @@ func (s *subscriptionModificationService) toPreviewChangedInvoices(
 			return nil, err
 		}
 		out = append(out, dto.ChangedInvoice{
-			ID:                "(preview-wallet-credit)",
+			ID:                previewWalletCreditID,
 			Action:            dto.ChangedInvoiceActionWalletCredit,
 			Status:            dto.ChangedInvoiceStatusPreview,
 			WalletTransaction: walletTx,
@@ -483,8 +604,8 @@ func previewProrationQuantityChangeInvoiceResponse(
 	bm := types.GetDefaultBaseModel(ctx)
 
 	invLine := &invoice.InvoiceLineItem{
-		ID:                    "(preview-line)",
-		InvoiceID:             "(preview-invoice)",
+		ID:                    previewLineItemID,
+		InvoiceID:             previewInvoiceID,
 		CustomerID:            billingCustomer,
 		SubscriptionID:        &subscriptionID,
 		PlanDisplayName:       &planDisplayName,
@@ -505,7 +626,7 @@ func previewProrationQuantityChangeInvoiceResponse(
 	}
 
 	inv := &invoice.Invoice{
-		ID:                         "(preview-invoice)",
+		ID:                         previewInvoiceID,
 		CustomerID:                 billingCustomer,
 		SubscriptionID:             &subscriptionID,
 		SubscriptionCustomerID:     &subscriptionCustomerID,
@@ -568,7 +689,7 @@ func (s *subscriptionModificationService) previewProrationWalletTransactionRespo
 	envID := types.GetEnvironmentID(ctx)
 	bm := types.GetDefaultBaseModel(ctx)
 	tx := &wallet.Transaction{
-		ID:                  "(preview-wallet-credit)",
+		ID:                  previewWalletCreditID,
 		CustomerID:          billingCustomer,
 		Type:                types.TransactionTypeCredit,
 		Amount:              currencyTopUpAmount,
@@ -778,7 +899,7 @@ func (s *subscriptionModificationService) publishSystemEvent(ctx context.Context
 		TenantID:      types.GetTenantID(ctx),
 		EnvironmentID: types.GetEnvironmentID(ctx),
 		UserID:        types.GetUserID(ctx),
-		Timestamp:     time.Now().UTC(),
+		Timestamp:     clock.Now(),
 		Payload:       json.RawMessage(webhookPayload),
 		EntityType:    types.SystemEntityTypeSubscription,
 		EntityID:      subscriptionID,

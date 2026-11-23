@@ -3,12 +3,16 @@ package ent
 import (
 	"context"
 	"errors"
-	"time"
+
+	"github.com/flexprice/flexprice/internal/clock"
+
+	"github.com/lib/pq"
 
 	"github.com/flexprice/flexprice/ent"
 	"github.com/flexprice/flexprice/ent/customer"
 	"github.com/flexprice/flexprice/ent/predicate"
 	"github.com/flexprice/flexprice/ent/schema"
+	"github.com/flexprice/flexprice/internal/activity"
 	"github.com/flexprice/flexprice/internal/cache"
 	domainCustomer "github.com/flexprice/flexprice/internal/domain/customer"
 	"github.com/flexprice/flexprice/internal/dsl"
@@ -16,7 +20,6 @@ import (
 	"github.com/flexprice/flexprice/internal/logger"
 	"github.com/flexprice/flexprice/internal/postgres"
 	"github.com/flexprice/flexprice/internal/types"
-	"github.com/lib/pq"
 )
 
 type customerRepository struct {
@@ -56,13 +59,16 @@ func (r *customerRepository) Create(ctx context.Context, c *domainCustomer.Custo
 		c.EnvironmentID = types.GetEnvironmentID(ctx)
 	}
 
-	customer, err := client.Customer.Create().
+	create := client.Customer.Create().
 		SetID(c.ID).
 		SetTenantID(c.TenantID).
 		SetExternalID(c.ExternalID).
 		SetName(c.Name).
 		SetEmail(c.Email).
 		SetNillableContact(c.Contact).
+		SetNillableBillingCurrency(c.BillingCurrency).
+		SetNillableBillingEntityID(c.BillingEntityID).
+		SetContactPersons(c.ToEntContactPersons()).
 		SetAddressLine1(c.AddressLine1).
 		SetAddressLine2(c.AddressLine2).
 		SetAddressCity(c.AddressCity).
@@ -77,8 +83,12 @@ func (r *customerRepository) Create(ctx context.Context, c *domainCustomer.Custo
 		SetUpdatedAt(c.UpdatedAt).
 		SetCreatedBy(c.CreatedBy).
 		SetUpdatedBy(c.UpdatedBy).
-		SetEnvironmentID(c.EnvironmentID).
-		Save(ctx)
+		SetEnvironmentID(c.EnvironmentID)
+	// SetSettings(nil) would store JSON null, so leave the column NULL when there are no overrides.
+	if c.Settings != nil {
+		create.SetSettings(c.Settings)
+	}
+	customer, err := create.Save(ctx)
 
 	if err != nil {
 		SetSpanError(span, err)
@@ -329,7 +339,7 @@ func (r *customerRepository) Update(ctx context.Context, c *domainCustomer.Custo
 	})
 	defer FinishSpan(span)
 
-	_, err := client.Customer.Update().
+	update := client.Customer.Update().
 		Where(
 			customer.ID(c.ID),
 			customer.TenantID(c.TenantID),
@@ -339,6 +349,7 @@ func (r *customerRepository) Update(ctx context.Context, c *domainCustomer.Custo
 		SetName(c.Name).
 		SetEmail(c.Email).
 		SetNillableContact(c.Contact).
+		SetContactPersons(c.ToEntContactPersons()).
 		SetAddressLine1(c.AddressLine1).
 		SetAddressLine2(c.AddressLine2).
 		SetAddressCity(c.AddressCity).
@@ -348,9 +359,23 @@ func (r *customerRepository) Update(ctx context.Context, c *domainCustomer.Custo
 		SetTimezone(c.Timezone).
 		SetTaxTreatment(c.TaxTreatment).
 		SetMetadata(c.Metadata).
-		SetUpdatedAt(time.Now().UTC()).
-		SetUpdatedBy(types.GetUserID(ctx)).
-		Save(ctx)
+		SetUpdatedAt(clock.Now()).
+		SetUpdatedBy(types.GetUserID(ctx))
+
+	// SetNillable is a no-op on nil, so it cannot clear a column. Callers load the customer before
+	// mutating, so a nil billing currency here means "clear it" — issue an explicit clear.
+	if c.BillingCurrency != nil {
+		update.SetBillingCurrency(*c.BillingCurrency)
+	} else {
+		update.ClearBillingCurrency()
+	}
+	if c.Settings != nil {
+		update.SetSettings(c.Settings)
+	} else {
+		update.ClearSettings()
+	}
+
+	_, err := update.SaveReturning(ctx)
 
 	if err != nil {
 		SetSpanError(span, err)
@@ -397,6 +422,7 @@ func (r *customerRepository) Delete(ctx context.Context, domainCustomer *domainC
 	defer FinishSpan(span)
 
 	client := r.client.Writer(ctx)
+	ctx = activity.WithAction(ctx, domainCustomer.ID, activity.CustomerArchived)
 	_, err := client.Customer.Update().
 		Where(
 			customer.ID(domainCustomer.ID),
@@ -404,9 +430,9 @@ func (r *customerRepository) Delete(ctx context.Context, domainCustomer *domainC
 			customer.EnvironmentID(types.GetEnvironmentID(ctx)),
 		).
 		SetStatus(string(types.StatusArchived)).
-		SetUpdatedAt(time.Now().UTC()).
+		SetUpdatedAt(clock.Now()).
 		SetUpdatedBy(types.GetUserID(ctx)).
-		Save(ctx)
+		SaveReturning(ctx)
 
 	if err != nil {
 		SetSpanError(span, err)
@@ -501,6 +527,10 @@ func (o CustomerQueryOptions) applyEntityQueryOptions(_ context.Context, f *type
 		return query, nil
 	}
 
+	if f.BillingEntityID != "" {
+		query = query.Where(customer.BillingEntityID(f.BillingEntityID))
+	}
+
 	if f.ExternalID != "" {
 		query = query.Where(customer.ExternalID(f.ExternalID))
 	}
@@ -590,4 +620,69 @@ func (r *customerRepository) DeleteCache(ctx context.Context, customer *domainCu
 
 	cacheKey := cache.GenerateKey(ctx, cache.PrefixCustomer, customer.ID)
 	r.redisCache.Delete(ctx, cacheKey)
+}
+
+func (r *customerRepository) AssignDefaultBillingEntities(ctx context.Context, limit int) (int, error) {
+	tenantID := types.GetTenantID(ctx)
+	environmentID := types.GetEnvironmentID(ctx)
+	span := StartRepositorySpan(ctx, "customer", "assign_default_billing_entities", map[string]interface{}{
+		"tenant_id":      tenantID,
+		"environment_id": environmentID,
+		"limit":          limit,
+	})
+	defer FinishSpan(span)
+
+	var batchLimit any
+	if limit > 0 {
+		batchLimit = limit
+	}
+
+	query := `
+		WITH batch AS (
+			SELECT c.id, be.id AS billing_entity_id
+			FROM customers c
+			JOIN billing_entities be
+				ON be.tenant_id = c.tenant_id
+				AND be.environment_id = c.environment_id
+				AND be.is_default
+				AND be.status = 'published'
+			WHERE c.tenant_id = $1 AND c.environment_id = $2 AND c.billing_entity_id IS NULL
+			LIMIT $3
+		)
+		UPDATE customers c
+		SET billing_entity_id = batch.billing_entity_id
+		FROM batch
+		WHERE c.id = batch.id AND c.billing_entity_id IS NULL
+		RETURNING c.id`
+
+	rows, err := r.client.Writer(ctx).QueryContext(ctx, query, tenantID, environmentID, batchLimit)
+	if err != nil {
+		SetSpanError(span, err)
+		return 0, ierr.WithError(err).
+			WithHint("Failed to assign customers to their default billing entity").
+			Mark(ierr.ErrDatabase)
+	}
+	defer rows.Close()
+
+	count := 0
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			SetSpanError(span, err)
+			return count, ierr.WithError(err).
+				WithHint("Failed to read assigned customers").
+				Mark(ierr.ErrDatabase)
+		}
+		r.DeleteCache(ctx, &domainCustomer.Customer{ID: id})
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		SetSpanError(span, err)
+		return count, ierr.WithError(err).
+			WithHint("Failed to read assigned customers").
+			Mark(ierr.ErrDatabase)
+	}
+
+	SetSpanSuccess(span)
+	return count, nil
 }

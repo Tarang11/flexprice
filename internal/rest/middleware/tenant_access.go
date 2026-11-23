@@ -4,15 +4,15 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/flexprice/flexprice/internal/logger"
 	"github.com/flexprice/flexprice/internal/ee/service"
+	"github.com/flexprice/flexprice/internal/logger"
 	"github.com/flexprice/flexprice/internal/types"
 	"github.com/gin-gonic/gin"
 )
 
 // TenantStatusMiddleware loads the tenant's InternalStatus on every authenticated
 // request and stamps it onto the context. Write-access enforcement is handled by
-// RequirePermission("entity", "write") on individual routes.
+// RequirePermission or BlockWhenSuspended on individual routes.
 func TenantStatusMiddleware(tenantService service.TenantService, logger *logger.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		tenantID := types.GetTenantID(c.Request.Context())

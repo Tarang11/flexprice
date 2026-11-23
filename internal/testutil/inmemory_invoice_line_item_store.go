@@ -9,6 +9,7 @@ import (
 	"github.com/flexprice/flexprice/internal/domain/invoice"
 	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/types"
+	"github.com/samber/lo"
 	"github.com/shopspring/decimal"
 )
 
@@ -128,6 +129,12 @@ func (s *InMemoryInvoiceLineItemStore) List(ctx context.Context, filter *types.I
 				continue
 			}
 		}
+		if filter != nil && len(filter.EntityIDs) > 0 && !lo.Contains(filter.EntityIDs, lo.FromPtr(item.EntityID)) {
+			continue
+		}
+		if filter != nil && filter.EntityType != nil && lo.FromPtr(item.EntityType) != *filter.EntityType {
+			continue
+		}
 		result = append(result, item)
 	}
 	return result, nil
@@ -172,7 +179,7 @@ func (s *InMemoryInvoiceLineItemStore) GetBilledAmountsBySubscriptionLineItem(
 			continue
 		}
 		if item.Amount.IsPositive() {
-			charged[id] = charged[id].Add(item.Amount)
+			charged[id] = charged[id].Add(item.Amount.Sub(item.LineItemDiscount).Sub(item.InvoiceLevelDiscount))
 		} else if item.Amount.IsNegative() {
 			credited[id] = credited[id].Add(item.Amount.Neg())
 		}

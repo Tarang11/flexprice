@@ -28,10 +28,11 @@ func IsIdempotencyKeyConflict(err error) bool {
 // ScopedPayment identifies a payment along with its tenant/environment so a
 // cron running outside any tenant scope can re-establish context per payment.
 type ScopedPayment struct {
-	PaymentID        string
-	TenantID         string
-	EnvironmentID    string
-	GatewayPaymentID string
+	PaymentID         string
+	TenantID          string
+	EnvironmentID     string
+	GatewayPaymentID  string
+	PaymentMethodType types.PaymentMethodType
 }
 
 // Repository defines the interface for payment persistence
@@ -39,6 +40,8 @@ type Repository interface {
 	// Payment operations
 	Create(ctx context.Context, payment *Payment) error
 	Get(ctx context.Context, id string) (*Payment, error)
+	// GetLinkedCustomerID returns the customer the payment is linked to, in any status; "" when it has none.
+	GetLinkedCustomerID(ctx context.Context, id string) (string, error)
 	Update(ctx context.Context, payment *Payment) error
 	// UpdateWithExpectedStatus writes the payment only while its stored status
 	// still equals expectedStatus, so a lifecycle check made against a value

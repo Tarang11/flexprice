@@ -39,6 +39,13 @@ func AllTemporalScheduleConfigs() []types.ScheduleConfig {
 			TaskQueue: types.TemporalTaskQueueCron,
 		},
 		{
+			ID:        types.ScheduleIDSubscriptionOverdueInvoices,
+			Interval:  15 * time.Minute,
+			Workflow:  cronWorkflows.SubscriptionOverdueInvoicesWorkflow,
+			Input:     models.SubscriptionOverdueInvoicesWorkflowInput{},
+			TaskQueue: types.TemporalTaskQueueCron,
+		},
+		{
 			ID:        types.ScheduleIDWalletCreditExpiry,
 			Interval:  15 * time.Minute,
 			Workflow:  cronWorkflows.WalletCreditExpiryWorkflow,
@@ -95,6 +102,13 @@ func AllTemporalScheduleConfigs() []types.ScheduleConfig {
 			TaskQueue: types.TemporalTaskQueueCron,
 		},
 		{
+			ID:        types.ScheduleIDRazorpayPaymentStatusSync,
+			Interval:  time.Hour,
+			Workflow:  cronWorkflows.RazorpayPaymentStatusSyncWorkflow,
+			Input:     struct{}{},
+			TaskQueue: types.TemporalTaskQueueCron,
+		},
+		{
 			ID:        types.ScheduleIDCheckoutSessionExpiry,
 			Interval:  30 * time.Minute,
 			Workflow:  cronWorkflows.CheckoutSessionExpiryWorkflow,
@@ -131,6 +145,50 @@ func AllTemporalScheduleConfigs() []types.ScheduleConfig {
 			Workflow:  invoiceWorkflows.ScheduleDraftFinalizationWorkflow,
 			Input:     invoiceModels.ScheduleDraftFinalizationWorkflowInput{BatchSize: types.DEFAULT_BATCH_SIZE},
 			TaskQueue: types.TemporalTaskQueueInvoice,
+		},
+		{
+			// Always declared; analytics.revenue_rollup.enabled acts as a kill
+			// switch inside RollupDirtyActivity, and tenants opt in via settings.
+			ID:        types.ScheduleIDRevenueRollup,
+			Interval:  24 * time.Hour,
+			Offset:    3 * time.Hour, // daily at 03:00 UTC by default
+			Workflow:  cronWorkflows.RevenueRollupWorkflow,
+			Input:     models.RevenueRollupInput{Interval: 24 * time.Hour},
+			TaskQueue: types.TemporalTaskQueueCron,
+		},
+		{
+			// Always declared; a no-op unless an environment enables revenue recognition.
+			ID:        types.ScheduleIDRevenueRecognition,
+			Interval:  24 * time.Hour,
+			Offset:    4 * time.Hour, // daily at 04:00 UTC, after the revenue rollup's FINAL facts
+			Workflow:  cronWorkflows.RevenueRecognitionWorkflow,
+			Input:     models.RevenueRecognitionInput{},
+			TaskQueue: types.TemporalTaskQueueCron,
+		},
+		{
+			// Always declared; RunHourly is a no-op unless self-billing is enabled.
+			ID:        types.ScheduleIDSelfBillingHourly,
+			Interval:  1 * time.Hour,
+			Offset:    20 * time.Minute, // fires at :20 so the previous hour has settled (selfbilling waits 15 minutes)
+			Workflow:  cronWorkflows.SelfBillingHourlyWorkflow,
+			Input:     models.SelfBillingHourlyWorkflowInput{},
+			TaskQueue: types.TemporalTaskQueueCron,
+		},
+		{
+			// Always declared; BillDueInstalments only visits environments holding a due instalment.
+			ID:        types.ScheduleIDBillingInstalmentsDue,
+			Interval:  15 * time.Minute,
+			Workflow:  cronWorkflows.BillingInstalmentsDueWorkflow,
+			Input:     models.BillingInstalmentsDueWorkflowInput{},
+			TaskQueue: types.TemporalTaskQueueCron,
+		},
+		{
+			// Always declared; a no-op unless customer emails are on (email.enabled and email.provider).
+			ID:        types.ScheduleIDEmailDispatch,
+			Interval:  1 * time.Minute,
+			Workflow:  cronWorkflows.EmailDispatchWorkflow,
+			Input:     models.EmailDispatchWorkflowInput{},
+			TaskQueue: types.TemporalTaskQueueCron,
 		},
 	}
 }

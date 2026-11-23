@@ -6,9 +6,9 @@ import (
 
 	"github.com/flexprice/flexprice/internal/api/dto"
 	"github.com/flexprice/flexprice/internal/config"
+	"github.com/flexprice/flexprice/internal/ee/service"
 	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/logger"
-	"github.com/flexprice/flexprice/internal/ee/service"
 	"github.com/gin-gonic/gin"
 )
 
@@ -75,4 +75,41 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, authResponse)
+}
+
+// CheckPasswordLink tells the set-password page what a one-time link is for.
+func (h *AuthHandler) CheckPasswordLink(c *gin.Context) {
+	var req dto.CheckPasswordLinkRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.Error(ierr.WithError(err).
+			WithHint("Please check the request payload").
+			Mark(ierr.ErrValidation))
+		return
+	}
+
+	details, err := h.authService.CheckPasswordLink(c.Request.Context(), &req)
+	if err != nil {
+		c.Error(err)
+		return
+	}
+
+	c.JSON(http.StatusOK, details)
+}
+
+// SetPassword sets a password through a one-time link.
+func (h *AuthHandler) SetPassword(c *gin.Context) {
+	var req dto.SetPasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.Error(ierr.WithError(err).
+			WithHint("Please check the request payload").
+			Mark(ierr.ErrValidation))
+		return
+	}
+
+	if err := h.authService.SetPassword(c.Request.Context(), &req); err != nil {
+		c.Error(err)
+		return
+	}
+
+	c.Status(http.StatusNoContent)
 }

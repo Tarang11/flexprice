@@ -86,6 +86,9 @@ func (s *WalletServiceSuite) buildServiceParams() ServiceParams {
 		RedisCache:                   s.GetRedisCache(),
 		WalletRepo:                   stores.WalletRepo,
 		SubRepo:                      stores.SubscriptionRepo,
+		CommitmentRepo:               stores.CommitmentRepo,
+		BillingTermRepo:              stores.BillingTermRepo,
+		BillingInstalmentRepo:        stores.BillingInstalmentRepo,
 		SubscriptionLineItemRepo:     stores.SubscriptionLineItemRepo,
 		PlanRepo:                     stores.PlanRepo,
 		PriceRepo:                    stores.PriceRepo,
@@ -93,7 +96,10 @@ func (s *WalletServiceSuite) buildServiceParams() ServiceParams {
 		MeterUsageRepo:               stores.MeterUsageRepo,
 		MeterRepo:                    stores.MeterRepo,
 		CustomerRepo:                 stores.CustomerRepo,
+		TenantRepo:                   stores.TenantRepo,
+		EnvironmentRepo:              stores.EnvironmentRepo,
 		InvoiceRepo:                  stores.InvoiceRepo,
+		HostedInvoiceTokenRepo:       stores.HostedInvoiceTokenRepo,
 		InvoiceLineItemRepo:          stores.InvoiceLineItemRepo,
 		EntitlementRepo:              stores.EntitlementRepo,
 		EntitlementGrantRepo:         stores.EntitlementGrantRepo,
@@ -115,6 +121,7 @@ func (s *WalletServiceSuite) buildServiceParams() ServiceParams {
 		IntegrationFactory:           s.GetIntegrationFactory(),
 		ConnectionRepo:               stores.ConnectionRepo,
 		EntityIntegrationMappingRepo: stores.EntityIntegrationMappingRepo,
+		FXRateRepo:                   stores.FXRateRepo,
 	}
 }
 
@@ -127,6 +134,9 @@ func (s *WalletServiceSuite) setupService() {
 		Config:                   s.GetConfig(),
 		DB:                       s.GetDB(),
 		SubRepo:                  stores.SubscriptionRepo,
+		CommitmentRepo:           stores.CommitmentRepo,
+		BillingTermRepo:          stores.BillingTermRepo,
+		BillingInstalmentRepo:    stores.BillingInstalmentRepo,
 		SubscriptionLineItemRepo: stores.SubscriptionLineItemRepo,
 		PlanRepo:                 stores.PlanRepo,
 		PriceRepo:                stores.PriceRepo,
@@ -135,6 +145,7 @@ func (s *WalletServiceSuite) setupService() {
 		MeterRepo:                stores.MeterRepo,
 		CustomerRepo:             stores.CustomerRepo,
 		InvoiceRepo:              stores.InvoiceRepo,
+		HostedInvoiceTokenRepo:   stores.HostedInvoiceTokenRepo,
 		InvoiceLineItemRepo:      stores.InvoiceLineItemRepo,
 		EntitlementRepo:          stores.EntitlementRepo,
 		EntitlementGrantRepo:     stores.EntitlementGrantRepo,
@@ -604,6 +615,13 @@ func (s *WalletServiceSuite) setupWallet() {
 }
 
 func (s *WalletServiceSuite) TestCreateWallet() {
+	s.NoError(s.GetStores().CustomerRepo.Create(s.GetContext(), &customer.Customer{
+		ID:         "customer-2",
+		ExternalID: "ext-customer-2",
+		Name:       "Customer Two",
+		Email:      "c2@test.com",
+		BaseModel:  types.GetDefaultBaseModel(s.GetContext()),
+	}))
 	// Test successful wallet creation with CustomerID
 	req := &dto.CreateWalletRequest{
 		CustomerID: "customer-2",
@@ -741,6 +759,308 @@ func (s *WalletServiceSuite) TestTopUpWallet() {
 	s.NotNil(foundTx, "Transaction with matching idempotency key not found")
 	s.NotNil(foundTx.Priority, "Transaction priority should not be nil")
 	s.Equal(2, *foundTx.Priority, "Transaction priority mismatch")
+}
+
+func (s *WalletServiceSuite) freshWallet() {
+	s.setupWallet()
+	s.resetWalletBalance()
+}
+
+func (s *WalletServiceSuite) assertEffectiveGrant(tx *wallet.Transaction, effective time.Time) {
+	effective = effective.UTC()
+	s.True(effective.Equal(tx.CreatedAt), "created_at")
+	s.True(effective.Equal(tx.UpdatedAt), "updated_at")
+	got, err := time.Parse(time.RFC3339Nano, tx.Metadata["requested_effective_date"])
+	s.NoError(err)
+	s.True(effective.Equal(got), "requested_effective_date")
+	requestedAt, err := time.Parse(time.RFC3339Nano, tx.Metadata["requested_at"])
+	s.NoError(err)
+	s.WithinDuration(time.Now().UTC(), requestedAt, 5*time.Second)
+}
+
+func (s *WalletServiceSuite) TestTopUpWallet_EffectiveDate_OmittedUsesNow() {
+	s.freshWallet()
+	before := time.Now().UTC()
+	resp, err := s.service.TopUpWallet(s.GetContext(), s.testData.wallet.ID, &dto.TopUpWalletRequest{
+		CreditsToAdd:      decimal.NewFromInt(10),
+		TransactionReason: types.TransactionReasonFreeCredit,
+		IdempotencyKey:    lo.ToPtr("effective_date_omitted"),
+		Metadata:          types.Metadata{"note": "kept"},
+	})
+	s.NoError(err)
+	tx := resp.WalletTransaction.Transaction
+	s.False(tx.CreatedAt.Before(before))
+	s.True(tx.CreatedAt.Equal(tx.UpdatedAt))
+	s.Empty(tx.Metadata["requested_effective_date"])
+	s.Empty(tx.Metadata["requested_at"])
+	s.Equal("kept", tx.Metadata["note"])
+}
+
+func (s *WalletServiceSuite) TestTopUpWallet_EffectiveDate_StampsGrantAndKeepsRequestMetadata() {
+	s.freshWallet()
+	loc := time.FixedZone("IST", 5*3600+30*60)
+	effective := time.Date(2026, 10, 1, 12, 0, 0, 0, loc)
+	resp, err := s.service.TopUpWallet(s.GetContext(), s.testData.wallet.ID, &dto.TopUpWalletRequest{
+		CreditsToAdd:      decimal.NewFromInt(20),
+		TransactionReason: types.TransactionReasonFreeCredit,
+		IdempotencyKey:    lo.ToPtr("effective_date_stamp"),
+		EffectiveDate:     &effective,
+		Metadata:          types.Metadata{"note": "kept"},
+	})
+	s.NoError(err)
+	s.assertEffectiveGrant(resp.WalletTransaction.Transaction, effective)
+	s.Equal("kept", resp.WalletTransaction.Metadata["note"])
+}
+
+func (s *WalletServiceSuite) TestTopUpWallet_EffectiveDate_DebitConsumesBackdatedGrant() {
+	s.freshWallet()
+	effective := time.Date(2026, 10, 1, 6, 29, 46, 0, time.UTC)
+	backdated, err := s.service.TopUpWallet(s.GetContext(), s.testData.wallet.ID, &dto.TopUpWalletRequest{
+		CreditsToAdd:      decimal.NewFromInt(20),
+		TransactionReason: types.TransactionReasonFreeCredit,
+		IdempotencyKey:    lo.ToPtr("effective_date_backdated"),
+		EffectiveDate:     &effective,
+	})
+	s.NoError(err)
+	_, err = s.service.TopUpWallet(s.GetContext(), s.testData.wallet.ID, &dto.TopUpWalletRequest{
+		CreditsToAdd:      decimal.NewFromInt(10),
+		TransactionReason: types.TransactionReasonFreeCredit,
+		IdempotencyKey:    lo.ToPtr("effective_date_later"),
+	})
+	s.NoError(err)
+
+	s.NoError(s.service.DebitWallet(s.GetContext(), &wallet.WalletOperation{
+		WalletID:          s.testData.wallet.ID,
+		Type:              types.TransactionTypeDebit,
+		CreditAmount:      decimal.NewFromInt(5),
+		TransactionReason: types.TransactionReasonManualBalanceDebit,
+		IdempotencyKey:    "effective_date_debit",
+	}))
+
+	grant, err := s.GetStores().WalletRepo.GetTransactionByID(s.GetContext(), backdated.WalletTransaction.ID)
+	s.NoError(err)
+	s.True(decimal.NewFromInt(15).Equal(grant.CreditsAvailable))
+	s.True(effective.Equal(grant.CreatedAt))
+	s.True(grant.UpdatedAt.After(effective))
+	s.Equal(effective.Format(time.RFC3339Nano), grant.Metadata["requested_effective_date"])
+
+	later, err := s.GetStores().WalletRepo.GetTransactionByIdempotencyKey(s.GetContext(), "effective_date_later")
+	s.NoError(err)
+	s.True(decimal.NewFromInt(10).Equal(later.CreditsAvailable))
+
+	debit, err := s.GetStores().WalletRepo.GetTransactionByIdempotencyKey(s.GetContext(), "effective_date_debit")
+	s.NoError(err)
+	s.True(debit.CreatedAt.After(effective))
+	s.Empty(debit.Metadata["requested_effective_date"])
+	s.Empty(debit.Metadata["requested_at"])
+}
+
+func (s *WalletServiceSuite) TestTopUpWallet_EffectiveDate_RejectedWhenInTheFuture() {
+	s.freshWallet()
+	effective := time.Now().UTC().Add(24 * time.Hour)
+	_, err := s.service.TopUpWallet(s.GetContext(), s.testData.wallet.ID, &dto.TopUpWalletRequest{
+		CreditsToAdd:      decimal.NewFromInt(20),
+		TransactionReason: types.TransactionReasonFreeCredit,
+		IdempotencyKey:    lo.ToPtr("effective_date_future"),
+		EffectiveDate:     &effective,
+	})
+	s.Error(err)
+	s.Contains(err.Error(), "effective_date cannot be in the future")
+}
+
+func (s *WalletServiceSuite) TestTopUpWallet_EffectiveDate_RejectedWhenNotBeforeExpiry() {
+	s.freshWallet()
+	expiryDay := time.Now().UTC().Add(-48 * time.Hour)
+	y, m, d := expiryDay.Date()
+	expiryInt := y*10000 + int(m)*100 + d
+	expiry := time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+	for _, effective := range []time.Time{expiry, expiry.Add(time.Hour)} {
+		_, err := s.service.TopUpWallet(s.GetContext(), s.testData.wallet.ID, &dto.TopUpWalletRequest{
+			CreditsToAdd:      decimal.NewFromInt(1),
+			TransactionReason: types.TransactionReasonFreeCredit,
+			IdempotencyKey:    lo.ToPtr(effective.Format(time.RFC3339Nano)),
+			EffectiveDate:     &effective,
+			ExpiryDate:        &expiryInt,
+		})
+		s.Error(err)
+		s.Contains(err.Error(), "effective_date must be before the credit expiry")
+	}
+}
+
+func (s *WalletServiceSuite) TestTopUpWallet_EffectiveDate_RejectedWhenNotBeforeBonusExpiry() {
+	s.freshWallet()
+	bonusExpiry := time.Now().UTC().Add(-48 * time.Hour)
+	effective := bonusExpiry.Add(time.Hour)
+	_, err := s.service.TopUpWallet(s.GetContext(), s.testData.wallet.ID, &dto.TopUpWalletRequest{
+		CreditsToAdd:              decimal.NewFromInt(10),
+		BonusCreditsToAdd:         lo.ToPtr(decimal.NewFromInt(5)),
+		TransactionReason:         types.TransactionReasonPurchasedCreditDirect,
+		IdempotencyKey:            lo.ToPtr("effective_date_bonus_expiry"),
+		EffectiveDate:             &effective,
+		BonusCreditsExpiryDateUTC: &bonusExpiry,
+	})
+	s.Error(err)
+	s.Contains(err.Error(), "effective_date must be before the bonus credit expiry")
+}
+
+func (s *WalletServiceSuite) TestTopUpWallet_EffectiveDate_BonusGrantSharesDate() {
+	s.freshWallet()
+	effective := time.Date(2026, 10, 1, 6, 29, 46, 0, time.UTC)
+	bonusExpiry := time.Now().UTC().Add(48 * time.Hour)
+	resp, err := s.service.TopUpWallet(s.GetContext(), s.testData.wallet.ID, &dto.TopUpWalletRequest{
+		CreditsToAdd:              decimal.NewFromInt(20),
+		BonusCreditsToAdd:         lo.ToPtr(decimal.NewFromInt(5)),
+		TransactionReason:         types.TransactionReasonPurchasedCreditDirect,
+		IdempotencyKey:            lo.ToPtr("effective_date_bonus"),
+		EffectiveDate:             &effective,
+		BonusCreditsExpiryDateUTC: &bonusExpiry,
+		Metadata:                  types.Metadata{"note": "kept"},
+	})
+	s.NoError(err)
+	s.assertEffectiveGrant(resp.WalletTransaction.Transaction, effective)
+	s.Equal("kept", resp.WalletTransaction.Metadata["note"])
+
+	bonus := s.bonusTxByParent(resp.WalletTransaction.ID)
+	s.Require().NotNil(bonus)
+	s.assertEffectiveGrant(bonus, effective)
+	s.True(bonusExpiry.Equal(*bonus.ExpiryDate))
+	s.Equal("kept", bonus.Metadata["note"])
+
+	s.NoError(s.service.DebitWallet(s.GetContext(), &wallet.WalletOperation{
+		WalletID:          s.testData.wallet.ID,
+		Type:              types.TransactionTypeDebit,
+		CreditAmount:      decimal.NewFromInt(5),
+		TransactionReason: types.TransactionReasonInvoicePayment,
+		IdempotencyKey:    "effective_date_bonus_debit",
+	}))
+	purchase, err := s.GetStores().WalletRepo.GetTransactionByID(s.GetContext(), resp.WalletTransaction.ID)
+	s.NoError(err)
+	s.True(decimal.NewFromInt(20).Equal(purchase.CreditsAvailable))
+	bonus = s.bonusTxByParent(resp.WalletTransaction.ID)
+	s.True(decimal.Zero.Equal(bonus.CreditsAvailable))
+}
+
+func (s *WalletServiceSuite) TestTopUpWallet_EffectiveDate_InvoicePeriodUsesEffectiveDate() {
+	s.freshWallet()
+	periodEnd := time.Date(2026, 10, 15, 0, 0, 0, 0, time.UTC)
+	s.NoError(s.GetStores().InvoiceRepo.Create(s.GetContext(), &invoice.Invoice{
+		ID:            "inv_effective_period",
+		CustomerID:    s.testData.customer.ID,
+		Currency:      "usd",
+		InvoiceStatus: types.InvoiceStatusFinalized,
+		PaymentStatus: types.PaymentStatusPending,
+		PeriodEnd:     &periodEnd,
+		BaseModel:     types.GetDefaultBaseModel(s.GetContext()),
+	}))
+
+	beforePeriod := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	afterPeriod := time.Date(2026, 10, 19, 0, 0, 0, 0, time.UTC)
+	eligible, err := s.service.TopUpWallet(s.GetContext(), s.testData.wallet.ID, &dto.TopUpWalletRequest{
+		CreditsToAdd:      decimal.NewFromInt(20),
+		TransactionReason: types.TransactionReasonFreeCredit,
+		IdempotencyKey:    lo.ToPtr("effective_before_period"),
+		EffectiveDate:     &beforePeriod,
+	})
+	s.NoError(err)
+	_, err = s.service.TopUpWallet(s.GetContext(), s.testData.wallet.ID, &dto.TopUpWalletRequest{
+		CreditsToAdd:      decimal.NewFromInt(10),
+		TransactionReason: types.TransactionReasonFreeCredit,
+		IdempotencyKey:    lo.ToPtr("effective_after_period"),
+		EffectiveDate:     &afterPeriod,
+	})
+	s.NoError(err)
+
+	s.NoError(s.service.DebitWallet(s.GetContext(), &wallet.WalletOperation{
+		WalletID:          s.testData.wallet.ID,
+		Type:              types.TransactionTypeDebit,
+		CreditAmount:      decimal.NewFromInt(5),
+		TransactionReason: types.TransactionReasonInvoicePayment,
+		InvoiceID:         lo.ToPtr("inv_effective_period"),
+		IdempotencyKey:    "effective_period_debit",
+	}))
+
+	grant, err := s.GetStores().WalletRepo.GetTransactionByID(s.GetContext(), eligible.WalletTransaction.ID)
+	s.NoError(err)
+	s.True(decimal.NewFromInt(15).Equal(grant.CreditsAvailable))
+	later, err := s.GetStores().WalletRepo.GetTransactionByIdempotencyKey(s.GetContext(), "effective_after_period")
+	s.NoError(err)
+	s.True(decimal.NewFromInt(10).Equal(later.CreditsAvailable))
+}
+
+func (s *WalletServiceSuite) TestTopUpWallet_EffectiveDate_InvoicedPurchaseStaysPending() {
+	s.freshWallet()
+	effective := time.Date(2026, 10, 1, 6, 29, 46, 0, time.UTC)
+	bonusExpiry := time.Now().UTC().Add(48 * time.Hour)
+	resp, err := s.service.TopUpWallet(s.GetContext(), s.testData.wallet.ID, &dto.TopUpWalletRequest{
+		CreditsToAdd:              decimal.NewFromInt(20),
+		BonusCreditsToAdd:         lo.ToPtr(decimal.NewFromInt(5)),
+		TransactionReason:         types.TransactionReasonPurchasedCreditInvoiced,
+		IdempotencyKey:            lo.ToPtr("effective_date_invoiced"),
+		EffectiveDate:             &effective,
+		BonusCreditsExpiryDateUTC: &bonusExpiry,
+	})
+	s.NoError(err)
+	s.Equal(types.TransactionStatusPending, resp.WalletTransaction.TxStatus)
+	s.assertEffectiveGrant(resp.WalletTransaction.Transaction, effective)
+	bonus := s.bonusTxByParent(resp.WalletTransaction.ID)
+	s.Require().NotNil(bonus)
+	s.Equal(types.TransactionStatusPending, bonus.TxStatus)
+	s.assertEffectiveGrant(bonus, effective)
+
+	err = s.service.DebitWallet(s.GetContext(), &wallet.WalletOperation{
+		WalletID:          s.testData.wallet.ID,
+		Type:              types.TransactionTypeDebit,
+		CreditAmount:      decimal.NewFromInt(5),
+		TransactionReason: types.TransactionReasonInvoicePayment,
+		IdempotencyKey:    "effective_date_pending_debit",
+	})
+	s.Error(err)
+	s.Contains(err.Error(), "insufficient balance")
+}
+
+func (s *WalletServiceSuite) TestTopUpWallet_EffectiveDate_PurchasedDirectStampsGrant() {
+	s.freshWallet()
+	effective := time.Date(2026, 10, 1, 6, 29, 46, 0, time.UTC)
+	resp, err := s.service.TopUpWallet(s.GetContext(), s.testData.wallet.ID, &dto.TopUpWalletRequest{
+		CreditsToAdd:      decimal.NewFromInt(20),
+		TransactionReason: types.TransactionReasonPurchasedCreditDirect,
+		IdempotencyKey:    lo.ToPtr("effective_date_purchased_direct"),
+		EffectiveDate:     &effective,
+	})
+	s.NoError(err)
+	s.Equal(types.TransactionStatusCompleted, resp.WalletTransaction.TxStatus)
+	s.assertEffectiveGrant(resp.WalletTransaction.Transaction, effective)
+
+	s.NoError(s.service.DebitWallet(s.GetContext(), &wallet.WalletOperation{
+		WalletID:          s.testData.wallet.ID,
+		Type:              types.TransactionTypeDebit,
+		CreditAmount:      decimal.NewFromInt(5),
+		TransactionReason: types.TransactionReasonInvoicePayment,
+		IdempotencyKey:    "effective_date_purchased_direct_debit",
+	}))
+	grant, err := s.GetStores().WalletRepo.GetTransactionByID(s.GetContext(), resp.WalletTransaction.ID)
+	s.NoError(err)
+	s.True(decimal.NewFromInt(15).Equal(grant.CreditsAvailable))
+	s.True(effective.Equal(grant.CreatedAt))
+}
+
+func (s *WalletServiceSuite) TestTopUpWallet_EffectiveDate_DoesNotChangeDerivedIdempotencyKey() {
+	s.freshWallet()
+	first := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	second := time.Date(2026, 10, 2, 0, 0, 0, 0, time.UTC)
+	a, err := s.service.TopUpWallet(s.GetContext(), s.testData.wallet.ID, &dto.TopUpWalletRequest{
+		CreditsToAdd:      decimal.NewFromInt(1),
+		TransactionReason: types.TransactionReasonFreeCredit,
+		EffectiveDate:     &first,
+	})
+	s.NoError(err)
+	b, err := s.service.TopUpWallet(s.GetContext(), s.testData.wallet.ID, &dto.TopUpWalletRequest{
+		CreditsToAdd:      decimal.NewFromInt(1),
+		TransactionReason: types.TransactionReasonFreeCredit,
+		EffectiveDate:     &second,
+	})
+	s.NoError(err)
+	s.Equal(a.WalletTransaction.IdempotencyKey, b.WalletTransaction.IdempotencyKey)
 }
 
 func (s *WalletServiceSuite) TestTopUpWallet_ForceSyncInvoice_AttemptsMoyasarSyncAfterCommit() {
@@ -2433,6 +2753,9 @@ func (s *WalletAutoTopupInvoiceSuite) setupService() {
 		DB:                       s.GetDB(),
 		WalletRepo:               stores.WalletRepo,
 		SubRepo:                  stores.SubscriptionRepo,
+		CommitmentRepo:           stores.CommitmentRepo,
+		BillingTermRepo:          stores.BillingTermRepo,
+		BillingInstalmentRepo:    stores.BillingInstalmentRepo,
 		SubscriptionLineItemRepo: stores.SubscriptionLineItemRepo,
 		PlanRepo:                 stores.PlanRepo,
 		PriceRepo:                stores.PriceRepo,
@@ -2440,7 +2763,10 @@ func (s *WalletAutoTopupInvoiceSuite) setupService() {
 		MeterUsageRepo:           stores.MeterUsageRepo,
 		MeterRepo:                stores.MeterRepo,
 		CustomerRepo:             stores.CustomerRepo,
+		TenantRepo:               stores.TenantRepo,
+		EnvironmentRepo:          stores.EnvironmentRepo,
 		InvoiceRepo:              stores.InvoiceRepo,
+		HostedInvoiceTokenRepo:   stores.HostedInvoiceTokenRepo,
 		InvoiceLineItemRepo:      stores.InvoiceLineItemRepo,
 		EntitlementRepo:          stores.EntitlementRepo,
 		EntitlementGrantRepo:     stores.EntitlementGrantRepo,
@@ -2688,6 +3014,29 @@ func (s *WalletAutoTopupInvoiceSuite) TestTriggerAutoTopup_PendingWalletTxnBlock
 	s.Equal(0, s.countAutoTopupInvoices(), "pending wallet txn alone must block a new auto-topup invoice")
 }
 
+func (s *WalletAutoTopupInvoiceSuite) TestTriggerAutoTopup_ManualPendingTopupBlocks() {
+	ctx := s.GetContext()
+	balance := decimal.NewFromInt(3)
+
+	manual := &wallet.Transaction{
+		ID:                "txn_pending_manual_topup",
+		WalletID:          s.wallet.ID,
+		CustomerID:        s.customer.ID,
+		Type:              types.TransactionTypeCredit,
+		CreditAmount:      decimal.NewFromInt(10),
+		Amount:            decimal.NewFromInt(10),
+		TxStatus:          types.TransactionStatusPending,
+		TransactionReason: types.TransactionReasonPurchasedCreditInvoiced,
+		Currency:          "usd",
+		BaseModel:         types.GetDefaultBaseModel(ctx),
+	}
+	s.NoError(s.GetStores().WalletRepo.CreateTransaction(ctx, manual))
+
+	err := s.svc().triggerAutoTopup(ctx, s.wallet, balance, "")
+	s.NoError(err)
+	s.Equal(0, s.countAutoTopupInvoices(), "a manual top-up in flight must block auto top-up")
+}
+
 func (s *WalletAutoTopupInvoiceSuite) TestTriggerAutoTopup_CooldownBlocksAfterCompletedTxn() {
 	ctx := s.GetContext()
 	balance := decimal.NewFromInt(3)
@@ -2762,6 +3111,9 @@ func (s *WalletAutoTopupDirectSuite) SetupTest() {
 		DB:                       s.GetDB(),
 		WalletRepo:               stores.WalletRepo,
 		SubRepo:                  stores.SubscriptionRepo,
+		CommitmentRepo:           stores.CommitmentRepo,
+		BillingTermRepo:          stores.BillingTermRepo,
+		BillingInstalmentRepo:    stores.BillingInstalmentRepo,
 		SubscriptionLineItemRepo: stores.SubscriptionLineItemRepo,
 		PlanRepo:                 stores.PlanRepo,
 		PriceRepo:                stores.PriceRepo,
@@ -2769,7 +3121,10 @@ func (s *WalletAutoTopupDirectSuite) SetupTest() {
 		MeterUsageRepo:           stores.MeterUsageRepo,
 		MeterRepo:                stores.MeterRepo,
 		CustomerRepo:             stores.CustomerRepo,
+		TenantRepo:               stores.TenantRepo,
+		EnvironmentRepo:          stores.EnvironmentRepo,
 		InvoiceRepo:              stores.InvoiceRepo,
+		HostedInvoiceTokenRepo:   stores.HostedInvoiceTokenRepo,
 		InvoiceLineItemRepo:      stores.InvoiceLineItemRepo,
 		EntitlementRepo:          stores.EntitlementRepo,
 		FeatureRepo:              stores.FeatureRepo,
@@ -2962,6 +3317,9 @@ func (s *CheckWalletBalanceAlertSuite) setupService() {
 		DB:                       s.GetDB(),
 		WalletRepo:               stores.WalletRepo,
 		SubRepo:                  stores.SubscriptionRepo,
+		CommitmentRepo:           stores.CommitmentRepo,
+		BillingTermRepo:          stores.BillingTermRepo,
+		BillingInstalmentRepo:    stores.BillingInstalmentRepo,
 		SubscriptionLineItemRepo: stores.SubscriptionLineItemRepo,
 		PlanRepo:                 stores.PlanRepo,
 		PriceRepo:                stores.PriceRepo,
@@ -2969,7 +3327,10 @@ func (s *CheckWalletBalanceAlertSuite) setupService() {
 		MeterUsageRepo:           stores.MeterUsageRepo,
 		MeterRepo:                stores.MeterRepo,
 		CustomerRepo:             stores.CustomerRepo,
+		TenantRepo:               stores.TenantRepo,
+		EnvironmentRepo:          stores.EnvironmentRepo,
 		InvoiceRepo:              stores.InvoiceRepo,
+		HostedInvoiceTokenRepo:   stores.HostedInvoiceTokenRepo,
 		InvoiceLineItemRepo:      stores.InvoiceLineItemRepo,
 		EntitlementRepo:          stores.EntitlementRepo,
 		EntitlementGrantRepo:     stores.EntitlementGrantRepo,
@@ -3180,6 +3541,42 @@ func (s *CheckWalletBalanceAlertSuite) TestWalletAlerts_BalanceBelowCritical_InA
 	updated, err := s.GetStores().WalletRepo.GetWalletByID(s.GetContext(), w.ID)
 	s.NoError(err)
 	s.Equal(types.AlertStateInAlarm, updated.AlertState, "wallet alert state must be updated to in_alarm")
+}
+
+// ---------------------------------------------------------------------------
+// Test 5b – conversion_rate != 1: absolute thresholds are in wallet currency,
+//           so the credit balance must be converted to currency before compare.
+//           Here credits (4000) are far above the $50 threshold, but the
+//           currency balance ($40) is below it → in_alarm. Pre-fix this compared
+//           raw credits (4000 <= 50 == false) and never fired.
+// ---------------------------------------------------------------------------
+
+func (s *CheckWalletBalanceAlertSuite) TestWalletAlerts_AbsoluteThresholdUsesCurrency_InAlarm() {
+	ctx := s.GetContext()
+	w := &wallet.Wallet{
+		ID:                  "wallet_rate_alarm",
+		CustomerID:          s.customer.ID,
+		Currency:            "usd",
+		WalletType:          types.WalletTypePrePaid,
+		WalletStatus:        types.WalletStatusActive,
+		Balance:             decimal.NewFromInt(40),   // currency: $40
+		CreditBalance:       decimal.NewFromInt(4000), // credits: 4000 @ 0.01 = $40
+		ConversionRate:      decimal.NewFromFloat(0.01),
+		TopupConversionRate: decimal.NewFromFloat(0.01),
+		AlertSettings:       s.enabledAlertSettings(decimal.NewFromInt(50)), // below $50
+		Config:              *types.GetDefaultWalletConfig(),
+		BaseModel:           types.GetDefaultBaseModel(ctx),
+	}
+	s.NoError(s.GetStores().WalletRepo.CreateWallet(ctx, w))
+
+	s.NoError(s.service.CheckWalletBalanceAlert(ctx, s.makeEvent()))
+
+	logs, err := s.GetStores().AlertLogsRepo.ListByEntity(ctx, types.AlertEntityTypeWallet, w.ID, 10)
+	s.NoError(err)
+	s.Require().Len(logs, 1, "expected in_alarm: $40 currency balance is below the $50 threshold")
+	s.Equal(types.AlertStateInAlarm, logs[0].AlertStatus)
+	s.True(decimal.NewFromInt(40).Equal(logs[0].AlertInfo.ValueAtTime),
+		"value_at_time must be the currency balance, not the raw credit count")
 }
 
 // ---------------------------------------------------------------------------
@@ -4056,7 +4453,7 @@ func (s *WalletServiceSuite) TestCompletePurchasedCreditTransaction_WithLinkedBo
 	s.NoError(err)
 	s.True(decimal.NewFromInt(1000).Equal(balanceBefore.CreditBalance))
 
-	err = s.service.(*walletService).CompletePurchasedCreditTransactionWithRetry(s.GetContext(), resp.WalletTransaction.ID)
+	err = s.service.(*walletService).CompletePurchasedCreditTransactionWithRetry(s.GetContext(), resp.WalletTransaction.ID, lo.FromPtr(resp.InvoiceID))
 	s.NoError(err)
 
 	purchaseTx, err := s.GetStores().WalletRepo.GetTransactionByID(s.GetContext(), resp.WalletTransaction.ID)
@@ -4084,7 +4481,7 @@ func (s *WalletServiceSuite) TestCompletePurchasedCreditTransaction_NoLinkedBonu
 	resp, err := s.service.TopUpWallet(s.GetContext(), s.testData.wallet.ID, req)
 	s.NoError(err)
 
-	err = s.service.(*walletService).CompletePurchasedCreditTransactionWithRetry(s.GetContext(), resp.WalletTransaction.ID)
+	err = s.service.(*walletService).CompletePurchasedCreditTransactionWithRetry(s.GetContext(), resp.WalletTransaction.ID, lo.FromPtr(resp.InvoiceID))
 	s.NoError(err, "completion must succeed even when GetPendingTransactionByParent finds nothing")
 
 	purchaseTx, err := s.GetStores().WalletRepo.GetTransactionByID(s.GetContext(), resp.WalletTransaction.ID)
@@ -4104,14 +4501,14 @@ func (s *WalletServiceSuite) TestCompletePurchasedCreditTransaction_WithLinkedBo
 	resp, err := s.service.TopUpWallet(s.GetContext(), s.testData.wallet.ID, req)
 	s.NoError(err)
 
-	err = s.service.(*walletService).CompletePurchasedCreditTransactionWithRetry(s.GetContext(), resp.WalletTransaction.ID)
+	err = s.service.(*walletService).CompletePurchasedCreditTransactionWithRetry(s.GetContext(), resp.WalletTransaction.ID, lo.FromPtr(resp.InvoiceID))
 	s.NoError(err)
 
 	w1, err := s.GetStores().WalletRepo.GetWalletByID(s.GetContext(), s.testData.wallet.ID)
 	s.NoError(err)
 
 	// second call must be a no-op: the top-of-function pending-check short-circuits
-	err = s.service.(*walletService).CompletePurchasedCreditTransactionWithRetry(s.GetContext(), resp.WalletTransaction.ID)
+	err = s.service.(*walletService).CompletePurchasedCreditTransactionWithRetry(s.GetContext(), resp.WalletTransaction.ID, lo.FromPtr(resp.InvoiceID))
 	s.NoError(err)
 
 	w2, err := s.GetStores().WalletRepo.GetWalletByID(s.GetContext(), s.testData.wallet.ID)
@@ -4167,7 +4564,7 @@ func (s *WalletServiceSuite) TestCompletePurchasedCreditTransaction_WithLinkedBo
 	// Call the non-retrying entrypoint directly: CompletePurchasedCreditTransactionWithRetry
 	// would retry and, since the mock has no rollback, find the purchase tx already marked
 	// completed from the first (failed) attempt and short-circuit as a false success.
-	err = failingService.completePurchasedCreditTransaction(s.GetContext(), resp.WalletTransaction.ID)
+	err = failingService.completePurchasedCreditTransaction(s.GetContext(), resp.WalletTransaction.ID, lo.FromPtr(resp.InvoiceID))
 	s.Error(err, "the injected failure on the bonus half must surface as an error")
 }
 
@@ -4208,8 +4605,16 @@ func (s *WalletServiceSuite) TestCreateWallet_CustomCurrencyEnforcement() {
 
 	for _, tt := range tests {
 		s.Run(tt.name, func() {
+			custID := s.GetUUID()
+			s.NoError(s.GetStores().CustomerRepo.Create(s.GetContext(), &customer.Customer{
+				ID:         custID,
+				ExternalID: "ext-" + custID,
+				Name:       "Currency Customer",
+				Email:      "currency@test.com",
+				BaseModel:  types.GetDefaultBaseModel(s.GetContext()),
+			}))
 			resp, err := s.service.CreateWallet(s.GetContext(), &dto.CreateWalletRequest{
-				CustomerID: s.GetUUID(),
+				CustomerID: custID,
 				Currency:   tt.currency,
 			})
 			if tt.wantErr {
@@ -4218,6 +4623,160 @@ func (s *WalletServiceSuite) TestCreateWallet_CustomCurrencyEnforcement() {
 			}
 			s.NoError(err)
 			s.Equal(tt.currency, resp.Currency)
+		})
+	}
+}
+
+// setTenantWalletAlertConfig stores the tenant's wallet_balance_alert_config.
+func (s *CheckWalletBalanceAlertSuite) setTenantWalletAlertConfig(cfg types.AlertSettings) {
+	value, err := utils.ToMap(cfg)
+	s.NoError(err)
+	s.NoError(s.GetStores().SettingsRepo.Create(s.GetContext(), &settings.Setting{
+		ID:            types.GenerateUUIDWithPrefix(types.UUID_PREFIX_SETTING),
+		Key:           types.SettingKeyWalletBalanceAlertConfig,
+		Value:         value,
+		EnvironmentID: types.GetEnvironmentID(s.GetContext()),
+		BaseModel:     types.GetDefaultBaseModel(s.GetContext()),
+	}))
+}
+
+// tieredBelow is warning at 100 and critical at 0, both "below", switched on.
+func tieredBelow() types.AlertSettings {
+	return types.AlertSettings{
+		AlertEnabled: lo.ToPtr(true),
+		Warning:      &types.AlertThreshold{Threshold: decimal.NewFromInt(100), Condition: types.AlertConditionBelow},
+		Critical:     &types.AlertThreshold{Threshold: decimal.Zero, Condition: types.AlertConditionBelow},
+	}
+}
+
+func (s *CheckWalletBalanceAlertSuite) TestBalanceAlertStatus_TenantThresholds() {
+	s.setTenantWalletAlertConfig(tieredBelow())
+	w := s.makeWallet("wallet_status_tenant", decimal.NewFromInt(500), nil, nil)
+
+	tests := []struct {
+		name    string
+		balance decimal.Decimal
+		want    types.AlertState
+	}{
+		{name: "above the warning threshold is ok", balance: decimal.NewFromInt(101), want: types.AlertStateOk},
+		{name: "exactly the warning threshold is a warning", balance: decimal.NewFromInt(100), want: types.AlertStateWarning},
+		{name: "between the thresholds is a warning", balance: decimal.NewFromInt(40), want: types.AlertStateWarning},
+		{name: "zero is in alarm", balance: decimal.Zero, want: types.AlertStateInAlarm},
+		{name: "a negative balance is in alarm", balance: decimal.NewFromInt(-5), want: types.AlertStateInAlarm},
+	}
+	for _, tt := range tests {
+		s.Run(tt.name, func() {
+			got, err := s.service.BalanceAlertStatus(s.GetContext(), w, tt.balance, tt.balance)
+			s.NoError(err)
+			s.Require().NotNil(got)
+			s.Equal(tt.want, *got)
+		})
+	}
+}
+
+func (s *CheckWalletBalanceAlertSuite) TestBalanceAlertStatus_TenantAlertsOff_Nil() {
+	cfg := tieredBelow()
+	cfg.AlertEnabled = lo.ToPtr(false)
+	s.setTenantWalletAlertConfig(cfg)
+	// The wallet's own settings are on, but the tenant switch gates every wallet,
+	// as it does for the alert pipeline.
+	w := s.makeWallet("wallet_status_off", decimal.Zero, s.enabledAlertSettings(decimal.NewFromInt(10)), nil)
+
+	got, err := s.service.BalanceAlertStatus(s.GetContext(), w, decimal.Zero, decimal.Zero)
+	s.NoError(err)
+	s.Nil(got)
+}
+
+func (s *CheckWalletBalanceAlertSuite) TestBalanceAlertStatus_NeverConfigured_Nil() {
+	// The default config is off, with a critical threshold of "below 0" sitting there.
+	w := s.makeWallet("wallet_status_default", decimal.Zero, nil, nil)
+
+	got, err := s.service.BalanceAlertStatus(s.GetContext(), w, decimal.Zero, decimal.Zero)
+	s.NoError(err)
+	s.Nil(got)
+}
+
+func (s *CheckWalletBalanceAlertSuite) TestBalanceAlertStatus_WalletSettingsWin() {
+	s.setTenantWalletAlertConfig(tieredBelow())
+	// Critical at 50 on the wallet itself: 40 is in alarm here, a warning by the tenant's.
+	w := s.makeWallet("wallet_status_own", decimal.NewFromInt(40), s.enabledAlertSettings(decimal.NewFromInt(50)), nil)
+
+	got, err := s.service.BalanceAlertStatus(s.GetContext(), w, decimal.NewFromInt(40), decimal.NewFromInt(40))
+	s.NoError(err)
+	s.Require().NotNil(got)
+	s.Equal(types.AlertStateInAlarm, *got)
+}
+
+func (s *CheckWalletBalanceAlertSuite) TestBalanceAlertStatus_WalletAlertsOff_Nil() {
+	s.setTenantWalletAlertConfig(tieredBelow())
+	own := s.enabledAlertSettings(decimal.NewFromInt(50))
+	own.AlertEnabled = lo.ToPtr(false)
+	w := s.makeWallet("wallet_status_own_off", decimal.Zero, own, nil)
+
+	got, err := s.service.BalanceAlertStatus(s.GetContext(), w, decimal.Zero, decimal.Zero)
+	s.NoError(err)
+	s.Nil(got)
+}
+
+func (s *CheckWalletBalanceAlertSuite) TestBalanceAlertStatus_AbsoluteUsesCurrencyBalance() {
+	s.setTenantWalletAlertConfig(tieredBelow())
+	w := s.makeWallet("wallet_status_currency", decimal.NewFromInt(500), nil, nil)
+
+	// 1,000 credits worth 50 in currency: absolute thresholds are in currency.
+	got, err := s.service.BalanceAlertStatus(s.GetContext(), w, decimal.NewFromInt(1000), decimal.NewFromInt(50))
+	s.NoError(err)
+	s.Require().NotNil(got)
+	s.Equal(types.AlertStateWarning, *got)
+}
+
+func (s *CheckWalletBalanceAlertSuite) TestBalanceAlertStatus_PercentageOfPeriodCredits() {
+	cfg := *s.percentageAlertSettings()
+	s.setTenantWalletAlertConfig(cfg)
+	w := s.makeWallet("wallet_status_pct", decimal.NewFromInt(25), nil, nil)
+	s.makeCreditTransaction("wtxn_status_pct", w.ID, decimal.NewFromInt(100),
+		types.TransactionStatusCompleted, types.StatusPublished, time.Now().UTC().Add(-time.Hour))
+
+	// 25 credits against a 100 credit base is 25%, the warning threshold.
+	got, err := s.service.BalanceAlertStatus(s.GetContext(), w, decimal.NewFromInt(25), decimal.NewFromInt(25))
+	s.NoError(err)
+	s.Require().NotNil(got)
+	s.Equal(types.AlertStateWarning, *got)
+}
+
+func (s *CheckWalletBalanceAlertSuite) TestBalanceAlertStatus_AboveThresholds_Nil() {
+	s.setTenantWalletAlertConfig(types.AlertSettings{
+		AlertEnabled: lo.ToPtr(true),
+		Critical:     &types.AlertThreshold{Threshold: decimal.NewFromInt(1000), Condition: types.AlertConditionAbove},
+	})
+	// A high balance trips an "above" alarm; it is not a low balance to warn about.
+	w := s.makeWallet("wallet_status_above", decimal.NewFromInt(5000), nil, nil)
+
+	got, err := s.service.BalanceAlertStatus(s.GetContext(), w, decimal.NewFromInt(5000), decimal.NewFromInt(5000))
+	s.NoError(err)
+	s.Nil(got)
+}
+
+func (s *WalletServiceSuite) TestCreateWallet_CustomerMustExist() {
+	tests := []struct {
+		name       string
+		customerID string
+		wantErr    bool
+	}{
+		{"unknown customer id", "cust_does_not_exist", true},
+		{"existing customer id", s.testData.customer.ID, false},
+	}
+	for _, tc := range tests {
+		s.Run(tc.name, func() {
+			_, err := s.service.CreateWallet(s.GetContext(), &dto.CreateWalletRequest{
+				CustomerID: tc.customerID,
+				Currency:   "eur",
+			})
+			if tc.wantErr {
+				s.Error(err)
+				s.True(ierr.IsNotFound(err))
+				return
+			}
+			s.NoError(err)
 		})
 	}
 }

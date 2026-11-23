@@ -4,7 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
+
+	"github.com/flexprice/flexprice/internal/clock"
+
+	"github.com/samber/lo"
+	"github.com/shopspring/decimal"
 
 	"github.com/flexprice/flexprice/internal/api/dto"
 	"github.com/flexprice/flexprice/internal/domain/addon"
@@ -13,15 +17,17 @@ import (
 	"github.com/flexprice/flexprice/internal/domain/meter"
 	"github.com/flexprice/flexprice/internal/domain/plan"
 	"github.com/flexprice/flexprice/internal/domain/price"
+	"github.com/flexprice/flexprice/internal/domain/subscription"
 	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/types"
 	webhookDto "github.com/flexprice/flexprice/internal/webhook/dto"
-	"github.com/samber/lo"
 )
 
 // EntitlementService defines the interface for entitlement operations
 type EntitlementService interface {
 	CreateEntitlement(ctx context.Context, req dto.CreateEntitlementRequest) (*dto.EntitlementResponse, error)
+	// CreateSubscriptionEntitlementGrant creates a subscription entitlement grant on sub, which the caller has already loaded.
+	CreateSubscriptionEntitlementGrant(ctx context.Context, req dto.CreateEntitlementRequest, sub *subscription.Subscription) (*dto.EntitlementResponse, error)
 	CreateBulkEntitlement(ctx context.Context, req dto.CreateBulkEntitlementRequest) (*dto.CreateBulkEntitlementResponse, error)
 	GetEntitlement(ctx context.Context, id string) (*dto.EntitlementResponse, error)
 	ListEntitlements(ctx context.Context, filter *types.EntitlementFilter) (*dto.ListEntitlementsResponse, error)
@@ -30,6 +36,7 @@ type EntitlementService interface {
 	GetPlanEntitlements(ctx context.Context, planID string) (*dto.ListEntitlementsResponse, error)
 	GetPlanFeatureEntitlements(ctx context.Context, planID, featureID string) (*dto.ListEntitlementsResponse, error)
 	GetAddonEntitlements(ctx context.Context, addonID string) (*dto.ListEntitlementsResponse, error)
+	ValidateGrantShape(ctx context.Context, e *entitlement.Entitlement) error
 }
 
 type entitlementService struct {
@@ -114,6 +121,15 @@ func (s *entitlementService) CreateEntitlement(ctx context.Context, req dto.Crea
 			Mark(ierr.ErrValidation)
 	}
 
+	if req.IsSubscriptionEntitlementGrant() {
+		sub, ok := entity.(*subscription.Subscription)
+		if !ok {
+			return nil, ierr.NewError("a subscription entitlement grant needs entity_id set to the subscription").
+				Mark(ierr.ErrValidation)
+		}
+		return s.CreateSubscriptionEntitlementGrant(ctx, req, sub)
+	}
+
 	// Validate feature exists
 	feature, err := s.FeatureRepo.Get(ctx, req.FeatureID)
 	if err != nil {
@@ -163,6 +179,11 @@ func (s *entitlementService) CreateEntitlement(ctx context.Context, req dto.Crea
 	// entitlement.validateGrantConfig internally when we call Validate below).
 	e := req.ToEntitlement(ctx)
 
+	if err := s.deriveGrantConfig(ctx, e, meterForGrantCheck); err != nil {
+		return nil, err
+	}
+	e.ApplyGrantDefaults()
+
 	if err := e.Validate(); err != nil {
 		return nil, err
 	}
@@ -170,12 +191,32 @@ func (s *entitlementService) CreateEntitlement(ctx context.Context, req dto.Crea
 	if err := s.validateEntitlementGrantShape(ctx, e, meterForGrantCheck); err != nil {
 		return nil, err
 	}
-	// Ensure entity type and ID are set correctly
+
 	e.EntityType = entityType
 	e.EntityID = entityID
 
-	result, err := s.EntitlementRepo.Create(ctx, e)
-	if err != nil {
+	var result *entitlement.Entitlement
+	if err := s.DB.WithTx(ctx, func(txCtx context.Context) error {
+		if err := s.assertSingleContributor(txCtx, e); err != nil {
+			return err
+		}
+		if err := s.validateFeatureGrantAgainstSubscriptionScopedEntitlements(txCtx, e); err != nil {
+			return err
+		}
+
+		created, err := s.EntitlementRepo.Create(txCtx, e)
+		if err != nil {
+			return err
+		}
+		result = created
+
+		// Only a grant-backed override has windows to re-cut; a legacy one carries a
+		// usage_limit, which nothing materialises.
+		if created.IsSubscriptionOverride() && created.HasGrantConfig() {
+			return s.takeOverGrantWindowsFromParent(txCtx, created)
+		}
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 
@@ -224,7 +265,14 @@ func (s *entitlementService) CreateBulkEntitlement(ctx context.Context, req dto.
 		subscriptionIDs := make(map[string]bool)
 		featureIDs := make(map[string]bool)
 
-		for _, entReq := range req.Items {
+		for i, entReq := range req.Items {
+			if entReq.IsSubscriptionEntitlementGrant() {
+				return ierr.NewError("subscription entitlement grants cannot be created in bulk").
+					WithHint("Create each subscription entitlement grant with POST /entitlements.").
+					WithReportableDetails(map[string]interface{}{"index": i}).
+					Mark(ierr.ErrValidation)
+			}
+
 			// Support both legacy plan_id and new entity_type/entity_id
 			var entityType types.EntitlementEntityType
 			var entityID string
@@ -362,6 +410,12 @@ func (s *entitlementService) CreateBulkEntitlement(ctx context.Context, req dto.
 			entitlements[i] = ent
 		}
 
+		for _, e := range entitlements {
+			if err := s.validateFeatureGrantAgainstSubscriptionScopedEntitlements(txCtx, e); err != nil {
+				return err
+			}
+		}
+
 		// Create entitlements in bulk
 		createdEntitlements, err := s.EntitlementRepo.CreateBulk(txCtx, entitlements)
 		if err != nil {
@@ -439,6 +493,10 @@ func (s *entitlementService) GetEntitlement(ctx context.Context, id string) (*dt
 	}
 
 	response := &dto.EntitlementResponse{Entitlement: result}
+
+	if result.IsSubscriptionScoped() {
+		return response, nil
+	}
 
 	// Add expanded fields
 	fetaureService := NewFeatureService(s.ServiceParams)
@@ -522,8 +580,8 @@ func (s *entitlementService) hydrateEntitlements(ctx context.Context, entitlemen
 	addonsByID := make(map[string]*addon.Addon)
 
 	if expand.Has(types.ExpandFeatures) {
-		featureIDs := lo.Map(entitlements, func(e *entitlement.Entitlement, _ int) string {
-			return e.FeatureID
+		featureIDs := lo.FilterMap(entitlements, func(e *entitlement.Entitlement, _ int) (string, bool) {
+			return e.FeatureID, e.FeatureID != ""
 		})
 
 		if len(featureIDs) > 0 {
@@ -660,6 +718,13 @@ func (s *entitlementService) UpdateEntitlement(ctx context.Context, id string, r
 	if err != nil {
 		return nil, err
 	}
+	if existing.IsSubscriptionScoped() {
+		return s.updateSubscriptionEntitlementGrant(ctx, existing, req)
+	}
+
+	priorQuota := existing.GrantQuota
+	priorUnlimited := existing.IsUnlimitedGrant()
+	stored := *existing
 
 	// Update fields if provided
 	if req.IsEnabled != nil {
@@ -687,8 +752,14 @@ func (s *entitlementService) UpdateEntitlement(ctx context.Context, id string, r
 		existing.ConfigValue = req.ConfigValue
 	}
 
-	// Grant fields: nil = leave alone; ClearGrantConfig wipes the whole config.
+	// Grant fields: nil = leave alone.
+	//
+	// Deprecated: ClearGrantConfig is honoured for existing callers but is on its
+	// way out — logged so we can see whether anyone still relies on it.
 	if req.ClearGrantConfig != nil && *req.ClearGrantConfig {
+		s.Logger.Info(ctx, "deprecated clear_grant_config used on entitlement update",
+			"entitlement_id", id,
+			"feature_id", existing.FeatureID)
 		existing.GrantMeasure = ""
 		existing.GrantDurationValue = nil
 		existing.GrantDurationUnit = ""
@@ -711,15 +782,42 @@ func (s *entitlementService) UpdateEntitlement(ctx context.Context, id string, r
 	if req.GrantQuota != nil {
 		existing.GrantQuota = req.GrantQuota
 	}
+
+	if req.GrantUnlimited != nil {
+		if *req.GrantUnlimited {
+			unit := existing.GrantDurationUnit
+			if req.GrantDurationUnit != nil {
+				unit = *req.GrantDurationUnit
+			}
+			if unit != types.EntitlementGrantDurationUnitSubscriptionPeriod {
+				return nil, ierr.NewError("an unlimited allowance must reset once per billing period").
+					WithHint("Send grant_duration_unit=subscription_period alongside grant_unlimited").
+					WithReportableDetails(map[string]interface{}{"grant_duration_unit": unit}).
+					Mark(ierr.ErrValidation)
+			}
+			existing.GrantQuota = nil
+		} else if req.GrantQuota == nil {
+			return nil, ierr.NewError("grant_quota is required when turning off an unlimited allowance").
+				WithHint("Send the quota this allowance should be capped at").
+				Mark(ierr.ErrValidation)
+		}
+	}
 	if req.AggregationMode != nil {
 		existing.AggregationMode = *req.AggregationMode
 	}
+
+	if existing.GrantDurationUnit == types.EntitlementGrantDurationUnitSubscriptionPeriod {
+		existing.GrantDurationValue = nil
+		existing.GrantAllocationBehavior = ""
+	}
+
+	existing.ApplyGrantDefaults()
 
 	if err := existing.Validate(); err != nil {
 		return nil, err
 	}
 
-	if existing.HasGrantConfig() && existing.FeatureType == types.FeatureTypeMetered {
+	if !stored.GrantConfigEquals(existing) && existing.HasGrantConfig() {
 		featureRow, err := s.FeatureRepo.Get(ctx, existing.FeatureID)
 		if err != nil {
 			return nil, err
@@ -733,8 +831,23 @@ func (s *entitlementService) UpdateEntitlement(ctx context.Context, id string, r
 		}
 	}
 
-	result, err := s.EntitlementRepo.Update(ctx, existing)
-	if err != nil {
+	var result *entitlement.Entitlement
+	if err := s.DB.WithTx(ctx, func(txCtx context.Context) error {
+		if err := s.assertSingleContributor(txCtx, existing); err != nil {
+			return err
+		}
+		if err := s.validateFeatureGrantAgainstSubscriptionScopedEntitlements(txCtx, existing); err != nil {
+			return err
+		}
+
+		updated, err := s.EntitlementRepo.Update(txCtx, existing)
+		if err != nil {
+			return err
+		}
+		result = updated
+
+		return s.resettleGrantWindows(txCtx, updated, priorQuota, priorUnlimited)
+	}); err != nil {
 		return nil, err
 	}
 
@@ -752,7 +865,20 @@ func (s *entitlementService) UpdateEntitlement(ctx context.Context, id string, r
 }
 
 func (s *entitlementService) DeleteEntitlement(ctx context.Context, id string) error {
-	if err := s.EntitlementRepo.Delete(ctx, id); err != nil {
+	if err := s.DB.WithTx(ctx, func(txCtx context.Context) error {
+		existing, err := s.EntitlementRepo.GetForUpdate(txCtx, id)
+		if err != nil {
+			return err
+		}
+
+		if err := s.EntitlementRepo.Delete(txCtx, id); err != nil {
+			return err
+		}
+		if existing.IsSubscriptionScoped() {
+			return s.settleDeletedSubscriptionEntitlementGrant(txCtx, existing)
+		}
+		return s.settleGrantWindowsForDeletedEC(txCtx, existing)
+	}); err != nil {
 		return err
 	}
 
@@ -830,7 +956,7 @@ func (s *entitlementService) publishSystemEvent(ctx context.Context, eventName t
 		TenantID:      types.GetTenantID(ctx),
 		EnvironmentID: types.GetEnvironmentID(ctx),
 		UserID:        types.GetUserID(ctx),
-		Timestamp:     time.Now().UTC(),
+		Timestamp:     clock.Now(),
 		Payload:       json.RawMessage(webhookPayload),
 		EntityType:    types.SystemEntityTypeEntitlement,
 		EntityID:      entitlementID,
@@ -840,10 +966,8 @@ func (s *entitlementService) publishSystemEvent(ctx context.Context, eventName t
 	}
 }
 
-// validateEntitlementAgainstBucketedPrices is the reverse direction: reject an
-// entitlement when a live price on the feature's meter is already bucketed.
-// grantBased distinguishes the two rules — grants are rejected for any bucketed
-// meter, plain entitlements only for MAX.
+// validateEntitlementAgainstBucketedPrices rejects an entitlement when a live price on
+// the meter is bucketed. Grants are rejected for any of them, legacy only for MAX.
 func (s *entitlementService) validateEntitlementAgainstBucketedPrices(ctx context.Context, m *meter.Meter, grantBased bool) error {
 	if m == nil || m.ID == "" || s.PriceRepo == nil {
 		return nil
@@ -893,4 +1017,165 @@ func (s *entitlementService) validateEntitlementAgainstBucketedPrices(ctx contex
 	}
 
 	return nil
+}
+
+// deriveGrantConfig puts every new metered entitlement on the grant model so the legacy
+// set stops growing. usage_limit becomes the quota, its absence an unlimited allowance,
+// and the billing period the cadence — which reproduces legacy behaviour exactly.
+// Meters a grant cannot cover keep the legacy shape rather than lose their entitlement.
+func (s *entitlementService) deriveGrantConfig(
+	ctx context.Context,
+	e *entitlement.Entitlement,
+	m *meter.Meter,
+) error {
+	if e == nil || e.FeatureType != types.FeatureTypeMetered || e.HasGrantConfig() {
+		return nil
+	}
+
+	measure := types.EntitlementGrantMeasureQuantity
+	if err := s.grantMeterEligibility(ctx, m, measure); err != nil {
+		s.Logger.Info(ctx, "feature cannot carry an allowance; entitlement stays on the legacy model",
+			"feature_id", e.FeatureID,
+			"meter_id", lo.FromPtr(m).ID,
+			"reason", err.Error())
+		return nil
+	}
+
+	e.GrantMeasure = measure
+	e.GrantDurationUnit = types.EntitlementGrantDurationUnitSubscriptionPeriod
+	if e.AggregationMode == "" {
+		e.AggregationMode = types.EntitlementAggregationModeAdditive
+	}
+	if e.UsageLimit != nil {
+		e.GrantQuota = lo.ToPtr(decimal.NewFromInt(*e.UsageLimit))
+	}
+
+	e.UsageLimit = nil
+
+	s.Logger.Info(ctx, "derived a grant config for a new metered entitlement",
+		"feature_id", e.FeatureID,
+		"unlimited", e.IsUnlimitedGrant())
+	return nil
+}
+
+// resettleGrantWindows re-cuts one customer's live windows after an allowance edit.
+// Subscription rows only: a plan edit would rewrite every subscriber's window at once.
+func (s *entitlementService) resettleGrantWindows(
+	ctx context.Context,
+	e *entitlement.Entitlement,
+	priorQuota *decimal.Decimal,
+	priorUnlimited bool,
+) error {
+	if e == nil || e.EntityType != types.ENTITLEMENT_ENTITY_TYPE_SUBSCRIPTION || !e.HasGrantConfig() {
+		return nil
+	}
+	unlimited := e.IsUnlimitedGrant()
+	if unlimited == priorUnlimited && entitlement.QuotaEquals(priorQuota, e.GrantQuota) {
+		return nil
+	}
+
+	// The allowance replaced the old one rather than topping it up, so the delta is the
+	// difference. Added to what the closed window had left, that is the same number as
+	// recalculating from scratch: (old − usage) + (new − old) = new − usage.
+	delta := lo.FromPtr(e.GrantQuota).Sub(lo.FromPtr(priorQuota))
+	_, err := NewEntitlementGrantService(s.ServiceParams).ReissueEntitlementGrants(ctx, &dto.ReissueEntitlementGrantsRequest{
+		SubscriptionID: e.EntityID,
+		FeatureID:      e.FeatureID,
+		Delta:          delta,
+		Unlimited:      unlimited,
+		At:             clock.Now(),
+		Source:         "entitlement_updated",
+	})
+	return err
+}
+
+// assertSingleContributor rejects overrides where multiple entitlements contribute to the feature.
+func (s *entitlementService) assertSingleContributor(ctx context.Context, e *entitlement.Entitlement) error {
+	if !e.IsSubscriptionOverride() {
+		return nil
+	}
+	parentID := lo.FromPtr(e.ParentEntitlementID)
+
+	sub, err := s.SubRepo.Get(ctx, e.EntityID)
+	if err != nil {
+		return err
+	}
+
+	entitlementsForSubscription, err := NewSubscriptionService(s.ServiceParams).GetSubscriptionEntitlementsForSubscription(ctx, sub)
+
+	if err != nil {
+		return err
+	}
+
+	otherEntitlements := make([]string, 0, len(entitlementsForSubscription))
+	for _, other := range entitlementsForSubscription {
+		if other == nil || other.Entitlement == nil || other.FeatureID != e.FeatureID {
+			continue
+		}
+		// The row being written and the one it replaces both become this override.
+		if other.ID == e.ID || other.ID == parentID {
+			continue
+		}
+		otherEntitlements = append(otherEntitlements, other.ID)
+	}
+
+	if len(otherEntitlements) == 0 {
+		return nil
+	}
+
+	return ierr.NewError("this allowance comes from more than one entitlement").
+		WithHint("Change it on the plan or addon instead.").
+		WithReportableDetails(map[string]interface{}{
+			"subscription_id":       e.EntityID,
+			"feature_id":            e.FeatureID,
+			"other_entitlement_ids": otherEntitlements,
+		}).
+		Mark(ierr.ErrValidation)
+}
+
+// entitlementAlertsEnabled reports whether grant usage is evaluated in this environment: on in the
+// deployment config and in the environment's entitlement alert setting.
+func (s *entitlementService) entitlementAlertsEnabled(ctx context.Context) (bool, error) {
+	if !s.Config.UsageAlerts.Enabled || !s.Config.UsageAlerts.EntitlementAlertsEnabled {
+		return false, nil
+	}
+	settingsSvc := NewSettingsService(s.ServiceParams).(*settingsService)
+	cfg, err := GetSetting[types.AlertToggleConfig](settingsSvc, ctx, types.SettingKeyEntitlementAlertConfig)
+	if err != nil && !ierr.IsNotFound(err) {
+		return false, err
+	}
+	return cfg.IsAlertEnabled(), nil
+}
+
+// validateFeatureGrantAgainstSubscriptionScopedEntitlements refuses a feature entitlement grant that would reach a subscription
+// with a subscription-scoped entitlement, directly or through its plan or addon: one grant per charge.
+func (s *entitlementService) validateFeatureGrantAgainstSubscriptionScopedEntitlements(ctx context.Context, e *entitlement.Entitlement) error {
+	if !isFeatureEntitlementGrant(e) {
+		return nil
+	}
+	grants := &entitlementGrantService{ServiceParams: s.ServiceParams}
+	var subIDs []string
+	switch e.EntityType {
+	case types.ENTITLEMENT_ENTITY_TYPE_SUBSCRIPTION:
+		granted, err := grants.hasSubscriptionScopedEntitlement(ctx, e.EntityID)
+		if err != nil {
+			return err
+		}
+		if granted {
+			subIDs = []string{e.EntityID}
+		}
+	case types.ENTITLEMENT_ENTITY_TYPE_PLAN, types.ENTITLEMENT_ENTITY_TYPE_ADDON:
+		subs, err := grants.subscriptionsWithSubscriptionScopedEntitlementOn(ctx, e.EntityType, e.EntityID)
+		if err != nil {
+			return err
+		}
+		subIDs = lo.Map(subs, func(sub *subscription.Subscription, _ int) string { return sub.ID })
+	}
+	if len(subIDs) == 0 {
+		return nil
+	}
+	return ierr.NewErrorf("subscription entitlement grant not supported: %s", errSubGrantWithFeatureGrant).
+		WithHint("A subscription with a subscription entitlement grant cannot also have feature entitlement grants.").
+		WithReportableDetails(map[string]any{"entitlement_id": e.ID, "subscription_ids": subIDs}).
+		Mark(ierr.ErrValidation)
 }

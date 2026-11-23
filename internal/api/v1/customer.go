@@ -15,6 +15,7 @@ import (
 type CustomerHandler struct {
 	service                         service.CustomerService
 	billing                         service.BillingService
+	payment                         service.PaymentService
 	entityIntegrationMappingService service.EntityIntegrationMappingService
 	log                             *logger.Logger
 }
@@ -22,12 +23,14 @@ type CustomerHandler struct {
 func NewCustomerHandler(
 	service service.CustomerService,
 	billing service.BillingService,
+	payment service.PaymentService,
 	entityIntegrationMappingService service.EntityIntegrationMappingService,
 	log *logger.Logger,
 ) *CustomerHandler {
 	return &CustomerHandler{
 		service:                         service,
 		billing:                         billing,
+		payment:                         payment,
 		entityIntegrationMappingService: entityIntegrationMappingService,
 		log:                             log,
 	}
@@ -280,6 +283,7 @@ func (h *CustomerHandler) attachCustomerIntegrations(c *gin.Context, resp *dto.C
 // @Produce json
 // @Security ApiKeyAuth
 // @Param id path string true "Customer ID"
+// @Param refresh_grants query bool false "Evaluate entitlement grants before returning their usage (slower)"
 // @Success 200 {object} dto.CustomerEntitlementsResponse
 // @Failure 400 {object} ierr.ErrorResponse "Invalid request"
 // @Failure 500 {object} ierr.ErrorResponse "Server error"
@@ -313,6 +317,7 @@ func (h *CustomerHandler) GetCustomerEntitlements(c *gin.Context) {
 // @Produce json
 // @Security ApiKeyAuth
 // @Param external_id path string true "Customer External ID"
+// @Param refresh_grants query bool false "Evaluate entitlement grants before returning their usage (slower)"
 // @Success 200 {object} dto.CustomerEntitlementsResponse
 // @Failure 400 {object} ierr.ErrorResponse "Invalid request"
 // @Failure 404 {object} ierr.ErrorResponse "Resource not found"
@@ -492,5 +497,55 @@ func (h *CustomerHandler) GetUpcomingCreditGrantApplications(c *gin.Context) {
 		return
 	}
 
+	c.JSON(http.StatusOK, resp)
+}
+
+// @Summary List customer payment integrations
+// @ID listCustomerPaymentIntegrations
+// @Description Use to learn which connected gateways can serve this customer and what each can do: check out, auto-charge, list methods, add a method (with the method types it sets up, e.g. enach for Razorpay), set a default.
+// @Tags Customers
+// @x-scope "read"
+// @Produce json
+// @Security ApiKeyAuth
+// @Param id path string true "Customer ID"
+// @Success 200 {object} dto.IntegrationsResponse
+// @Failure 404 {object} ierr.ErrorResponse "Customer not found"
+// @Failure 500 {object} ierr.ErrorResponse "Server error"
+// @Router /customers/{id}/payment-integrations [get]
+func (h *CustomerHandler) ListPaymentIntegrations(c *gin.Context) {
+	resp, err := h.payment.ListPaymentIntegrations(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		c.Error(err)
+		return
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+// @Summary List customer payment methods
+// @ID listCustomerPaymentMethods
+// @Description Use when you need a customer's saved payment methods across every connected gateway, including whether each can be auto-charged. Only gateways that can list saved methods are included.
+// @Tags Customers
+// @x-scope "read"
+// @Produce json
+// @Security ApiKeyAuth
+// @Param id path string true "Customer ID"
+// @Param providers query []string false "Limit to these payment gateways" collectionFormat(multi)
+// @Success 200 {object} dto.SavedPaymentMethodsResponse
+// @Failure 400 {object} ierr.ErrorResponse "Invalid request"
+// @Failure 404 {object} ierr.ErrorResponse "Customer not found"
+// @Failure 500 {object} ierr.ErrorResponse "Server error"
+// @Router /customers/{id}/payment-methods [get]
+func (h *CustomerHandler) ListPaymentMethods(c *gin.Context) {
+	var req dto.ListSavedPaymentMethodsRequest
+	if err := c.ShouldBindQuery(&req); err != nil {
+		c.Error(ierr.WithError(err).WithHint("providers must be one or more supported payment gateways").
+			Mark(ierr.ErrValidation))
+		return
+	}
+	resp, err := h.payment.ListPaymentMethods(c.Request.Context(), c.Param("id"), &req)
+	if err != nil {
+		c.Error(err)
+		return
+	}
 	c.JSON(http.StatusOK, resp)
 }

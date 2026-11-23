@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/flexprice/flexprice/internal/domain/customer"
 	"github.com/flexprice/flexprice/internal/domain/subscription"
 	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/types"
@@ -16,6 +17,9 @@ type InMemorySubscriptionStore struct {
 	*InMemoryStore[*subscription.Subscription]
 	lineItems     map[string][]*subscription.SubscriptionLineItem // map[subscriptionID][]lineItems (initial batch from CreateWithLineItems)
 	lineItemStore *InMemorySubscriptionLineItemStore              // optional: when set, GetWithLineItems merges in line items created via SubscriptionLineItemRepo.Create
+	invoiceStore  *InMemoryInvoiceStore                           // optional: when set, MarkOverdueGatedSubscriptionsIncomplete checks invoices
+	customerStore *InMemoryCustomerStore                          // optional: when set, MarkOverdueGatedSubscriptionsIncomplete reads customer grace overrides
+	settingsStore *InMemorySettingsStore                          // optional: when set, ListEnvironmentsForAutoCancellation reads environment settings
 	pauses        map[string][]*subscription.SubscriptionPause    // map[subscriptionID][]pauses
 	pauseByID     map[string]*subscription.SubscriptionPause      // map[pauseID]pause
 }
@@ -214,6 +218,15 @@ func copySubscription(sub *subscription.Subscription) *subscription.Subscription
 	return &out
 }
 
+// GetTimezone returns the timezone of the scoped subscription.
+func (s *InMemorySubscriptionStore) GetTimezone(ctx context.Context, id string) (string, error) {
+	sub, err := s.Get(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	return sub.Timezone, nil
+}
+
 // GetForUpdate matches Get; in-memory store has no row locks.
 func (s *InMemorySubscriptionStore) GetForUpdate(ctx context.Context, id string) (*subscription.Subscription, error) {
 	return s.Get(ctx, id)
@@ -235,6 +248,12 @@ func (s *InMemorySubscriptionStore) List(ctx context.Context, filter *types.Subs
 		// Same copy-on-read contract as Get; attaching line items below is a write.
 		sub = copySubscription(sub)
 		subs[i] = sub
+
+		// Like the ent repository, line items load only on request.
+		if filter == nil || !filter.WithLineItems {
+			sub.LineItems = nil
+			continue
+		}
 
 		if s.lineItemStore != nil {
 			liFilter := types.NewNoLimitSubscriptionLineItemFilter()
@@ -264,6 +283,7 @@ func (s *InMemorySubscriptionStore) ListByCustomerID(ctx context.Context, custom
 			types.SubscriptionStatusActive,
 			types.SubscriptionStatusTrialing,
 		},
+		WithLineItems: true,
 	}
 
 	// Use the existing List method
@@ -373,25 +393,15 @@ func (s *InMemorySubscriptionStore) Delete(ctx context.Context, id string) error
 }
 
 // ListAll returns all subscriptions without pagination
+// ListAll drops pagination and keeps every other field, matching the ent
+// repository. Copying fields by hand here silently ignored CustomerIDs,
+// SubscriptionIDs and WithLineItems.
 func (s *InMemorySubscriptionStore) ListAll(ctx context.Context, filter *types.SubscriptionFilter) ([]*subscription.Subscription, error) {
-	// Create an unlimited filter
-	unlimitedFilter := &types.SubscriptionFilter{
-		QueryFilter:             types.NewNoLimitQueryFilter(),
-		TimeRangeFilter:         filter.TimeRangeFilter,
-		CustomerID:              filter.CustomerID,
-		PlanID:                  filter.PlanID,
-		ParentSubscriptionIDs:   filter.ParentSubscriptionIDs,
-		SubscriptionTypes:       filter.SubscriptionTypes,
-		SubscriptionStatus:      filter.SubscriptionStatus,
-		BillingCadence:          filter.BillingCadence,
-		BillingPeriod:           filter.BillingPeriod,
-		SubscriptionStatusNotIn: filter.SubscriptionStatusNotIn,
-		ActiveAt:                filter.ActiveAt,
-		EffectiveDateForUpdate:  filter.EffectiveDateForUpdate,
-		TrialEndDueLTE:          filter.TrialEndDueLTE,
+	if filter == nil {
+		filter = &types.SubscriptionFilter{}
 	}
-
-	return s.List(ctx, unlimitedFilter)
+	filter.QueryFilter = types.NewNoLimitQueryFilter()
+	return s.List(ctx, filter)
 }
 
 // GetSubscriptionsForBillingPeriodUpdate returns subscriptions across all tenants for billing-period jobs.
@@ -648,6 +658,141 @@ func (s *InMemorySubscriptionStore) GetSubscriptionsWithAutoInvoiceThreshold(ctx
 		results = results[:limit]
 	}
 	return results, nil
+}
+
+// SetInvoiceStore lets MarkOverdueGatedSubscriptionsIncomplete see invoices, mirroring the ent repository's join.
+func (s *InMemorySubscriptionStore) SetInvoiceStore(store *InMemoryInvoiceStore) {
+	s.invoiceStore = store
+}
+
+// SetCustomerStore lets MarkOverdueGatedSubscriptionsIncomplete resolve customer grace overrides.
+func (s *InMemorySubscriptionStore) SetCustomerStore(store *InMemoryCustomerStore) {
+	s.customerStore = store
+}
+
+// SetSettingsStore lets ListEnvironmentsForAutoCancellation read environment settings.
+func (s *InMemorySubscriptionStore) SetSettingsStore(store *InMemorySettingsStore) {
+	s.settingsStore = store
+}
+
+func (s *InMemorySubscriptionStore) ListEnvironmentsWithGatedActiveSubscriptions(ctx context.Context) ([]types.TenantEnvironment, error) {
+	subs, err := s.InMemoryStore.List(ctx, nil, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	envs := lo.FilterMap(subs, func(sub *subscription.Subscription, _ int) (types.TenantEnvironment, bool) {
+		return types.TenantEnvironment{TenantID: sub.TenantID, EnvironmentID: sub.EnvironmentID}, isGatedActive(sub)
+	})
+	return lo.Uniq(envs), nil
+}
+
+func (s *InMemorySubscriptionStore) ListEnvironmentsForAutoCancellation(ctx context.Context) ([]types.TenantEnvironment, error) {
+	autoCancels := func(o *types.SettingsOverride) bool {
+		return o != nil && o.SubscriptionConfig != nil && lo.FromPtr(o.SubscriptionConfig.AutoCancellationEnabled)
+	}
+	subs, err := s.InMemoryStore.List(ctx, nil, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	envs := lo.FilterMap(subs, func(sub *subscription.Subscription, _ int) (types.TenantEnvironment, bool) {
+		return types.TenantEnvironment{TenantID: sub.TenantID, EnvironmentID: sub.EnvironmentID},
+			sub.Status == types.StatusPublished && autoCancels(sub.Settings)
+	})
+	if s.settingsStore != nil {
+		configs, err := s.settingsStore.ListAllTenantEnvSettingsByKey(ctx, types.SettingKeySubscriptionConfig)
+		if err != nil {
+			return nil, err
+		}
+		envs = append(envs, lo.FilterMap(configs, func(c *types.TenantEnvConfig, _ int) (types.TenantEnvironment, bool) {
+			enabled, _ := c.Config["auto_cancellation_enabled"].(bool)
+			return types.TenantEnvironment{TenantID: c.TenantID, EnvironmentID: c.EnvironmentID}, enabled
+		})...)
+	}
+	if s.customerStore != nil {
+		customers, err := s.customerStore.InMemoryStore.List(ctx, nil, nil, nil)
+		if err != nil {
+			return nil, err
+		}
+		envs = append(envs, lo.FilterMap(customers, func(c *customer.Customer, _ int) (types.TenantEnvironment, bool) {
+			return types.TenantEnvironment{TenantID: c.TenantID, EnvironmentID: c.EnvironmentID},
+				c.Status == types.StatusPublished && autoCancels(c.Settings)
+		})...)
+	}
+	return lo.Uniq(envs), nil
+}
+
+func (s *InMemorySubscriptionStore) MarkOverdueGatedSubscriptionsIncomplete(ctx context.Context, asOf time.Time, graceDays int) ([]string, error) {
+	if s.invoiceStore == nil {
+		return nil, nil
+	}
+	tenantID, environmentID := types.GetTenantID(ctx), types.GetEnvironmentID(ctx)
+
+	invoices, err := s.invoiceStore.InMemoryStore.List(ctx, nil, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	dueDates := make(map[string][]time.Time)
+	for _, inv := range invoices {
+		if inv.TenantID != tenantID || inv.EnvironmentID != environmentID || inv.SubscriptionID == nil || inv.DueDate == nil {
+			continue
+		}
+		if inv.Status != types.StatusPublished ||
+			inv.InvoiceType != types.InvoiceTypeSubscription ||
+			inv.InvoiceStatus != types.InvoiceStatusFinalized ||
+			inv.BillingReason != string(types.InvoiceBillingReasonSubscriptionCycle) ||
+			!lo.Contains([]types.PaymentStatus{types.PaymentStatusPending, types.PaymentStatusFailed}, inv.PaymentStatus) ||
+			!inv.AmountRemaining.IsPositive() {
+			continue
+		}
+		if inv.DueDate.After(asOf) {
+			continue
+		}
+		dueDates[*inv.SubscriptionID] = append(dueDates[*inv.SubscriptionID], *inv.DueDate)
+	}
+
+	subs, err := s.InMemoryStore.List(ctx, nil, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, sub := range subs {
+		if sub.TenantID != tenantID || sub.EnvironmentID != environmentID || !isGatedActive(sub) {
+			continue
+		}
+		windowStart := asOf.AddDate(0, 0, -s.graceDays(ctx, sub, graceDays))
+		if !lo.ContainsBy(dueDates[sub.ID], func(due time.Time) bool { return due.After(windowStart) }) {
+			continue
+		}
+		updated := *sub
+		updated.SubscriptionStatus = types.SubscriptionStatusIncomplete
+		updated.UpdatedAt = asOf
+		if err := s.InMemoryStore.Update(ctx, sub.ID, &updated); err != nil {
+			return nil, err
+		}
+		ids = append(ids, sub.ID)
+	}
+	return ids, nil
+}
+
+// graceDays mirrors the ent query's COALESCE: subscription override, then customer override, then the environment value.
+func (s *InMemorySubscriptionStore) graceDays(ctx context.Context, sub *subscription.Subscription, envGraceDays int) int {
+	if sub.Settings != nil && sub.Settings.SubscriptionConfig != nil && sub.Settings.SubscriptionConfig.GracePeriodDays != nil {
+		return *sub.Settings.SubscriptionConfig.GracePeriodDays
+	}
+	if s.customerStore != nil {
+		if cust, err := s.customerStore.Get(ctx, sub.CustomerID); err == nil &&
+			cust.Settings != nil && cust.Settings.SubscriptionConfig != nil && cust.Settings.SubscriptionConfig.GracePeriodDays != nil {
+			return *cust.Settings.SubscriptionConfig.GracePeriodDays
+		}
+	}
+	return envGraceDays
+}
+
+func isGatedActive(sub *subscription.Subscription) bool {
+	return sub.Status == types.StatusPublished &&
+		sub.SubscriptionStatus == types.SubscriptionStatusActive &&
+		types.PaymentBehavior(sub.PaymentBehavior).IsIncompleteType()
 }
 
 // Clear removes all data from the store

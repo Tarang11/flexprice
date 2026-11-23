@@ -71,6 +71,7 @@ func TestToProviderPaymentMethod_CardIsNormalized(t *testing.T) {
 	assert.Equal(t, types.PaymentMethodTypeCard, got.Method)
 	assert.True(t, got.IsDefault, "the primary source is the default")
 	assert.True(t, got.Active)
+	assert.True(t, got.InstantlyChargeable, "a valid vaulted card can be charged on demand")
 	assert.Equal(t, "gw_001", got.GatewayAccountID, "kept so a split vault is diagnosable")
 	require.NotNil(t, got.Card)
 	assert.Equal(t, "4242", got.Card.Last4)
@@ -170,10 +171,11 @@ func (c *paymentSourceClient) AssignPaymentRole(_ context.Context, _, paymentSou
 }
 
 func newOwnershipAdapter(sources ...*paymentSourceModel.PaymentSource) (*PaymentMethodAdapter, *paymentSourceClient) {
-	client := &paymentSourceClient{sources: sources}
+	client := &paymentSourceClient{ChargebeeClient: connClient{}, sources: sources}
 	return &PaymentMethodAdapter{
 		Client: client,
 		CustomerSvc: &CustomerService{CustomerServiceParams{
+			Client: client,
 			EntityIntegrationMappingRepo: mappingStore{
 				chargebeeCustomerIDByEntityID: map[string]string{"cust_ours": "cb_cust_ours"},
 			},

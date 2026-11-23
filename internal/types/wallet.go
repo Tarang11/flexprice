@@ -102,6 +102,19 @@ func (t TransactionReason) Validate() error {
 	return nil
 }
 
+// WalletTxSourceType is the kind of entity a wallet transaction's source_id points to.
+type WalletTxSourceType string
+
+const (
+	WalletTxSourceTypeInvoice WalletTxSourceType = "INVOICE"
+)
+
+// WalletTxConsumption is the credits a debit drew from one credit batch.
+type WalletTxConsumption struct {
+	CreditTransactionID string          `json:"credit_transaction_id"`
+	Credits             decimal.Decimal `json:"credits" swaggertype:"string"`
+}
+
 type WalletTxReferenceType string
 
 const (
@@ -155,7 +168,7 @@ type WalletTransactionFilter struct {
 	ReferenceID        *string            `json:"reference_id,omitempty" form:"reference_id"`
 	ExpiryDateBefore   *time.Time         `json:"expiry_date_before,omitempty" form:"expiry_date_before"`
 	ExpiryDateAfter    *time.Time         `json:"expiry_date_after,omitempty" form:"expiry_date_after"`
-	CreditsAvailableGT *decimal.Decimal   `json:"credits_available_gt,omitempty" form:"credits_available_gt"`
+	CreditsAvailableGT *decimal.Decimal   `json:"credits_available_gt,omitempty" form:"credits_available_gt" swaggertype:"string"`
 	TransactionReason  *TransactionReason `json:"transaction_reason,omitempty" form:"transaction_reason"`
 	Priority           *int               `json:"priority,omitempty" form:"priority"`
 	CreatedBy          *string            `json:"created_by,omitempty" form:"created_by"`
@@ -314,21 +327,12 @@ func (c WalletConfig) Validate() error {
 	return nil
 }
 
-// CreditExpirySkipReason is the reason a credit grant was skipped during expiry.
-type CreditExpirySkipReason string
-
-const (
-	CreditExpirySkipReasonNone               CreditExpirySkipReason = ""
-	CreditExpirySkipReasonActiveSubscription CreditExpirySkipReason = "active_subscription"
-	CreditExpirySkipReasonActiveInvoice      CreditExpirySkipReason = "active_invoice"
-)
-
 // ExpireCreditsResult is the result of attempting to expire a single credit transaction.
 type ExpireCreditsResult struct {
 	// Expired is true if the credits were expired.
 	Expired bool `json:"expired"`
-	// SkipReason is set when expiry was skipped (e.g. active_subscription, active_invoice).
-	SkipReason CreditExpirySkipReason `json:"skip_reason,omitempty"`
+	// Applied is the amount, in the wallet's currency, applied to draft invoices for usage before expiry.
+	Applied decimal.Decimal `json:"applied"`
 }
 
 // WalletFilter represents the filter options for wallets
@@ -361,8 +365,8 @@ const WalletMetadataKeyFailureReason = "failure_reason"
 // AutoTopup represents the auto top-up configuration for a wallet
 type AutoTopup struct {
 	Enabled   *bool            `json:"enabled"`
-	Threshold *decimal.Decimal `json:"threshold"`
-	Amount    *decimal.Decimal `json:"amount"`
+	Threshold *decimal.Decimal `json:"threshold" swaggertype:"string"`
+	Amount    *decimal.Decimal `json:"amount" swaggertype:"string"`
 	Invoicing *bool            `json:"invoicing"`
 	// Cooldown is an optional cooloff after a successful auto top-up before another may run.
 	Cooldown *Duration `json:"cooldown,omitempty"`

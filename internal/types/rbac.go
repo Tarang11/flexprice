@@ -19,15 +19,14 @@ const (
 )
 
 // AllowedRoles returns the roles assignable to this user type. People hold a
-// broad access level over the whole tenant, while service accounts hold either
-// full access or a single narrow machine scope, so the two sets are disjoint
-// apart from super_admin.
+// broad access level over the whole tenant. Service accounts hold full access,
+// tenant-wide read, or a narrow event scope.
 func (ut UserType) AllowedRoles() []Role {
 	switch ut {
 	case UserTypeUser:
 		return []Role{RoleSuperAdmin, RoleAllReader, RoleAllWriter}
 	case UserTypeServiceAccount:
-		return []Role{RoleSuperAdmin, RoleEventIngestor, RoleEventReader}
+		return []Role{RoleSuperAdmin, RoleAllReader, RoleEventIngestor, RoleEventReader}
 	default:
 		return nil
 	}
@@ -74,6 +73,7 @@ const (
 	EntityCustomer        Entity = "customer"
 	EntityPlan            Entity = "plan"
 	EntityAddon           Entity = "addon"
+	EntityProduct         Entity = "product"
 	EntityGroup           Entity = "group"
 	EntityAlertSettings   Entity = "alert_settings"
 	EntitySubscription    Entity = "subscription"
@@ -81,6 +81,7 @@ const (
 	EntityTenant          Entity = "tenant"
 	EntityInvoice         Entity = "invoice"
 	EntityFeature         Entity = "feature"
+	EntityActivity        Entity = "activity"
 	EntityEntitlement     Entity = "entitlement"
 	EntityCreditGrant     Entity = "creditgrant"
 	EntityPayment         Entity = "payment"
@@ -92,6 +93,7 @@ const (
 	EntityCostsheet       Entity = "costsheet"
 	EntityCreditNote      Entity = "creditnote"
 	EntityCoupon          Entity = "coupon"
+	EntityCommitment      Entity = "commitment"
 	EntityAI              Entity = "ai"
 	EntityPortal          Entity = "portal"
 	EntityWebhook         Entity = "webhook"
@@ -100,4 +102,7 @@ const (
 	EntityOAuth           Entity = "oauth"
 	EntityCheckoutSession Entity = "checkoutsession"
 	EntityWorkflow        Entity = "workflow"
+	EntityAnalytics       Entity = "analytics"
+	EntityFXRate          Entity = "fxrate"
+	EntityBillingEntity   Entity = "billing_entity"
 )

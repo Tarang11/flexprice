@@ -1,12 +1,18 @@
 package service
 
 import (
+	"context"
 	"testing"
 
 	"github.com/flexprice/flexprice/internal/api/dto"
+	"github.com/flexprice/flexprice/internal/config"
 	"github.com/flexprice/flexprice/internal/domain/tenant"
+	"github.com/flexprice/flexprice/internal/logger"
 	"github.com/flexprice/flexprice/internal/testutil"
 	"github.com/flexprice/flexprice/internal/types"
+	"github.com/samber/lo"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -273,6 +279,207 @@ func (s *TenantServiceSuite) TestGetTenantWithBillingDetails() {
 					s.Equal(tc.expectedPhone, resp.BillingDetails.Phone)
 					s.Equal(tc.expectedCountry, resp.BillingDetails.Address.Country)
 				}
+			}
+		})
+	}
+}
+
+func (s *TenantServiceSuite) TestUpdateTenantBillingDetails() {
+	stored := tenant.TenantBillingDetails{
+		Email:     "billing@example.com",
+		HelpEmail: "help@example.com",
+		Phone:     "+1-555-987-6543",
+		Address: tenant.TenantAddress{
+			Line1:      "456 Market Street",
+			Line2:      "Floor 3",
+			City:       "San Francisco",
+			State:      "CA",
+			PostalCode: "94105",
+			Country:    "US",
+		},
+	}
+
+	testCases := []struct {
+		name     string
+		request  dto.UpdateTenantRequest
+		expected func(b tenant.TenantBillingDetails) tenant.TenantBillingDetails
+	}{
+		{
+			name:     "nil_billing_details_keeps_stored_values",
+			request:  dto.UpdateTenantRequest{Name: lo.ToPtr("Renamed")},
+			expected: func(b tenant.TenantBillingDetails) tenant.TenantBillingDetails { return b },
+		},
+		{
+			name: "omitted_email_is_kept",
+			request: dto.UpdateTenantRequest{BillingDetails: &dto.UpdateTenantBillingDetails{
+				Phone: lo.ToPtr("+1-555-000-0000"),
+			}},
+			expected: func(b tenant.TenantBillingDetails) tenant.TenantBillingDetails {
+				b.Phone = "+1-555-000-0000"
+				return b
+			},
+		},
+		{
+			name: "new_email_replaces_stored_email",
+			request: dto.UpdateTenantRequest{BillingDetails: &dto.UpdateTenantBillingDetails{
+				Email: lo.ToPtr("finance@example.com"),
+			}},
+			expected: func(b tenant.TenantBillingDetails) tenant.TenantBillingDetails {
+				b.Email = "finance@example.com"
+				return b
+			},
+		},
+		{
+			name: "empty_email_clears_stored_email",
+			request: dto.UpdateTenantRequest{BillingDetails: &dto.UpdateTenantBillingDetails{
+				Email: lo.ToPtr(""),
+			}},
+			expected: func(b tenant.TenantBillingDetails) tenant.TenantBillingDetails {
+				b.Email = ""
+				return b
+			},
+		},
+		{
+			name: "omitted_address_fields_are_kept",
+			request: dto.UpdateTenantRequest{BillingDetails: &dto.UpdateTenantBillingDetails{
+				Address: &dto.UpdateTenantAddress{City: lo.ToPtr("Oakland")},
+			}},
+			expected: func(b tenant.TenantBillingDetails) tenant.TenantBillingDetails {
+				b.Address.City = "Oakland"
+				return b
+			},
+		},
+		{
+			name: "empty_address_line_clears_only_that_line",
+			request: dto.UpdateTenantRequest{BillingDetails: &dto.UpdateTenantBillingDetails{
+				Address: &dto.UpdateTenantAddress{Line2: lo.ToPtr("")},
+			}},
+			expected: func(b tenant.TenantBillingDetails) tenant.TenantBillingDetails {
+				b.Address.Line2 = ""
+				return b
+			},
+		},
+		{
+			name: "empty_country_clears_country",
+			request: dto.UpdateTenantRequest{BillingDetails: &dto.UpdateTenantBillingDetails{
+				Address: &dto.UpdateTenantAddress{Country: lo.ToPtr("")},
+			}},
+			expected: func(b tenant.TenantBillingDetails) tenant.TenantBillingDetails {
+				b.Address.Country = ""
+				return b
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			id := "tenant-update-" + tc.name
+			s.NoError(s.tenantRepo.Create(s.GetContext(), &tenant.Tenant{
+				ID:             id,
+				Name:           "Billing Tenant",
+				BillingDetails: stored,
+			}))
+
+			resp, err := s.tenantService.UpdateTenant(s.GetContext(), id, tc.request)
+			s.NoError(err)
+			s.NotNil(resp)
+
+			updated, err := s.tenantRepo.GetByID(s.GetContext(), id)
+			s.NoError(err)
+			s.Equal(tc.expected(stored), updated.BillingDetails)
+		})
+	}
+}
+
+func (s *TenantServiceSuite) TestUpdateTenantRejectsInvalidCountry() {
+	id := "tenant-update-invalid-country"
+	s.NoError(s.tenantRepo.Create(s.GetContext(), &tenant.Tenant{ID: id, Name: "Tenant"}))
+
+	_, err := s.tenantService.UpdateTenant(s.GetContext(), id, dto.UpdateTenantRequest{
+		BillingDetails: &dto.UpdateTenantBillingDetails{
+			Address: &dto.UpdateTenantAddress{Country: lo.ToPtr("USA")},
+		},
+	})
+	s.Error(err)
+}
+
+// CreateTenant can run inside a caller's transaction, so provisioning is left to the caller after commit.
+func TestCreateTenant_DoesNotCallSelfBillingHook(t *testing.T) {
+	hook := &recordingHook{}
+	params := ServiceParams{
+		Logger:      logger.NewNoopLogger(),
+		Config:      &config.Configuration{},
+		TenantRepo:  testutil.NewInMemoryTenantStore(),
+		SelfBilling: hook,
+	}
+
+	_, err := NewTenantService(params).CreateTenant(context.Background(), dto.CreateTenantRequest{
+		ID:             "tenant_1",
+		Name:           "Acme",
+		BillingDetails: &dto.TenantBillingDetails{Email: "a@acme.io"},
+	})
+	require.NoError(t, err)
+	assert.Empty(t, hook.calls)
+}
+
+func TestUpdateTenant_NotifiesSelfBillingOnNameOrAddressChange(t *testing.T) {
+	tests := []struct {
+		name       string
+		req        dto.UpdateTenantRequest
+		wantNotify bool
+	}{
+		{
+			name: "address_changed",
+			req: dto.UpdateTenantRequest{
+				BillingDetails: &dto.UpdateTenantBillingDetails{
+					Address: &dto.UpdateTenantAddress{City: lo.ToPtr("Pune")},
+				},
+			},
+			wantNotify: true,
+		},
+		{
+			name:       "name_changed",
+			req:        dto.UpdateTenantRequest{Name: lo.ToPtr("Acme Inc")},
+			wantNotify: true,
+		},
+		{
+			name: "only_email_changed",
+			req: dto.UpdateTenantRequest{
+				BillingDetails: &dto.UpdateTenantBillingDetails{Email: lo.ToPtr("new@acme.io")},
+			},
+		},
+		{
+			name: "nothing_changed",
+			req:  dto.UpdateTenantRequest{Name: lo.ToPtr("Acme")},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hook := &recordingHook{}
+			tenants := testutil.NewInMemoryTenantStore()
+			require.NoError(t, tenants.Create(context.Background(), &tenant.Tenant{
+				ID:     "tenant_1",
+				Name:   "Acme",
+				Status: types.StatusPublished,
+				BillingDetails: tenant.TenantBillingDetails{
+					Address: tenant.TenantAddress{City: "Mumbai", Country: "IN"},
+				},
+			}))
+
+			svc := NewTenantService(ServiceParams{
+				Logger:      logger.NewNoopLogger(),
+				Config:      &config.Configuration{},
+				TenantRepo:  tenants,
+				SelfBilling: hook,
+			})
+
+			_, err := svc.UpdateTenant(context.Background(), "tenant_1", tt.req)
+			require.NoError(t, err)
+
+			if tt.wantNotify {
+				assert.Equal(t, []string{"tenant_1"}, hook.updated)
+			} else {
+				assert.Empty(t, hook.updated)
 			}
 		})
 	}

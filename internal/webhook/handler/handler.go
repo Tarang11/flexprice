@@ -12,10 +12,12 @@ import (
 	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/httpclient"
 	"github.com/flexprice/flexprice/internal/logger"
+	"github.com/flexprice/flexprice/internal/metrics"
 	"github.com/flexprice/flexprice/internal/pubsub"
 	pubsubRouter "github.com/flexprice/flexprice/internal/pubsub/router"
 	repoent "github.com/flexprice/flexprice/internal/repository/ent"
 	"github.com/flexprice/flexprice/internal/svix"
+	"github.com/flexprice/flexprice/internal/telemetry"
 	"github.com/flexprice/flexprice/internal/tracing"
 	"github.com/flexprice/flexprice/internal/types"
 	"github.com/flexprice/flexprice/internal/webhook/payload"
@@ -42,6 +44,7 @@ type handler struct {
 	svixClient      *svix.Client
 	systemEventRepo *repoent.SystemEventRepository
 	cascader        EventCascader
+	telemetry       *telemetry.Reporter
 }
 
 // NewHandler creates a new memory-based handler
@@ -55,6 +58,7 @@ func NewHandler(
 	svixClient *svix.Client,
 	systemEventRepo *repoent.SystemEventRepository,
 	cascader EventCascader,
+	telemetryReporter *telemetry.Reporter,
 ) (Handler, error) {
 	return &handler{
 		pubSub:          pubSub,
@@ -67,6 +71,7 @@ func NewHandler(
 		svixClient:      svixClient,
 		systemEventRepo: systemEventRepo,
 		cascader:        cascader,
+		telemetry:       telemetryReporter,
 	}, nil
 }
 
@@ -153,6 +158,24 @@ func webhookMissingDataError(err error) bool {
 	return ierr.IsNotFound(err) || ent.IsNotFound(err)
 }
 
+// recordDelivery counts one delivery of an event the tenant is subscribed to.
+func recordDelivery(ctx context.Context, transport string, eventName types.WebhookEventName, err error) {
+	// Svix only acknowledges receipt; a native 2xx means the customer endpoint accepted it.
+	outcome := lo.Ternary(transport == "svix", "enqueued", "delivered")
+	switch {
+	case webhookMissingDataError(err):
+		outcome = "skipped"
+	case err != nil:
+		outcome = "error"
+	}
+
+	metrics.RecordCounter(ctx, metrics.WebhookDeliveries, 1,
+		metrics.L(metrics.KeyTransport, transport),
+		metrics.L(metrics.KeyEventType, string(eventName)),
+		metrics.L(metrics.KeyOutcome, outcome),
+	)
+}
+
 // absorbDeliveryError logs delivery failures for the Kafka consumer path and always acks.
 // It also persists the failure reason on the system_events row so it is never silently dropped.
 func (h *handler) absorbDeliveryError(ctx context.Context, transport string, err error, event *types.WebhookEvent, messageUUID string) {
@@ -234,11 +257,16 @@ func (h *handler) processMessage(ctx context.Context, msg *message.Message) erro
 	if h.cascader != nil && h.config.EventCascadingEnabled {
 		h.cascader.Cascade(ctx, &event)
 	}
+
+	if h.telemetry != nil {
+		h.telemetry.ReportEvent(ctx, &event)
+	}
+
 	return nil
 }
 
 // deliverSvix sends a webhook via Svix.
-func (h *handler) deliverSvix(ctx context.Context, event *types.WebhookEvent, eventID string) error {
+func (h *handler) deliverSvix(ctx context.Context, event *types.WebhookEvent, eventID string) (err error) {
 	appID, err := h.svixClient.GetOrCreateApplication(ctx, event.TenantID, event.EnvironmentID)
 	if err != nil {
 		if err.Error() == "application not found" {
@@ -275,6 +303,7 @@ func (h *handler) deliverSvix(ctx context.Context, event *types.WebhookEvent, ev
 		}
 		return nil
 	}
+	defer func() { recordDelivery(ctx, "svix", event.EventName, err) }()
 
 	builder, err := h.factory.GetBuilder(event.EventName)
 	if err != nil {
@@ -321,7 +350,7 @@ func (h *handler) deliverSvix(ctx context.Context, event *types.WebhookEvent, ev
 }
 
 // deliverNative sends a webhook to the configured HTTP endpoint.
-func (h *handler) deliverNative(ctx context.Context, event *types.WebhookEvent, eventID string) error {
+func (h *handler) deliverNative(ctx context.Context, event *types.WebhookEvent, eventID string) (err error) {
 	tenantCfg, ok := h.config.TenantConfig(event.TenantID)
 	if !ok {
 		return ierr.NewError("native webhook is not configured for this tenant").
@@ -340,6 +369,7 @@ func (h *handler) deliverNative(ctx context.Context, event *types.WebhookEvent, 
 				Mark(ierr.ErrInvalidOperation)
 		}
 	}
+	defer func() { recordDelivery(ctx, "native", event.EventName, err) }()
 
 	builder, err := h.factory.GetBuilder(event.EventName)
 	if err != nil {

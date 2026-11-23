@@ -7,6 +7,8 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"github.com/flexprice/flexprice/internal/metrics/metricstest"
+	"github.com/stretchr/testify/require"
 	"testing"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 	transactionModel "github.com/chargebee/chargebee-go/v3/models/transaction"
 	transactionEnum "github.com/chargebee/chargebee-go/v3/models/transaction/enum"
 	"github.com/flexprice/flexprice/internal/api/dto"
+	"github.com/flexprice/flexprice/internal/domain/connection"
 	"github.com/flexprice/flexprice/internal/domain/entityintegrationmapping"
 	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/integration/chargebee"
@@ -107,6 +110,10 @@ type refundClient struct {
 	refundErr      error
 }
 
+func (c *refundClient) GetConnection(_ context.Context) (*connection.Connection, error) {
+	return &connection.Connection{ID: "conn_test", ProviderType: types.SecretProviderChargebee}, nil
+}
+
 func (c *refundClient) RetrieveTransaction(_ context.Context, _ string) (*transactionModel.Transaction, error) {
 	txn := &transactionModel.Transaction{Id: testChargebeeTxnID, Amount: c.amount}
 	if c.amountRefunded > 0 {
@@ -136,7 +143,7 @@ type fakePaymentService struct {
 	updateReqs []dto.UpdatePaymentRequest
 }
 
-func (s *fakePaymentService) GetPayment(_ context.Context, _ string) (*dto.PaymentResponse, error) {
+func (s *fakePaymentService) GetPayment(_ context.Context, _ dto.GetPaymentRequest) (*dto.PaymentResponse, error) {
 	if s.getErr != nil {
 		return nil, s.getErr
 	}
@@ -183,8 +190,10 @@ func (s *ChargebeeWebhookCheckoutSuite) SetupTest() {
 
 	log := logger.NewNoopLogger()
 
+	s.client = &refundClient{amount: 10000}
 	invoiceSvc := &chargebee.InvoiceService{
 		InvoiceServiceParams: chargebee.InvoiceServiceParams{
+			Client: s.client,
 			EntityIntegrationMappingRepo: mappingStore{
 				entityIDByProviderEntityID: map[string]string{
 					testChargebeeInvoiceID: testFlexpriceInvoiceID,
@@ -194,7 +203,6 @@ func (s *ChargebeeWebhookCheckoutSuite) SetupTest() {
 		},
 	}
 
-	s.client = &refundClient{amount: 10000}
 	s.handler = NewHandler(s.client, invoiceSvc, chargebee.NewPaymentService(s.client, grantingLocker{}, log), log)
 	s.checkoutSvc = &fakeCheckoutSessionService{}
 	s.paymentSvc = &fakePaymentService{payment: &dto.PaymentResponse{
@@ -248,6 +256,17 @@ func (s *ChargebeeWebhookCheckoutSuite) TestPaymentSucceeded_PendingSessionIsCom
 
 	s.Require().NoError(err)
 	s.True(handled, "a checkout payment must not fall through to invoice reconciliation")
+	s.Equal([]string{session.ID}, s.checkoutSvc.completeCalls)
+}
+
+// Chargebee can webhook before the create call returns, while the session is still initiated.
+func (s *ChargebeeWebhookCheckoutSuite) TestPaymentSucceeded_InitiatedSessionIsCompleted() {
+	session := s.seedSession(types.CheckoutStatusInitiated)
+
+	handled, err := s.handler.handleCheckoutSessionForPayment(s.ctx, testFlexpricePaymentID, testFlexpriceInvoiceID, testChargebeeInvoiceID, testChargebeeTxnID, s.services)
+
+	s.Require().NoError(err)
+	s.True(handled)
 	s.Equal([]string{session.ID}, s.checkoutSvc.completeCalls)
 }
 
@@ -454,4 +473,13 @@ func (s *ChargebeeWebhookCheckoutSuite) TestPaymentSucceeded_SessionWinsOverLink
 	s.Equal([]string{session.ID}, s.checkoutSvc.completeCalls)
 	s.Empty(s.paymentSvc.updateReqs, "the session owns settlement")
 	s.Empty(invoiceSvc.reconciled)
+}
+
+func TestHandleWebhookEvent_UnhandledTypeCountedAsOther(t *testing.T) {
+	r := metricstest.Install(t)
+	h := NewHandler(nil, nil, nil, logger.NewNoopLogger())
+
+	require.NoError(t, h.HandleWebhookEvent(types.SetEnvironmentID(types.SetTenantID(context.Background(), "ten_gw_cb"), "env_gw"), &ChargebeeWebhookEvent{EventType: "attacker_chosen"}, "env_gw", nil))
+
+	require.Equal(t, int64(1), r.Sum("gateway.webhooks", map[string]string{"tenant_id": "ten_gw_cb", "provider": "chargebee", "event_type": "other", "outcome": "ignored"}))
 }

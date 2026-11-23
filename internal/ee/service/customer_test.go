@@ -3,9 +3,12 @@ package service
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/flexprice/flexprice/internal/api/dto"
+	"github.com/flexprice/flexprice/internal/domain/connection"
 	domainCustomer "github.com/flexprice/flexprice/internal/domain/customer"
 	"github.com/flexprice/flexprice/internal/domain/subscription"
 	"github.com/flexprice/flexprice/internal/domain/wallet"
@@ -13,6 +16,7 @@ import (
 	"github.com/flexprice/flexprice/internal/testutil"
 	"github.com/flexprice/flexprice/internal/types"
 	"github.com/samber/lo"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -30,32 +34,35 @@ func (s *CustomerServiceSuite) SetupTest() {
 	s.BaseServiceTestSuite.SetupTest()
 	s.ctx = context.Background()
 	s.service = NewCustomerService(ServiceParams{
-		Logger:             s.GetLogger(),
-		Config:             s.GetConfig(),
-		DB:                 s.GetDB(),
-		SubRepo:            s.GetStores().SubscriptionRepo,
-		PlanRepo:           s.GetStores().PlanRepo,
-		PriceRepo:          s.GetStores().PriceRepo,
-		EventRepo:          s.GetStores().EventRepo,
-		MeterRepo:          s.GetStores().MeterRepo,
-		CustomerRepo:       s.GetStores().CustomerRepo,
-		InvoiceRepo:        s.GetStores().InvoiceRepo,
-		EntitlementRepo:    s.GetStores().EntitlementRepo,
-		EnvironmentRepo:    s.GetStores().EnvironmentRepo,
-		FeatureRepo:        s.GetStores().FeatureRepo,
-		TenantRepo:         s.GetStores().TenantRepo,
-		UserRepo:           s.GetStores().UserRepo,
-		AuthRepo:           s.GetStores().AuthRepo,
-		WalletRepo:         s.GetStores().WalletRepo,
-		PaymentRepo:        s.GetStores().PaymentRepo,
-		EventPublisher:     s.GetPublisher(),
-		WebhookPublisher:   s.GetWebhookPublisher(),
-		TaxRateRepo:        s.GetStores().TaxRateRepo,
-		TaxAppliedRepo:     s.GetStores().TaxAppliedRepo,
-		TaxAssociationRepo: s.GetStores().TaxAssociationRepo,
-		ConnectionRepo:     s.GetStores().ConnectionRepo,
-		AlertLogsRepo:      s.GetStores().AlertLogsRepo,
-		SettingsRepo:       s.GetStores().SettingsRepo,
+		Logger:              s.GetLogger(),
+		Config:              s.GetConfig(),
+		DB:                  s.GetDB(),
+		SubRepo:             s.GetStores().SubscriptionRepo,
+		PlanRepo:            s.GetStores().PlanRepo,
+		PriceRepo:           s.GetStores().PriceRepo,
+		EventRepo:           s.GetStores().EventRepo,
+		MeterRepo:           s.GetStores().MeterRepo,
+		CustomerRepo:        s.GetStores().CustomerRepo,
+		InvoiceRepo:         s.GetStores().InvoiceRepo,
+		EntitlementRepo:     s.GetStores().EntitlementRepo,
+		EnvironmentRepo:     s.GetStores().EnvironmentRepo,
+		FeatureRepo:         s.GetStores().FeatureRepo,
+		TenantRepo:          s.GetStores().TenantRepo,
+		UserRepo:            s.GetStores().UserRepo,
+		AuthRepo:            s.GetStores().AuthRepo,
+		WalletRepo:          s.GetStores().WalletRepo,
+		PaymentRepo:         s.GetStores().PaymentRepo,
+		EventPublisher:      s.GetPublisher(),
+		WebhookPublisher:    s.GetWebhookPublisher(),
+		TaxRateRepo:         s.GetStores().TaxRateRepo,
+		TaxAppliedRepo:      s.GetStores().TaxAppliedRepo,
+		TaxAssociationRepo:  s.GetStores().TaxAssociationRepo,
+		ConnectionRepo:      s.GetStores().ConnectionRepo,
+		AlertLogsRepo:       s.GetStores().AlertLogsRepo,
+		SettingsRepo:        s.GetStores().SettingsRepo,
+		FXRateRepo:          s.GetStores().FXRateRepo,
+		CheckoutSessionRepo: s.GetStores().CheckoutSessionRepo,
+		IntegrationFactory:  s.GetIntegrationFactory(),
 	})
 
 }
@@ -380,6 +387,9 @@ func (s *CustomerServiceSuite) TestUpdateCustomer() {
 		setup         func()
 		expectedError bool
 		errorCode     ierr.ErrorCode
+		wantPersons   int
+		wantGrace     *int
+		wantNoSetting bool
 	}{
 		{
 			name: "valid_update",
@@ -409,6 +419,94 @@ func (s *CustomerServiceSuite) TestUpdateCustomer() {
 			},
 			expectedError: true,
 			errorCode:     ierr.ErrCodeValidation,
+		},
+		{
+			name: "contact_persons_replaced",
+			id:   "cust-1",
+			request: dto.UpdateCustomerRequest{
+				ContactPersons: []*domainCustomer.ContactPerson{
+					{IsPrimary: true, FirstName: "Ravi", Email: "ravi@example.com"},
+					{FirstName: "Fin", Email: "fin@example.com"},
+				},
+			},
+			wantPersons: 2,
+		},
+		{
+			name:        "contact_persons_kept_when_omitted",
+			id:          "cust-1",
+			request:     dto.UpdateCustomerRequest{Name: lo.ToPtr("Renamed")},
+			wantPersons: 2,
+		},
+		{
+			name: "contact_persons_two_primaries",
+			id:   "cust-1",
+			request: dto.UpdateCustomerRequest{
+				ContactPersons: []*domainCustomer.ContactPerson{
+					{IsPrimary: true, FirstName: "A"},
+					{IsPrimary: true, FirstName: "B"},
+				},
+			},
+			expectedError: true,
+			errorCode:     ierr.ErrCodeValidation,
+		},
+		{
+			name:          "contact_persons_missing_first_name",
+			id:            "cust-1",
+			request:       dto.UpdateCustomerRequest{ContactPersons: []*domainCustomer.ContactPerson{{Email: "x@example.com"}}},
+			expectedError: true,
+			errorCode:     ierr.ErrCodeValidation,
+		},
+		{
+			name:          "contact_persons_null_entry",
+			id:            "cust-1",
+			request:       dto.UpdateCustomerRequest{ContactPersons: []*domainCustomer.ContactPerson{nil}},
+			expectedError: true,
+			errorCode:     ierr.ErrCodeValidation,
+		},
+		{
+			name: "settings_set",
+			id:   "cust-1",
+			request: dto.UpdateCustomerRequest{
+				Settings: &types.SettingsOverride{SubscriptionConfig: &types.SubscriptionConfigOverride{GracePeriodDays: lo.ToPtr(10)}},
+			},
+			wantGrace: lo.ToPtr(10),
+		},
+		{
+			name:      "settings_kept_when_omitted",
+			id:        "cust-1",
+			request:   dto.UpdateCustomerRequest{Name: lo.ToPtr("Renamed")},
+			wantGrace: lo.ToPtr(10),
+		},
+		{
+			name: "settings_invalid_grace",
+			id:   "cust-1",
+			request: dto.UpdateCustomerRequest{
+				Settings: &types.SettingsOverride{SubscriptionConfig: &types.SubscriptionConfigOverride{GracePeriodDays: lo.ToPtr(-1)}},
+			},
+			expectedError: true,
+			errorCode:     ierr.ErrCodeValidation,
+		},
+		{
+			name: "settings_zero_grace",
+			id:   "cust-1",
+			request: dto.UpdateCustomerRequest{
+				Settings: &types.SettingsOverride{SubscriptionConfig: &types.SubscriptionConfigOverride{GracePeriodDays: lo.ToPtr(0)}},
+			},
+			wantGrace: lo.ToPtr(0),
+		},
+		{
+			name: "settings_merged",
+			id:   "cust-1",
+			request: dto.UpdateCustomerRequest{
+				Settings: &types.SettingsOverride{SubscriptionConfig: &types.SubscriptionConfigOverride{AutoCancellationEnabled: lo.ToPtr(false)}},
+			},
+			wantGrace: lo.ToPtr(0),
+		},
+		{
+			name:          "settings_cleared",
+			id:            "cust-1",
+			request:       dto.UpdateCustomerRequest{Settings: &types.SettingsOverride{}},
+			wantNoSetting: true,
 		},
 		{
 			name: "customer_not_found",
@@ -444,6 +542,18 @@ func (s *CustomerServiceSuite) TestUpdateCustomer() {
 				}
 				if tc.request.AddressCity != nil {
 					s.Equal(*tc.request.AddressCity, resp.Customer.AddressCity)
+				}
+				if tc.wantGrace != nil {
+					s.Equal(*tc.wantGrace, *resp.Customer.Settings.SubscriptionConfig.GracePeriodDays)
+				}
+				if tc.wantNoSetting {
+					s.Nil(resp.Customer.Settings)
+				}
+				if tc.wantPersons > 0 {
+					s.Len(resp.Customer.ContactPersons, tc.wantPersons)
+					for _, p := range resp.Customer.ContactPersons {
+						s.True(strings.HasPrefix(p.ID, types.UUID_PREFIX_CONTACT_PERSON+"_"), p.ID)
+					}
 				}
 			}
 		})
@@ -732,6 +842,146 @@ func (s *CustomerServiceSuite) TestGetCustomerByLookupKey() {
 				s.Equal(customer.AddressCountry, resp.Customer.AddressCountry)
 				s.Equal(customer.Metadata["source"], resp.Customer.Metadata["source"])
 			}
+		})
+	}
+}
+
+// A linked customer whose tenant does not push customers to Stripe still updates normally.
+func (s *CustomerServiceSuite) TestUpdateCustomer_StripePushIsSkippedWithoutOutboundSync() {
+	tests := []struct {
+		name       string
+		connection *types.SyncConfig
+		connected  bool
+	}{
+		{
+			name: "no Stripe connection",
+		},
+		{
+			name:      "customer outbound sync off",
+			connected: true,
+			connection: &types.SyncConfig{
+				Customer: &types.EntitySyncConfig{Outbound: false},
+			},
+		},
+	}
+
+	for i, tt := range tests {
+		s.Run(tt.name, func() {
+			s.SetupTest()
+
+			if tt.connected {
+				conn := &connection.Connection{
+					ID:            "conn_stripe",
+					Name:          "stripe",
+					ProviderType:  types.SecretProviderStripe,
+					SyncConfig:    tt.connection,
+					EnvironmentID: types.GetEnvironmentID(s.ctx),
+					BaseModel:     types.GetDefaultBaseModel(s.ctx),
+				}
+				conn.Status = types.StatusPublished
+				s.NoError(s.GetStores().ConnectionRepo.Create(s.ctx, conn))
+			}
+
+			customerID := fmt.Sprintf("cust_stripe_push_%d", i)
+			s.NoError(s.GetStores().CustomerRepo.Create(s.ctx, &domainCustomer.Customer{
+				ID:        customerID,
+				Name:      "Acme",
+				Email:     "billing@acme.test",
+				Metadata:  map[string]string{"stripe_customer_id": "cus_linked"},
+				BaseModel: types.GetDefaultBaseModel(s.ctx),
+			}))
+
+			resp, err := s.service.UpdateCustomer(s.ctx, customerID, dto.UpdateCustomerRequest{
+				AddressCountry:    lo.ToPtr("US"),
+				AddressPostalCode: lo.ToPtr("78701"),
+			})
+
+			s.NoError(err)
+			s.Equal("US", resp.Customer.AddressCountry)
+			s.Equal("78701", resp.Customer.AddressPostalCode)
+		})
+	}
+}
+
+func TestStripeFieldsChanged(t *testing.T) {
+	base := domainCustomer.Customer{
+		Name:              "Acme",
+		Email:             "billing@acme.test",
+		AddressLine1:      "1 Main St",
+		AddressCountry:    "US",
+		AddressPostalCode: "78701",
+		Timezone:          "UTC",
+	}
+
+	tests := []struct {
+		name   string
+		change func(c *domainCustomer.Customer)
+		want   bool
+	}{
+		{
+			name:   "nothing changed",
+			change: func(c *domainCustomer.Customer) {},
+			want:   false,
+		},
+		{
+			name:   "only metadata changed, as when the Stripe link itself is saved",
+			change: func(c *domainCustomer.Customer) { c.Metadata = map[string]string{"stripe_customer_id": "cus_1"} },
+			want:   false,
+		},
+		{
+			name:   "a field Stripe does not mirror changed",
+			change: func(c *domainCustomer.Customer) { c.Timezone = "Asia/Kolkata" },
+			want:   false,
+		},
+		{
+			name:   "name",
+			change: func(c *domainCustomer.Customer) { c.Name = "Acme Inc" },
+			want:   true,
+		},
+		{
+			name:   "email",
+			change: func(c *domainCustomer.Customer) { c.Email = "ap@acme.test" },
+			want:   true,
+		},
+		{
+			name:   "line 1",
+			change: func(c *domainCustomer.Customer) { c.AddressLine1 = "2 Main St" },
+			want:   true,
+		},
+		{
+			name:   "line 2",
+			change: func(c *domainCustomer.Customer) { c.AddressLine2 = "Suite 2" },
+			want:   true,
+		},
+		{
+			name:   "city",
+			change: func(c *domainCustomer.Customer) { c.AddressCity = "Austin" },
+			want:   true,
+		},
+		{
+			name:   "state",
+			change: func(c *domainCustomer.Customer) { c.AddressState = "TX" },
+			want:   true,
+		},
+		{
+			name:   "postal code",
+			change: func(c *domainCustomer.Customer) { c.AddressPostalCode = "78702" },
+			want:   true,
+		},
+		{
+			name:   "country",
+			change: func(c *domainCustomer.Customer) { c.AddressCountry = "CA" },
+			want:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			before := base
+			after := base
+			tt.change(&after)
+
+			assert.Equal(t, tt.want, stripeFieldsChanged(&before, &after))
 		})
 	}
 }

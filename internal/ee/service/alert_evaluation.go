@@ -5,15 +5,18 @@ import (
 	"errors"
 	"time"
 
+	"github.com/flexprice/flexprice/internal/clock"
+
+	"github.com/samber/lo"
+	"github.com/shopspring/decimal"
+
 	"github.com/flexprice/flexprice/internal/api/dto"
 	domainAlert "github.com/flexprice/flexprice/internal/domain/alert"
 	"github.com/flexprice/flexprice/internal/domain/customer"
 	"github.com/flexprice/flexprice/internal/domain/entitlementgrant"
-	"github.com/flexprice/flexprice/internal/domain/meter"
 	"github.com/flexprice/flexprice/internal/domain/subscription"
+	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/types"
-	"github.com/samber/lo"
-	"github.com/shopspring/decimal"
 )
 
 // EvaluateSpendAlertsForCustomer evaluates subscription-level spend alerts for
@@ -67,7 +70,7 @@ func (s *alertService) evaluateSpendAlertsForSubscriptions(ctx context.Context, 
 	subscriptionSvc := NewSubscriptionService(s.ServiceParams)
 	billingSvc := NewBillingService(s.ServiceParams)
 	alertLogsSvc := NewAlertLogsService(s.ServiceParams)
-	now := time.Now().UTC()
+	now := clock.Now()
 
 	for _, cfg := range subCfgs {
 		sub, ok := subsByID[cfg.EntityID]
@@ -91,6 +94,7 @@ func (s *alertService) evaluateSpendAlertsForSubscriptions(ctx context.Context, 
 
 		_, totalUsageCost, err := billingSvc.CalculateMeterUsageCharges(
 			ctx, sub, usage, sub.CurrentPeriodStart, now, types.UsageSourceInvoiceCreation,
+			nil,
 		)
 		if err != nil {
 			s.Logger.Error(ctx, "spend alerts: failed to calculate meter usage charges", "error", err, "subscription_id", sub.ID)
@@ -183,7 +187,7 @@ func (s *alertService) EvaluateSpendAndEntitlementAlertsForCustomer(
 	if cust == nil {
 		return nil
 	}
-	at := time.Now().UTC()
+	at := clock.Now()
 
 	subs, err := s.listActiveSubscriptions(ctx, cust.ID)
 	if err != nil {
@@ -203,14 +207,7 @@ func (s *alertService) EvaluateSpendAndEntitlementAlertsForCustomer(
 
 	var grantErr error
 	if withEntitlementAlerts {
-		grantSvc := NewEntitlementGrantService(s.ServiceParams)
-		grants, meta, err := grantSvc.EnsureGrantsForSubscriptions(ctx, cust, subs, at)
-		if err != nil {
-			s.Logger.Error(ctx, "fused evaluator: entitlement grants returned error", "error", err, "customer_id", cust.ID)
-			return errors.Join(spendErr, err)
-		}
-
-		grantErr = s.evaluateEntitlementGrantsForCustomer(ctx, cust, meta, grants, at)
+		grantErr = s.EvaluateAndAlertEntitlementGrants(ctx, cust, subs, at)
 		if grantErr != nil {
 			s.Logger.Error(ctx, "fused evaluator: grant evaluation returned error", "error", grantErr, "customer_id", cust.ID)
 		}
@@ -219,74 +216,24 @@ func (s *alertService) EvaluateSpendAndEntitlementAlertsForCustomer(
 	return errors.Join(spendErr, grantErr)
 }
 
-func (s *alertService) RefreshEntitlementGrantsForCustomer(ctx context.Context, customerID string) error {
-	cust, err := s.CustomerRepo.Get(ctx, customerID)
-	if err != nil {
-		return err
-	}
-	subs, err := s.listActiveSubscriptions(ctx, cust.ID)
-	if err != nil {
-		return err
-	}
-	if len(subs) == 0 {
+// EvaluateAndAlertEntitlementGrants opens the subscriptions' missing grant windows in each one's
+// current period, then measures, alerts on and snapshots each open or unfinalized window. Alert-log
+// dedup makes it safe under Temporal retries. Per-grant failures never block the remaining grants;
+// they join into the returned error.
+func (s *alertService) EvaluateAndAlertEntitlementGrants(ctx context.Context, cust *customer.Customer, subs []*subscription.Subscription, at time.Time) error {
+	if s.EntitlementGrantRepo == nil || cust == nil || len(subs) == 0 {
 		return nil
 	}
-	at := time.Now().UTC()
 	grantSvc := NewEntitlementGrantService(s.ServiceParams)
 	grants, meta, err := grantSvc.EnsureGrantsForSubscriptions(ctx, cust, subs, at)
-	if err != nil {
+	if err != nil || meta == nil {
 		return err
-	}
-	return s.evaluateEntitlementGrantsForCustomer(ctx, cust, meta, grants, at)
-}
-
-// evaluateEntitlementGrantsForCustomer refreshes usage and fires alerts for
-// each returned grant (open windows plus closed ones getting their final
-// refresh). Alert-log dedup makes it safe under Temporal retries. meta is the
-// lookup bundle built during EnsureGrantsForSubscriptions; grants whose
-// subscription is not in it (e.g. cancelled mid-window) are skipped.
-// Per-grant failures never block the remaining grants; they join into the
-// returned error so the Temporal retry decision sees them.
-func (s *alertService) evaluateEntitlementGrantsForCustomer(
-	ctx context.Context,
-	cust *customer.Customer,
-	meta *grantEvalMeta,
-	grants []*entitlementgrant.EntitlementGrant,
-	at time.Time,
-) error {
-	if len(grants) == 0 || meta == nil {
-		return nil
-	}
-
-	featureGrants := make([]*entitlementgrant.EntitlementGrant, 0, len(grants))
-	for _, g := range grants {
-		if g.IsFeatureScoped() {
-			featureGrants = append(featureGrants, g)
-			continue
-		}
-		s.Logger.Debug(ctx, "entitlement grant evaluation: skipping non-feature scope",
-			"grant_id", g.ID,
-			"scope_entity_type", g.ScopeEntityType,
-		)
-	}
-	if len(featureGrants) == 0 {
-		return nil
 	}
 
 	alertLogsSvc := NewAlertLogsService(s.ServiceParams)
-
 	var errs []error
-	for _, g := range featureGrants {
-		f, ok := meta.featureByID[g.ScopeEntityID]
-		if !ok || f.MeterID == "" {
-			s.Logger.Debug(ctx, "entitlement grant evaluation: feature or meter missing", "grant_id", g.ID)
-			continue
-		}
-		m, ok := meta.meterByID[f.MeterID]
-		if !ok {
-			s.Logger.Debug(ctx, "entitlement grant evaluation: meter missing", "grant_id", g.ID, "meter_id", f.MeterID)
-			continue
-		}
+	for _, g := range grants {
+		// Grants of subscriptions not passed in (e.g. cancelled mid-window) are skipped.
 		sub, ok := meta.subsByID[g.SubscriptionID]
 		if !ok {
 			s.Logger.Debug(ctx, "entitlement grant evaluation: subscription missing", "grant_id", g.ID)
@@ -303,15 +250,11 @@ func (s *alertService) evaluateEntitlementGrantsForCustomer(
 			continue
 		}
 
-		extIDs, err := meta.externalIDs(ctx, sub)
-		if err != nil {
-			s.Logger.Error(ctx, "entitlement grant evaluation: external customer id lookup failed",
-				"grant_id", g.ID, "subscription_id", sub.ID, "error", err)
-			errs = append(errs, err)
+		usage, err := grantSvc.MeasureEntitlementGrantUsage(ctx, meta, sub, g, at)
+		if ierr.IsNotFound(err) {
+			s.Logger.Debug(ctx, "entitlement grant evaluation: feature or meter missing", "grant_id", g.ID)
 			continue
 		}
-
-		usage, err := s.refreshEntitlementGrantUsage(ctx, g, m, sub, extIDs, at)
 		if err != nil {
 			s.Logger.Error(ctx, "entitlement grant evaluation: usage refresh failed",
 				"grant_id", g.ID, "error", err)
@@ -319,96 +262,19 @@ func (s *alertService) evaluateEntitlementGrantsForCustomer(
 			continue
 		}
 
+		// An alert failure must not block billing; the next evaluation retries the transition.
 		if err := s.transitionEntitlementGrantAlert(ctx, alertLogsSvc, cust, g, usage, at); err != nil {
 			s.Logger.Error(ctx, "entitlement grant evaluation: alert transition failed",
 				"grant_id", g.ID, "error", err)
-			errs = append(errs, err)
 		}
 
-		// Record the quota exhaustion timestamp, once per grant.
-		// NOTE: this is the EVALUATION time, not the exact crossing time.
-		// finding that exactly needs extra ClickHouse queries (binary search on the
-		// running usage). Billing only charges usage AFTER this timestamp, so
-		// overage accrued before detection is never billed: pro-customer,
-		// bounded by the debounce delay. If exactness is ever needed, the
-		// upgrade path is the binary-searched crossing (see ERD decisions).
-		cross := g.QuotaCrossedAt
-		if cross == nil && usage.GreaterThanOrEqual(g.Quota) {
-			cross = &at
-		}
-
-		// Snapshot the refreshed state; last_computed_at >= valid_to marks a
-		// closed window as finalized so it never re-enters the refresh set.
-		builder := entitlementgrant.NewEntitlementGrantBuilder(g).
-			WithUsage(usage).
-			WithLastComputedAt(&at).
-			WithQuotaCrossedAt(cross)
-		if usage.GreaterThanOrEqual(g.Quota) && g.GrantStatus == types.EntitlementGrantStatusActive {
-			builder = builder.WithGrantStatus(types.EntitlementGrantStatusExhausted)
-		}
-		if err := s.EntitlementGrantRepo.UpdateSnapshot(ctx, builder.Build()); err != nil {
+		if err := s.EntitlementGrantRepo.UpdateSnapshot(ctx, grantUsageSnapshot(g, usage, at)); err != nil {
 			s.Logger.Error(ctx, "entitlement grant evaluation: snapshot write failed",
 				"grant_id", g.ID, "error", err)
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
-}
-
-// refreshEntitlementGrantUsage refreshes the grant's consumed usage over
-// [valid_from, min(at, valid_to)).
-//
-//   - quantity measure: one raw meter-usage query over the window.
-//   - amount measure: rides the billing path (GetSubscriptionMeterUsageWithSub +
-//     ConvertToBillingCharges), which splits the window into per-line-item date
-//     ranges — a mid-window price change produces a new line-item segment, so
-//     each segment is priced at its own price. No price pinning required.
-func (s *alertService) refreshEntitlementGrantUsage(
-	ctx context.Context,
-	g *entitlementgrant.EntitlementGrant,
-	m *meter.Meter,
-	sub *subscription.Subscription,
-	extCustomerIDs []string,
-	at time.Time,
-) (decimal.Decimal, error) {
-	end := at
-	if end.After(g.ValidTo) {
-		end = g.ValidTo
-	}
-	if !end.After(g.ValidFrom) {
-		return decimal.Zero, nil
-	}
-
-	meterUsageSvc := NewMeterUsageService(s.ServiceParams)
-	if g.Measure == types.EntitlementGrantMeasureQuantity {
-		usage, err := meterUsageSvc.GetUsageTotal(ctx, &dto.UsageTotalRequest{
-			TenantID:            g.TenantID,
-			EnvironmentID:       g.EnvironmentID,
-			ExternalCustomerIDs: extCustomerIDs,
-			MeterID:             m.ID,
-			AggregationType:     m.Aggregation.Type,
-			StartTime:           g.ValidFrom,
-			EndTime:             end,
-		})
-		if err != nil {
-			return decimal.Zero, err
-		}
-
-		s.Logger.Debug(ctx, "quantity measure: entitlement grant evaluation: usage refreshed",
-			"grant_id", g.ID, "usage", usage,
-		)
-		return usage, nil
-	}
-
-	total, err := meterUsageSvc.GetMeterWindowCost(ctx, sub, m.ID, g.ValidFrom, end)
-	if err != nil {
-		return decimal.Zero, err
-	}
-
-	s.Logger.Debug(ctx, "amount measure: entitlement grant evaluation: usage refreshed",
-		"grant_id", g.ID, "usage", total,
-	)
-	return total, nil
 }
 
 // transitionEntitlementGrantAlert emits an alert-log row on state change.
@@ -420,13 +286,18 @@ func (s *alertService) transitionEntitlementGrantAlert(
 	usage decimal.Decimal,
 	at time.Time,
 ) error {
-	if !g.Quota.IsPositive() {
-		return nil
+	status := types.AlertStateInAlarm
+	if !g.IsExhausted(usage) {
+		if !g.ValidTo.After(at) {
+			return nil
+		}
+		status = types.AlertStateOk
 	}
-	ratio := usage.Div(g.Quota)
-	if ratio.LessThan(decimal.NewFromInt(1)) {
-		// not exhausted yet, AlertStateOk
-		return nil
+
+	// Zero quota is spent by definition, and dividing by it would panic.
+	ratio := decimal.NewFromInt(1)
+	if g.Quota.IsPositive() {
+		ratio = usage.Div(g.Quota)
 	}
 
 	parentEntityType := string(types.AlertEntityTypeSubscription)
@@ -438,7 +309,7 @@ func (s *alertService) transitionEntitlementGrantAlert(
 		ParentEntityID:   &g.SubscriptionID,
 		CustomerID:       &custID,
 		AlertType:        types.AlertTypeEntitlementGrantExhausted,
-		AlertStatus:      types.AlertStateInAlarm,
+		AlertStatus:      status,
 		AlertInfo: types.AlertInfo{
 			ValueAtTime: ratio,
 			Timestamp:   at,

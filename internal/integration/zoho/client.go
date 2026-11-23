@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/flexprice/flexprice/internal/clock"
+
 	"github.com/flexprice/flexprice/internal/domain/connection"
 	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/httpclient"
@@ -21,10 +23,13 @@ import (
 
 type ZohoClient interface {
 	HasZohoBooksConnection(ctx context.Context) bool
+	GetConnection(ctx context.Context) (*connection.Connection, error)
 	QueryContactByEmail(ctx context.Context, email string) (*ContactResponse, error)
 	CreateContact(ctx context.Context, req *ContactCreateRequest) (*ContactResponse, error)
 	UpdateContact(ctx context.Context, contactID string, req *ContactUpdateRequest) (*ContactResponse, error)
+	GetContact(ctx context.Context, contactID string) (*ContactResponse, error)
 	CreateInvoice(ctx context.Context, req *InvoiceCreateRequest) (*InvoiceResponse, error)
+	UpdateInvoice(ctx context.Context, zohoInvoiceID string, req *InvoiceCreateRequest) (*InvoiceResponse, error)
 	// GetInvoice fetches a Zoho Books invoice by ID (used to read the live balance/customer_id before mark-paid).
 	GetInvoice(ctx context.Context, zohoInvoiceID string) (*InvoiceResponse, error)
 	// CreateCustomerPayment records a payment against one or more Zoho Books invoices.
@@ -62,7 +67,7 @@ func NewClient(
 	return &Client{
 		connectionRepo:    connectionRepo,
 		encryptionService: encryptionService,
-		httpClient:        &http.Client{Timeout: 30 * time.Second, Transport: httpclient.OtelTransport(nil)},
+		httpClient:        &http.Client{Timeout: 30 * time.Second, Transport: httpclient.ProviderTransport(nil, logger, string(types.SecretProviderZohoBooks))},
 		logger:            logger,
 	}
 }
@@ -70,6 +75,11 @@ func NewClient(
 func (c *Client) HasZohoBooksConnection(ctx context.Context) bool {
 	conn, err := c.connectionRepo.GetByProvider(ctx, types.SecretProviderZohoBooks)
 	return err == nil && conn != nil && conn.Status == types.StatusPublished
+}
+
+// GetConnection returns the Zoho Books connection for the current context.
+func (c *Client) GetConnection(ctx context.Context) (*connection.Connection, error) {
+	return c.connectionRepo.GetByProvider(ctx, types.SecretProviderZohoBooks)
 }
 
 // GetZohoBooksWebhookConfig implements ZohoClient (used by HTTP webhooks, parallel to Stripe GetStripeClient).
@@ -127,8 +137,19 @@ func (c *Client) UpdateContact(ctx context.Context, contactID string, req *Conta
 	var resp struct {
 		Contact ContactResponse `json:"contact"`
 	}
-	path := fmt.Sprintf("/books/v3/contacts/%s", contactID)
+	path := fmt.Sprintf("/books/v3/contacts/%s", url.PathEscape(contactID))
 	if err := c.doBooksRequest(ctx, http.MethodPut, path, nil, req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp.Contact, nil
+}
+
+func (c *Client) GetContact(ctx context.Context, contactID string) (*ContactResponse, error) {
+	var resp struct {
+		Contact ContactResponse `json:"contact"`
+	}
+	path := fmt.Sprintf("/books/v3/contacts/%s", url.PathEscape(contactID))
+	if err := c.doBooksRequest(ctx, http.MethodGet, path, nil, nil, &resp); err != nil {
 		return nil, err
 	}
 	return &resp.Contact, nil
@@ -144,11 +165,22 @@ func (c *Client) CreateInvoice(ctx context.Context, req *InvoiceCreateRequest) (
 	return &resp.Invoice, nil
 }
 
+func (c *Client) UpdateInvoice(ctx context.Context, zohoInvoiceID string, req *InvoiceCreateRequest) (*InvoiceResponse, error) {
+	var resp struct {
+		Invoice InvoiceResponse `json:"invoice"`
+	}
+	path := fmt.Sprintf("/books/v3/invoices/%s", url.PathEscape(zohoInvoiceID))
+	if err := c.doBooksRequest(ctx, http.MethodPut, path, nil, req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp.Invoice, nil
+}
+
 func (c *Client) GetInvoice(ctx context.Context, zohoInvoiceID string) (*InvoiceResponse, error) {
 	var resp struct {
 		Invoice InvoiceResponse `json:"invoice"`
 	}
-	path := fmt.Sprintf("/books/v3/invoices/%s", zohoInvoiceID)
+	path := fmt.Sprintf("/books/v3/invoices/%s", url.PathEscape(zohoInvoiceID))
 	if err := c.doBooksRequest(ctx, http.MethodGet, path, nil, nil, &resp); err != nil {
 		return nil, err
 	}
@@ -156,7 +188,7 @@ func (c *Client) GetInvoice(ctx context.Context, zohoInvoiceID string) (*Invoice
 }
 
 func (c *Client) SubmitInvoiceForApproval(ctx context.Context, zohoInvoiceID string) error {
-	path := fmt.Sprintf("/books/v3/invoices/%s/submit", zohoInvoiceID)
+	path := fmt.Sprintf("/books/v3/invoices/%s/submit", url.PathEscape(zohoInvoiceID))
 	return c.doBooksRequest(ctx, http.MethodPost, path, nil, nil, nil)
 }
 
@@ -286,7 +318,7 @@ func (c *Client) getOrganizationBaseCurrency(ctx context.Context) (string, error
 			CurrencyCode string `json:"currency_code"`
 		} `json:"organization"`
 	}
-	path := fmt.Sprintf("/books/v3/organizations/%s", orgID)
+	path := fmt.Sprintf("/books/v3/organizations/%s", url.PathEscape(orgID))
 	if err := c.doBooksRequest(ctx, http.MethodGet, path, nil, nil, &resp); err != nil {
 		return "", err
 	}
@@ -344,6 +376,9 @@ func (c *Client) doBooksRequest(
 	if baseURL == "" {
 		baseURL = "https://www.zohoapis.com"
 	}
+	if err := types.ValidateZohoEndpoint(baseURL, "api_domain"); err != nil {
+		return err
+	}
 	u, err := url.Parse(baseURL + path)
 	if err != nil {
 		return err
@@ -382,13 +417,18 @@ func (c *Client) doBooksRequest(
 		var zohoErrResp ZohoErrorResponse
 		_ = json.Unmarshal(bodyBytes, &zohoErrResp)
 
+		c.logger.Error(ctx, "Zoho API request failed",
+			"error", "non_2xx_from_zoho_api",
+			"status_code", resp.StatusCode,
+			"zoho_code", zohoErrResp.Code,
+			"zoho_message", zohoErrResp.Message,
+			"response_body_bytes", len(bodyBytes))
 		return ierr.WithError(&ZohoAPIError{
 			Code:       zohoErrResp.Code,
 			Message:    zohoErrResp.Message,
 			HTTPStatus: resp.StatusCode,
 		}).
 			WithHintf("Zoho API returned status %d", resp.StatusCode).
-			WithReportableDetails(map[string]interface{}{"response_body": string(bodyBytes)}).
 			Mark(ierr.ErrHTTPClient)
 	}
 	if respBody != nil && len(bodyBytes) > 0 {
@@ -407,7 +447,7 @@ func (c *Client) getValidAccessToken(ctx context.Context, conn *connection.Conne
 
 	if md.AccessToken != "" && md.AccessTokenExpiresAt != "" {
 		exp, err := time.Parse(time.RFC3339, md.AccessTokenExpiresAt)
-		if err == nil && time.Now().UTC().Before(exp.Add(-1*time.Minute)) {
+		if err == nil && clock.Now().Before(exp.Add(-1*time.Minute)) {
 			token, err := c.encryptionService.Decrypt(md.AccessToken)
 			if err == nil && token != "" {
 				return token, nil
@@ -432,6 +472,9 @@ func (c *Client) getValidAccessToken(ctx context.Context, conn *connection.Conne
 	if accountsServer == "" {
 		accountsServer = "https://accounts.zoho.com"
 	}
+	if err := types.ValidateZohoEndpoint(accountsServer, "accounts_server"); err != nil {
+		return "", err
+	}
 	form := url.Values{}
 	form.Set("refresh_token", refreshToken)
 	form.Set("client_id", clientID)
@@ -453,9 +496,12 @@ func (c *Client) getValidAccessToken(ctx context.Context, conn *connection.Conne
 
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		c.logger.Error(ctx, "Zoho token refresh failed",
+			"error", "non_2xx_from_token_endpoint",
+			"status_code", resp.StatusCode,
+			"response_body_bytes", len(bodyBytes))
 		return "", ierr.NewError("Zoho token refresh failed").
 			WithHintf("Zoho token endpoint returned status %d", resp.StatusCode).
-			WithReportableDetails(map[string]interface{}{"response_body": string(bodyBytes)}).
 			Mark(ierr.ErrHTTPClient)
 	}
 
@@ -468,18 +514,28 @@ func (c *Client) getValidAccessToken(ctx context.Context, conn *connection.Conne
 		return "", err
 	}
 
+	newAPIDomain := strings.TrimRight(tokenResp.APIDomain, "/")
+	if newAPIDomain != "" {
+		if err := types.ValidateZohoEndpoint(newAPIDomain, "api_domain"); err != nil {
+			c.logger.Info(ctx, "ignoring invalid Zoho api_domain from token refresh",
+				"connection_id", conn.ID,
+				"error", err)
+			newAPIDomain = ""
+		}
+	}
+
 	encAccess, err := c.encryptionService.Encrypt(tokenResp.AccessToken)
 	if err != nil {
 		return "", err
 	}
 
 	md.AccessToken = encAccess
-	if tokenResp.APIDomain != "" {
-		md.APIDomain = tokenResp.APIDomain
+	if newAPIDomain != "" {
+		md.APIDomain = newAPIDomain
 	}
-	md.AccessTokenExpiresAt = time.Now().UTC().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339)
+	md.AccessTokenExpiresAt = clock.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339)
 	conn.EncryptedSecretData.ZohoBooks = md
-	conn.UpdatedAt = time.Now().UTC()
+	conn.UpdatedAt = clock.Now()
 
 	if err := c.connectionRepo.Update(ctx, conn); err != nil {
 		return "", err

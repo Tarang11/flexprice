@@ -43,6 +43,15 @@ func (s *InMemoryInvoiceStore) SetLineItemStore(lineItemStore *InMemoryInvoiceLi
 }
 
 // Helper to copy invoice
+// clonePtr returns a pointer to a copy of *p, or nil, so stored records are not aliased.
+func clonePtr[T any](p *T) *T {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
+}
+
 func copyInvoice(inv *invoice.Invoice) *invoice.Invoice {
 	if inv == nil {
 		return nil
@@ -78,11 +87,14 @@ func copyInvoice(inv *invoice.Invoice) *invoice.Invoice {
 			Metadata:                    item.Metadata,
 			CommitmentInfo:              item.CommitmentInfo,
 			CustomCurrency:              item.CustomCurrency,
+			FxConversion:                clonePtr(item.FxConversion),
 			PrepaidCreditsApplied:       item.PrepaidCreditsApplied,
 			LineItemDiscount:            item.LineItemDiscount,
 			InvoiceLevelDiscount:        item.InvoiceLevelDiscount,
 			AdjustedEntitlementQuantity: item.AdjustedEntitlementQuantity,
 			SubscriptionLineItemID:      item.SubscriptionLineItemID,
+			CommitmentID:                item.CommitmentID,
+			BillingInstalmentID:         item.BillingInstalmentID,
 			ParentLineItemID:            item.ParentLineItemID,
 			EnvironmentID:               item.EnvironmentID,
 			BaseModel:                   item.BaseModel,
@@ -101,6 +113,9 @@ func copyInvoice(inv *invoice.Invoice) *invoice.Invoice {
 		AmountDue:                  inv.AmountDue,
 		AmountPaid:                 inv.AmountPaid,
 		CustomCurrency:             inv.CustomCurrency,
+		FxConversion:               clonePtr(inv.FxConversion),
+		BillingEntity:              inv.BillingEntity,
+		BillingEntityID:            inv.BillingEntityID,
 		Subtotal:                   inv.Subtotal,
 		Total:                      inv.Total,
 		TotalTax:                   inv.TotalTax,
@@ -283,7 +298,33 @@ func (s *InMemoryInvoiceStore) Update(ctx context.Context, inv *invoice.Invoice)
 			updated.CustomCurrency = existing.CustomCurrency
 		}
 	}
+	// fx_conversion is frozen at finalize and never cleared; preserve it like custom_currency.
+	if updated.FxConversion == nil {
+		if existing, err := s.InMemoryStore.Get(ctx, inv.ID); err == nil {
+			updated.FxConversion = existing.FxConversion
+		}
+	}
+	if updated.BillingEntity == nil {
+		if existing, err := s.InMemoryStore.Get(ctx, inv.ID); err == nil {
+			updated.BillingEntity = existing.BillingEntity
+		}
+	}
 	return s.InMemoryStore.Update(ctx, inv.ID, updated)
+}
+
+func (s *InMemoryInvoiceStore) UpdateDraftInvoicePeriod(ctx context.Context, id string, periodEnd time.Time, billingReason string, idempotencyKey string) error {
+	inv, err := s.InMemoryStore.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if inv.InvoiceStatus != types.InvoiceStatusDraft {
+		return ierr.NewError("draft invoice not found").WithHint("Only a draft invoice can have its period moved").Mark(ierr.ErrNotFound)
+	}
+	updated := copyInvoice(inv)
+	updated.PeriodEnd = &periodEnd
+	updated.BillingReason = billingReason
+	updated.IdempotencyKey = &idempotencyKey
+	return s.InMemoryStore.Update(ctx, id, updated)
 }
 
 // Delete marks the invoice and its line items deleted, matching the ent repository, which soft
@@ -304,19 +345,57 @@ func (s *InMemoryInvoiceStore) Delete(ctx context.Context, id string) error {
 }
 
 func (s *InMemoryInvoiceStore) List(ctx context.Context, filter *types.InvoiceFilter) ([]*invoice.Invoice, error) {
-	return s.InMemoryStore.List(ctx, filter, invoiceFilterFn, invoiceSortFn)
+	sortFn := invoiceSortFn
+	if filter != nil && len(filter.Sort) > 0 && filter.Sort[0].Field == "period_end" {
+		desc := filter.Sort[0].Direction == types.SortDirectionDesc
+		sortFn = func(i, j *invoice.Invoice) bool {
+			a, b := lo.FromPtr(i.PeriodEnd), lo.FromPtr(j.PeriodEnd)
+			if desc {
+				return a.After(b)
+			}
+			return a.Before(b)
+		}
+	}
+	return s.InMemoryStore.List(ctx, filter, invoiceFilterFn, sortFn)
 }
 
-func (s *InMemoryInvoiceStore) ListAllTenant(ctx context.Context, filter *types.InvoiceFilter) ([]*invoice.Invoice, error) {
-	return s.List(ctx, filter)
+func (s *InMemoryInvoiceStore) ListFinalizationCandidates(ctx context.Context, afterID string, limit int) ([]*invoice.Invoice, error) {
+	candidate := func(_ context.Context, inv *invoice.Invoice, _ interface{}) bool {
+		earlyCycle := inv.BillingReason == string(types.InvoiceBillingReasonSubscriptionCycle) &&
+			inv.LastComputedAt != nil && inv.PeriodEnd != nil && inv.LastComputedAt.Before(*inv.PeriodEnd)
+		return inv.Status == types.StatusPublished &&
+			inv.InvoiceStatus == types.InvoiceStatusDraft &&
+			inv.LastComputedAt != nil &&
+			inv.ID > afterID &&
+			inv.BillingReason != string(types.InvoiceBillingReasonSubscriptionCreate) &&
+			!earlyCycle
+	}
+	byID := func(a, b *invoice.Invoice) bool { return a.ID < b.ID }
+	items, err := s.InMemoryStore.List(ctx, nil, candidate, byID)
+	if err != nil {
+		return nil, err
+	}
+	return items[:min(limit, len(items))], nil
 }
 
 func (s *InMemoryInvoiceStore) Count(ctx context.Context, filter *types.InvoiceFilter) (int, error) {
 	return s.InMemoryStore.Count(ctx, filter, invoiceFilterFn)
 }
 
+// AssignDefaultBillingEntities needs the raw SQL join; it is covered by e2e only.
+func (s *InMemoryInvoiceStore) AssignDefaultBillingEntities(ctx context.Context, limit int) (int, error) {
+	return 0, ierr.NewError("not supported by the in-memory invoice store").Mark(ierr.ErrNotImplemented)
+}
+
 func (s *InMemoryInvoiceStore) GetByIdempotencyKey(ctx context.Context, key string) (*invoice.Invoice, error) {
 	filter := types.NewNoLimitInvoiceFilter()
+	// The repository looks the key up across every status, SKIPPED included.
+	filter.InvoiceStatus = []types.InvoiceStatus{
+		types.InvoiceStatusDraft,
+		types.InvoiceStatusFinalized,
+		types.InvoiceStatusVoided,
+		types.InvoiceStatusSkipped,
+	}
 	invoices, err := s.List(ctx, filter)
 	if err != nil {
 		return nil, err
@@ -366,6 +445,13 @@ func (s *InMemoryInvoiceStore) ExistsForPeriod(ctx context.Context, subscription
 func (s *InMemoryInvoiceStore) GetForPeriod(ctx context.Context, subscriptionID string, periodStart, periodEnd time.Time, billingReason string) (*invoice.Invoice, error) {
 	filter := types.NewNoLimitInvoiceFilter()
 	filter.SubscriptionID = subscriptionID
+	// The repository looks the period up across every status, SKIPPED included.
+	filter.InvoiceStatus = []types.InvoiceStatus{
+		types.InvoiceStatusDraft,
+		types.InvoiceStatusFinalized,
+		types.InvoiceStatusVoided,
+		types.InvoiceStatusSkipped,
+	}
 	invoices, err := s.List(ctx, filter)
 	if err != nil {
 		return nil, err
@@ -387,7 +473,7 @@ func (s *InMemoryInvoiceStore) GetForPeriod(ctx context.Context, subscriptionID 
 	return nil, ierr.NewError("invoice not found").WithHint("invoice not found for period").Mark(ierr.ErrNotFound)
 }
 
-func (s *InMemoryInvoiceStore) GetNextInvoiceNumber(ctx context.Context, invoiceConfig *types.InvoiceConfig) (string, error) {
+func (s *InMemoryInvoiceStore) GetNextInvoiceNumber(ctx context.Context, invoiceConfig *types.InvoiceConfig, prefix string) (string, error) {
 	filter := types.NewNoLimitInvoiceFilter()
 	invoices, err := s.List(ctx, filter)
 	if err != nil {
@@ -477,6 +563,10 @@ func invoiceFilterFn(ctx context.Context, inv *invoice.Invoice, filter interface
 		return false
 	}
 
+	if len(f.InvoiceIDs) > 0 && !lo.Contains(f.InvoiceIDs, inv.ID) {
+		return false
+	}
+
 	// Filter by customer ID
 	if f.CustomerID != "" && inv.CustomerID != f.CustomerID {
 		return false
@@ -547,19 +637,30 @@ func invoiceFilterFn(ctx context.Context, inv *invoice.Invoice, filter interface
 
 	// Filter by time range
 	if f.TimeRangeFilter != nil && (f.TimeRangeFilter.StartTime != nil || f.TimeRangeFilter.EndTime != nil) {
+		// Matches the ent repository: the invoice's period lies inside the range.
 		if f.TimeRangeFilter.StartTime != nil {
-			if inv.PeriodStart == nil || inv.PeriodStart.After(*f.TimeRangeFilter.StartTime) {
+			if inv.PeriodStart == nil || inv.PeriodStart.Before(*f.TimeRangeFilter.StartTime) {
 				return false
 			}
 		}
 		if f.TimeRangeFilter.EndTime != nil {
-			if inv.PeriodEnd == nil || inv.PeriodEnd.Before(*f.TimeRangeFilter.EndTime) {
+			if inv.PeriodEnd == nil || inv.PeriodEnd.After(*f.TimeRangeFilter.EndTime) {
 				return false
 			}
 		}
 	}
 
 	// Filter by period_start_gte (periodStart >= value)
+	if f.FinalizedAtGTE != nil {
+		if inv.FinalizedAt == nil || inv.FinalizedAt.Before(*f.FinalizedAtGTE) {
+			return false
+		}
+	}
+	if f.VoidedAtGTE != nil {
+		if inv.VoidedAt == nil || inv.VoidedAt.Before(*f.VoidedAtGTE) {
+			return false
+		}
+	}
 	if f.PeriodStartGTE != nil {
 		if inv.PeriodStart == nil || inv.PeriodStart.Before(*f.PeriodStartGTE) {
 			return false
@@ -583,6 +684,20 @@ func invoiceFilterFn(ctx context.Context, inv *invoice.Invoice, filter interface
 	// Filter by period_end_lte (periodEnd <= value)
 	if f.PeriodEndLTE != nil {
 		if inv.PeriodEnd == nil || inv.PeriodEnd.After(*f.PeriodEndLTE) {
+			return false
+		}
+	}
+
+	// Filter by period_start_lt (periodStart < value)
+	if f.PeriodStartLT != nil {
+		if inv.PeriodStart == nil || !inv.PeriodStart.Before(*f.PeriodStartLT) {
+			return false
+		}
+	}
+
+	// Filter by period_end_gt (periodEnd > value)
+	if f.PeriodEndGT != nil {
+		if inv.PeriodEnd == nil || !inv.PeriodEnd.After(*f.PeriodEndGT) {
 			return false
 		}
 	}

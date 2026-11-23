@@ -36,7 +36,10 @@ type SubModifyInheritanceRequest struct {
 // checkoutAllowedModifyTypes is the allowlist of modification types that accept checkout.
 var checkoutAllowedModifyTypes = []SubscriptionModifyType{
 	SubscriptionModifyTypeQuantityChange,
+	SubscriptionModifyTypeLineItemChange,
 	SubscriptionModifyTypeAddon,
+	SubscriptionModifyTypeGroupedInvoicing,
+	SubscriptionModifyTypeTrialEnd,
 }
 
 func (r *SubModifyInheritanceRequest) Validate() error {
@@ -74,6 +77,9 @@ type LineItemQuantityChange struct {
 }
 
 // SubModifyQuantityChangeRequest is the payload for mid-cycle seat/quantity changes.
+//
+// Deprecated: use SubModifyLineItemChangeRequest with type "line_item_change", which changes
+// quantity, price, or both through the shared proration layer.
 type SubModifyQuantityChangeRequest struct {
 	LineItems []LineItemQuantityChange `json:"line_items" binding:"required,min=1"`
 }
@@ -94,6 +100,89 @@ func (r *SubModifyQuantityChangeRequest) Validate() error {
 			return ierr.NewError("quantity must be non-negative").
 				WithHint("Quantity cannot be negative").
 				Mark(ierr.ErrValidation)
+		}
+	}
+	return nil
+}
+
+// LineItemChange changes a single line item's quantity, price, or both.
+type LineItemChange struct {
+	ID       string           `json:"id" binding:"required"`
+	Quantity *decimal.Decimal `json:"quantity,omitempty" swaggertype:"string"`
+	// Amount reprices the charge. Flat fee only for now.
+	Amount        *decimal.Decimal `json:"amount,omitempty" swaggertype:"string"`
+	EffectiveDate *time.Time       `json:"effective_date,omitempty"`
+	// Coupons apply to the new line item created by this change.
+	Coupons []SubscriptionCouponInput `json:"coupons,omitempty"`
+}
+
+func (c *LineItemChange) ToOverrideLineItemRequest(priceID string) OverrideLineItemRequest {
+	return OverrideLineItemRequest{
+		PriceID: priceID,
+		Amount:  c.Amount,
+	}
+}
+
+// PriceChange reports whether the change carries a new price configuration.
+func (c *LineItemChange) PriceChange() bool {
+	return c.Amount != nil
+}
+
+type SubModifyLineItemChangeRequest struct {
+	LineItems []LineItemChange `json:"line_items" binding:"required,min=1"`
+}
+
+func (r *SubModifyLineItemChangeRequest) Validate() error {
+	if r == nil || len(r.LineItems) == 0 {
+		return ierr.NewError("at least one line item is required").
+			WithHint("Provide line_items with at least one entry").
+			Mark(ierr.ErrValidation)
+	}
+	seen := make(map[string]struct{}, len(r.LineItems))
+
+	for i := range r.LineItems {
+		li := &r.LineItems[i]
+		if li.ID == "" {
+			return ierr.NewError("line item ID is required").
+				WithHint("Each line_item entry must have a non-empty id").
+				Mark(ierr.ErrValidation)
+		}
+		if _, ok := seen[li.ID]; ok {
+			return ierr.NewError("duplicate line item id in line_items").
+				WithHint("Each line item can be changed at most once per request; combine quantity and amount into a single entry").
+				WithReportableDetails(map[string]any{"line_item_id": li.ID}).
+				Mark(ierr.ErrValidation)
+		}
+		seen[li.ID] = struct{}{}
+
+		if li.Quantity == nil && !li.PriceChange() {
+			return ierr.NewError("line item change must set a quantity or an amount").
+				WithHint("Provide quantity and/or amount").
+				WithReportableDetails(map[string]any{"line_item_id": li.ID}).
+				Mark(ierr.ErrValidation)
+		}
+		if li.Quantity != nil && li.Quantity.IsNegative() {
+			return ierr.NewError("quantity must be non-negative").
+				WithHint("Quantity cannot be negative").
+				WithReportableDetails(map[string]any{"line_item_id": li.ID}).
+				Mark(ierr.ErrValidation)
+		}
+		if li.Amount != nil && li.Amount.IsNegative() {
+			return ierr.NewError("amount must be non-negative").
+				WithHint("Amount cannot be negative").
+				WithReportableDetails(map[string]any{"line_item_id": li.ID}).
+				Mark(ierr.ErrValidation)
+		}
+		for j := range li.Coupons {
+			if li.Coupons[j].PriceID != nil {
+				return ierr.NewError("price_id is not supported on line item change coupons").
+					WithHint("Coupons always apply to the new line item; omit price_id").
+					WithReportableDetails(map[string]any{"line_item_id": li.ID}).
+					Mark(ierr.ErrValidation)
+			}
+			if err := li.Coupons[j].Validate(); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -146,6 +235,7 @@ const (
 	SubscriptionModifyTypeCoupon           SubscriptionModifyType = "coupon"
 	SubscriptionModifyTypeTax              SubscriptionModifyType = "tax"
 	SubscriptionModifyTypeAddon            SubscriptionModifyType = "addon"
+	SubscriptionModifyTypeLineItemChange   SubscriptionModifyType = "line_item_change"
 )
 
 type SubscriptionModificationAction string
@@ -177,21 +267,34 @@ type GroupedInvoicingAction string
 const (
 	GroupedInvoicingActionAdd    GroupedInvoicingAction = "add"
 	GroupedInvoicingActionRemove GroupedInvoicingAction = "remove"
+	GroupedInvoicingActionModify GroupedInvoicingAction = "modify"
 )
+
+// GroupedInvoicingChange is one group member's addon changes within a grouped invoicing modify.
+type GroupedInvoicingChange struct {
+	SubscriptionID  string                    `json:"subscription_id"`
+	AddonBulkParams *SubModifyBulkAddonParams `json:"addon_bulk_params"`
+}
 
 // SubModifyGroupedInvoicingParams is the payload for grouped invoicing membership changes.
 type SubModifyGroupedInvoicingParams struct {
-	// Action specifies whether to add or remove the child subscriptions from grouped invoicing.
+	// Action adds or removes child subscriptions, or modifies addons across the group ('modify').
 	Action GroupedInvoicingAction `json:"action" binding:"required"`
 	// ParentSubscriptionID is required for action 'add'.
 	ParentSubscriptionID string   `json:"parent_subscription_id,omitempty"`
 	ChildSubscriptionIDs []string `json:"child_subscription_ids"`
+	// Changes is required for action 'modify'; the path subscription is the parent.
+	Changes []GroupedInvoicingChange `json:"changes,omitempty"`
 }
 
 func (r *SubModifyGroupedInvoicingParams) Validate() error {
-	if r.Action != GroupedInvoicingActionAdd && r.Action != GroupedInvoicingActionRemove {
-		return ierr.NewError("action must be 'add' or 'remove'").
-			WithHint("Valid values for grouped_invoicing action: add, remove").
+	switch r.Action {
+	case GroupedInvoicingActionAdd, GroupedInvoicingActionRemove:
+	case GroupedInvoicingActionModify:
+		return r.validateModify()
+	default:
+		return ierr.NewError("action must be 'add', 'remove' or 'modify'").
+			WithHint("Valid values for grouped_invoicing action: add, remove, modify").
 			Mark(ierr.ErrValidation)
 	}
 	if len(r.ChildSubscriptionIDs) == 0 {
@@ -202,6 +305,38 @@ func (r *SubModifyGroupedInvoicingParams) Validate() error {
 	if r.Action == GroupedInvoicingActionAdd && r.ParentSubscriptionID == "" {
 		return ierr.NewError("parent_subscription_id is required for grouped invoicing action 'add'").
 			Mark(ierr.ErrValidation)
+	}
+	return nil
+}
+
+func (r *SubModifyGroupedInvoicingParams) validateModify() error {
+	if r.ParentSubscriptionID != "" || len(r.ChildSubscriptionIDs) > 0 {
+		return ierr.NewError("parent_subscription_id and child_subscription_ids are not allowed for grouped invoicing action 'modify'").
+			WithHint("The path subscription is the parent; list each target in changes").
+			Mark(ierr.ErrValidation)
+	}
+	if len(r.Changes) == 0 {
+		return ierr.NewError("changes must not be empty for grouped invoicing action 'modify'").
+			WithHint("Provide changes with at least one entry").
+			Mark(ierr.ErrValidation)
+	}
+	seen := make(map[string]struct{}, len(r.Changes))
+	for _, change := range r.Changes {
+		if change.SubscriptionID == "" {
+			return ierr.NewError("subscription_id is required for each change").
+				WithHint("Set subscription_id on every entry in changes").
+				Mark(ierr.ErrValidation)
+		}
+		if _, ok := seen[change.SubscriptionID]; ok {
+			return ierr.NewError("duplicate subscription_id in changes").
+				WithHint("Combine all changes for a subscription into one entry").
+				WithReportableDetails(map[string]any{"subscription_id": change.SubscriptionID}).
+				Mark(ierr.ErrValidation)
+		}
+		seen[change.SubscriptionID] = struct{}{}
+		if err := change.AddonBulkParams.Validate(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -320,6 +455,87 @@ func (r *SubModifyAddonParams) Validate() error {
 	}
 }
 
+const maxAddonBatchEntries = 20
+
+// SubModifyBulkAddonParams adds and removes several addons as one change, settled as one netted
+// document. Entries are the single-addon requests verbatim, so every per-entry rule is shared.
+// Reached through type "addon" by sending addon_bulk_params instead of addon_params.
+type SubModifyBulkAddonParams struct {
+	Adds    []*AddAddonToSubscriptionRequest `json:"adds,omitempty"`
+	Removes []*RemoveAddonRequest            `json:"removes,omitempty"`
+}
+
+func (p *SubModifyBulkAddonParams) Validate() error {
+	if p == nil {
+		return ierr.NewError("addon_bulk_params is required").
+			Mark(ierr.ErrValidation)
+	}
+
+	return ValidateAddonBatch(p.Adds, p.Removes)
+}
+
+// ValidateAddonBatch checks a set of addon changes applied as one. Shared with subscription
+// creation, which attaches its addons the same way.
+func ValidateAddonBatch(adds []*AddAddonToSubscriptionRequest, removes []*RemoveAddonRequest) error {
+	total := len(adds) + len(removes)
+	if total == 0 {
+		return ierr.NewError("at least one add or remove is required").
+			WithHint("Provide adds and/or removes with at least one entry").
+			Mark(ierr.ErrValidation)
+	}
+	if total > maxAddonBatchEntries {
+		return ierr.NewError("too many addon entries in one request").
+			WithHintf("An addon batch accepts at most %d entries across adds and removes", maxAddonBatchEntries).
+			WithReportableDetails(map[string]any{"count": total, "max": maxAddonBatchEntries}).
+			Mark(ierr.ErrValidation)
+	}
+
+	for i, add := range adds {
+		if add == nil {
+			return ierr.NewError("add entry must not be null").
+				WithReportableDetails(map[string]any{"index": i}).
+				Mark(ierr.ErrValidation)
+		}
+		if err := add.Validate(); err != nil {
+			return err
+		}
+		if add.StartDate != nil && add.StartDate.IsZero() {
+			return ierr.NewError("start_date must not be zero").
+				WithHint("Omit start_date to attach now, or provide a real timestamp").
+				WithReportableDetails(map[string]any{"index": i, "addon_id": add.AddonID}).
+				Mark(ierr.ErrValidation)
+		}
+	}
+
+	seen := make(map[string]struct{}, len(removes))
+	for i, remove := range removes {
+		if remove == nil {
+			return ierr.NewError("remove entry must not be null").
+				WithReportableDetails(map[string]any{"index": i}).
+				Mark(ierr.ErrValidation)
+		}
+		if err := remove.Validate(); err != nil {
+			return err
+		}
+		if _, ok := seen[remove.AddonAssociationID]; ok {
+			return ierr.NewError("duplicate addon_association_id in removes").
+				WithHint("Each addon association can be removed at most once per request").
+				WithReportableDetails(map[string]any{"index": i, "addon_association_id": remove.AddonAssociationID}).
+				Mark(ierr.ErrValidation)
+		}
+		seen[remove.AddonAssociationID] = struct{}{}
+
+		if remove.EffectiveDate != nil && remove.EffectiveDate.IsZero() {
+			return ierr.NewError("effective_date must not be zero").
+				WithHint("Omit effective_date to remove at period end, or provide a real timestamp").
+				WithReportableDetails(map[string]any{"index": i, "addon_association_id": remove.AddonAssociationID}).
+				Mark(ierr.ErrValidation)
+		}
+	}
+
+	return nil
+}
+
 // ExecuteSubscriptionModifyRequest is the unified body for
 // POST /subscriptions/:id/modify/execute and /modify/preview.
 // Exactly one of the *Params fields must be set, matching the type.
@@ -328,11 +544,13 @@ type ExecuteSubscriptionModifyRequest struct {
 	Type                   SubscriptionModifyType           `json:"type" binding:"required"`
 	InheritanceParams      *SubModifyInheritanceRequest     `json:"inheritance_params,omitempty"`
 	QuantityChangeParams   *SubModifyQuantityChangeRequest  `json:"quantity_change_params,omitempty"`
+	LineItemChangeParams   *SubModifyLineItemChangeRequest  `json:"line_item_change_params,omitempty"`
 	GroupedInvoicingParams *SubModifyGroupedInvoicingParams `json:"grouped_invoicing_params,omitempty"`
 	TrialEndParams         *SubModifyTrialEndRequest        `json:"trial_end_params,omitempty"`
 	CouponParams           *SubModifyCouponParams           `json:"coupon_params,omitempty"`
 	TaxParams              *SubModifyTaxParams              `json:"tax_params,omitempty"`
 	AddonParams            *SubModifyAddonParams            `json:"addon_params,omitempty"`
+	BulkAddonParams        *SubModifyBulkAddonParams        `json:"addon_bulk_params,omitempty"`
 	Checkout               *CheckoutParams                  `json:"checkout,omitempty"`
 }
 
@@ -351,6 +569,12 @@ func (r *ExecuteSubscriptionModifyRequest) Validate() error {
 				Mark(ierr.ErrValidation)
 		}
 		err = r.QuantityChangeParams.Validate()
+	case SubscriptionModifyTypeLineItemChange:
+		if r.LineItemChangeParams == nil {
+			return ierr.NewError("line_item_change_params is required for type 'line_item_change'").
+				Mark(ierr.ErrValidation)
+		}
+		err = r.LineItemChangeParams.Validate()
 	case SubscriptionModifyTypeGroupedInvoicing:
 		if r.GroupedInvoicingParams == nil {
 			return ierr.NewError("grouped_invoicing_params is required for type 'grouped_invoicing'").
@@ -376,15 +600,26 @@ func (r *ExecuteSubscriptionModifyRequest) Validate() error {
 		}
 		err = r.TaxParams.Validate()
 	case SubscriptionModifyTypeAddon:
-		if r.AddonParams == nil {
-			return ierr.NewError("addon_params is required for type 'addon'").
-				WithHint("Provide addon_params with an action of add or remove").
+		// One addon or several: addon_params changes a single addon, addon_bulk_params
+		// changes a set of them as one netted document. Exactly one of the two.
+		switch {
+		case r.AddonParams != nil && r.BulkAddonParams != nil:
+			return ierr.NewError("addon_params and addon_bulk_params are mutually exclusive").
+				WithHint("Send addon_params to change one addon, or addon_bulk_params to change several").
+				Mark(ierr.ErrValidation)
+		case r.BulkAddonParams != nil:
+			err = r.BulkAddonParams.Validate()
+		case r.AddonParams != nil:
+			err = r.AddonParams.Validate()
+		default:
+			return ierr.NewError("addon_params or addon_bulk_params is required for type 'addon'").
+				WithHint("Provide addon_params with an action of add or remove, " +
+					"or addon_bulk_params with at least one add or remove").
 				Mark(ierr.ErrValidation)
 		}
-		err = r.AddonParams.Validate()
 	default:
 		return ierr.NewError("unknown modification type: " + string(r.Type)).
-			WithHint("Valid values: inheritance, quantity_change, grouped_invoicing, trial_end, coupon, tax, addon").
+			WithHint("Valid values: inheritance, quantity_change, line_item_change, grouped_invoicing, trial_end, coupon, tax, addon").
 			Mark(ierr.ErrValidation)
 	}
 	if err != nil {
@@ -407,9 +642,23 @@ func (r *ExecuteSubscriptionModifyRequest) validateCheckout() error {
 			Mark(ierr.ErrValidation)
 	}
 
-	if r.Type == SubscriptionModifyTypeAddon && r.AddonParams.Action == SubscriptionModificationActionRemove {
+	if r.Type == SubscriptionModifyTypeAddon && r.AddonParams != nil &&
+		r.AddonParams.Action == SubscriptionModificationActionRemove {
 		return ierr.NewError("checkout is not supported when removing an addon").
 			WithHint("Removing an addon issues a credit, so there is no payment to collect").
+			Mark(ierr.ErrValidation)
+	}
+
+	if r.Type == SubscriptionModifyTypeGroupedInvoicing &&
+		(r.GroupedInvoicingParams == nil || r.GroupedInvoicingParams.Action != GroupedInvoicingActionModify) {
+		return ierr.NewError("checkout is only supported for grouped invoicing action 'modify'").
+			WithHint("Remove checkout, or use action 'modify'").
+			Mark(ierr.ErrValidation)
+	}
+
+	if r.Type == SubscriptionModifyTypeTrialEnd && (r.TrialEndParams == nil || r.TrialEndParams.Action != TrialEndActionImmediate) {
+		return ierr.NewError("checkout is only supported when ending the trial immediately").
+			WithHint("Use action 'immediate' with checkout").
 			Mark(ierr.ErrValidation)
 	}
 
@@ -433,6 +682,15 @@ type ChangedSubscriptionAction string
 const (
 	ChangedSubscriptionActionCreated ChangedSubscriptionAction = "created"
 	ChangedSubscriptionActionUpdated ChangedSubscriptionAction = "updated"
+)
+
+// ChangedAddonAssociationAction describes how an addon association changed.
+// @Description created | ended
+type ChangedAddonAssociationAction string
+
+const (
+	ChangedAddonAssociationActionCreated ChangedAddonAssociationAction = "created"
+	ChangedAddonAssociationActionEnded   ChangedAddonAssociationAction = "ended"
 )
 
 // ChangedInvoiceAction classifies invoice-side effects from a modification.
@@ -461,12 +719,13 @@ func ChangedInvoiceStatusFromPaymentStatus(ps types.PaymentStatus) ChangedInvoic
 
 // ChangedLineItem describes a subscription line item that was created, updated, or ended.
 type ChangedLineItem struct {
-	ID           string                `json:"id"`
-	PriceID      string                `json:"price_id"`
-	Quantity     decimal.Decimal       `json:"quantity" swaggertype:"string"`
-	StartDate    *time.Time            `json:"start_date,omitempty"`
-	EndDate      *time.Time            `json:"end_date,omitempty"`
-	ChangeAction ChangedLineItemAction `json:"change_action" enums:"created,updated,ended"`
+	ID             string                `json:"id"`
+	SubscriptionID string                `json:"subscription_id,omitempty"`
+	PriceID        string                `json:"price_id"`
+	Quantity       decimal.Decimal       `json:"quantity" swaggertype:"string"`
+	StartDate      *time.Time            `json:"start_date,omitempty"`
+	EndDate        *time.Time            `json:"end_date,omitempty"`
+	ChangeAction   ChangedLineItemAction `json:"change_action" enums:"created,updated,ended"`
 }
 
 // ChangedSubscription describes a subscription that was created or updated.
@@ -476,6 +735,18 @@ type ChangedSubscription struct {
 	Status           types.SubscriptionStatus  `json:"status"`
 	TrialEnd         *time.Time                `json:"trial_end,omitempty"`
 	CurrentPeriodEnd *time.Time                `json:"current_period_end,omitempty"`
+}
+
+// ChangedAddonAssociation describes an addon attached or ended by a modification. It is the
+// only place an attach's new association id is returned, and a later removal needs it.
+type ChangedAddonAssociation struct {
+	ID             string                        `json:"id"`
+	SubscriptionID string                        `json:"subscription_id,omitempty"`
+	AddonID        string                        `json:"addon_id"`
+	AddonStatus    types.AddonStatus             `json:"addon_status"`
+	StartDate      *time.Time                    `json:"start_date,omitempty"`
+	EndDate        *time.Time                    `json:"end_date,omitempty"`
+	ChangeAction   ChangedAddonAssociationAction `json:"change_action" enums:"created,ended"`
 }
 
 // ChangedInvoice describes a proration invoice or wallet credit from a modification.
@@ -493,9 +764,10 @@ type ChangedInvoice struct {
 
 // ChangedResources is the Orb-inspired envelope for all mutation side-effects.
 type ChangedResources struct {
-	LineItems     []ChangedLineItem     `json:"line_items,omitempty"`
-	Subscriptions []ChangedSubscription `json:"subscriptions,omitempty"`
-	Invoices      []ChangedInvoice      `json:"invoices,omitempty"`
+	LineItems         []ChangedLineItem         `json:"line_items,omitempty"`
+	AddonAssociations []ChangedAddonAssociation `json:"addon_associations,omitempty"`
+	Subscriptions     []ChangedSubscription     `json:"subscriptions,omitempty"`
+	Invoices          []ChangedInvoice          `json:"invoices,omitempty"`
 }
 
 // SubscriptionModifyResponse is the response from execute and preview endpoints.

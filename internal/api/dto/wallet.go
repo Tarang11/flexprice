@@ -6,12 +6,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/flexprice/flexprice/internal/clock"
+
+	"github.com/samber/lo"
+	"github.com/shopspring/decimal"
+
 	"github.com/flexprice/flexprice/internal/domain/wallet"
 	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/types"
 	"github.com/flexprice/flexprice/internal/validator"
-	"github.com/samber/lo"
-	"github.com/shopspring/decimal"
 )
 
 // CreateWalletRequest represents the request to create a wallet
@@ -238,7 +241,7 @@ func (r *CreateWalletRequest) Validate() error {
 	}
 
 	if r.InitialCreditsExpiryDateUTC != nil {
-		if r.InitialCreditsExpiryDateUTC.Before(time.Now().UTC()) {
+		if r.InitialCreditsExpiryDateUTC.Before(clock.Now()) {
 			return ierr.NewError("initial_credits_to_load_expiry_date_utc cannot be in the past").
 				WithHint("Expiry date must be in the future").
 				Mark(ierr.ErrValidation)
@@ -332,6 +335,9 @@ type TopUpWalletRequest struct {
 	// expiry_date_utc is the expiry date in UTC timezone
 	// ex 2025-01-01 00:00:00 UTC
 	ExpiryDateUTC *time.Time `json:"expiry_date_utc,omitempty"`
+	// effective_date is stored as the credit transaction's created_at.
+	// Omit to use the current time. Must not be in the future.
+	EffectiveDate *time.Time `json:"effective_date,omitempty"`
 	// priority is the priority of the transaction
 	// lower number means higher priority
 	// default is nil which means no priority at all
@@ -362,10 +368,21 @@ type TopUpWalletRequest struct {
 	// Omit for today's pay-later / auto-complete behavior.
 	Checkout *CheckoutParams `json:"checkout,omitempty"`
 
+	Coupons []TopUpCoupon `json:"coupons,omitempty"`
+
 	// TriggeringActor records who drove this top-up. An end customer never gets
 	// auto-complete: granting credits before the invoice is paid is a net-terms
 	// arrangement a tenant makes, not one a customer may take for itself.
 	TriggeringActor types.TriggeringActor `json:"-"`
+
+	// SourceType/SourceID set the transaction's source; server-only.
+	SourceType types.WalletTxSourceType `json:"-"`
+	SourceID   string                   `json:"-"`
+}
+
+// TopUpCoupon names a coupon to apply to a top-up invoice.
+type TopUpCoupon struct {
+	CouponCode string `json:"coupon_code" validate:"required"`
 }
 
 func (r *TopUpWalletRequest) Validate() error {
@@ -399,9 +416,31 @@ func (r *TopUpWalletRequest) Validate() error {
 
 	if r.ExpiryDateUTC != nil {
 		// check if the expiry date is in the past
-		if r.ExpiryDateUTC.Before(time.Now().UTC()) {
+		if r.ExpiryDateUTC.Before(clock.Now()) {
 			return ierr.NewError("expiry_date_utc cannot be in the past").
 				WithHint("Expiry date must be in the future").
+				Mark(ierr.ErrValidation)
+		}
+	}
+
+	if r.EffectiveDate != nil {
+		if r.EffectiveDate.After(clock.Now()) {
+			return ierr.NewError("effective_date cannot be in the future").
+				WithHint("Effective date must be now or in the past").
+				Mark(ierr.ErrValidation)
+		}
+		expiry := r.ExpiryDateUTC
+		if expiry == nil {
+			expiry = types.ParseYYYYMMDDToDate(r.ExpiryDate)
+		}
+		if expiry != nil && !r.EffectiveDate.Before(*expiry) {
+			return ierr.NewError("effective_date must be before the credit expiry").
+				WithHint("Date the grant before it expires").
+				Mark(ierr.ErrValidation)
+		}
+		if r.BonusCreditsExpiryDateUTC != nil && !r.EffectiveDate.Before(*r.BonusCreditsExpiryDateUTC) {
+			return ierr.NewError("effective_date must be before the bonus credit expiry").
+				WithHint("Date the grant before the bonus credits expire").
 				Mark(ierr.ErrValidation)
 		}
 	}
@@ -421,7 +460,7 @@ func (r *TopUpWalletRequest) Validate() error {
 			Mark(ierr.ErrValidation)
 	}
 
-	if r.BonusCreditsExpiryDateUTC != nil && r.BonusCreditsExpiryDateUTC.Before(time.Now().UTC()) {
+	if r.BonusCreditsExpiryDateUTC != nil && r.BonusCreditsExpiryDateUTC.Before(clock.Now()) {
 		return ierr.NewError("bonus_credits_expiry_date_utc cannot be in the past").
 			WithHint("Bonus credits expiry date must be in the future").
 			Mark(ierr.ErrValidation)
@@ -441,6 +480,49 @@ func (r *TopUpWalletRequest) Validate() error {
 		}
 	}
 
+	if len(r.Coupons) > 0 {
+		if err := r.validateCoupons(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (r *TopUpWalletRequest) validateCoupons() error {
+	if r.TransactionReason != types.TransactionReasonPurchasedCreditInvoiced {
+		return ierr.NewError("coupons are only supported for PURCHASED_CREDIT_INVOICED").
+			WithHint("Omit coupons, or set transaction_reason to PURCHASED_CREDIT_INVOICED").
+			WithReportableDetails(map[string]interface{}{
+				"transaction_reason": r.TransactionReason,
+			}).
+			Mark(ierr.ErrValidation)
+	}
+	if r.Checkout != nil {
+		return ierr.NewError("coupons are not supported with checkout").
+			WithHint("Omit either coupons or checkout").
+			Mark(ierr.ErrValidation)
+	}
+
+	seen := make(map[string]bool, len(r.Coupons))
+	for _, c := range r.Coupons {
+		// Coupon lookup ignores case and surrounding spaces, so "TOPUP10" and "topup10" are one coupon.
+		key := strings.ToLower(strings.TrimSpace(c.CouponCode))
+		if key == "" {
+			return ierr.NewError("coupon_code is required").
+				WithHint("Provide a coupon_code for each coupon").
+				Mark(ierr.ErrValidation)
+		}
+		if seen[key] {
+			return ierr.NewError("duplicate coupon_code").
+				WithHintf("Coupon '%s' is listed more than once", c.CouponCode).
+				WithReportableDetails(map[string]interface{}{
+					"coupon_code": c.CouponCode,
+				}).
+				Mark(ierr.ErrValidation)
+		}
+		seen[key] = true
+	}
 	return nil
 }
 
@@ -465,6 +547,8 @@ type WalletBalanceResponse struct {
 	CurrentPeriodUsage        *decimal.Decimal       `json:"current_period_usage,omitempty" swaggertype:"string"`
 	UnpaidInvoicesAmount      *decimal.Decimal       `json:"unpaid_invoices_amount,omitempty" swaggertype:"string"`
 	CreditsAvailableBreakdown *types.CreditBreakdown `json:"credits_available_breakdown,omitempty"`
+	// BalanceAlertStatus is ok, info, warning, or in_alarm. Absent when wallet alerts are off.
+	BalanceAlertStatus *types.AlertState `json:"balance_alert_status,omitempty"`
 	// IsCachedFallback is true whenever the response is sourced from cache:
 	// either an explicit cache request, or fallback after a real-time failure.
 	// Clients should treat the absence of this field as if it were true and

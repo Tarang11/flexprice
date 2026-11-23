@@ -55,11 +55,19 @@ func priceFilterFn(ctx context.Context, p *price.Price, filter interface{}) bool
 		}
 	}
 
+	if f.ParentPriceID != nil && p.ParentPriceID != *f.ParentPriceID {
+		return false
+	}
+
 	// Filter by price IDs
 	if len(f.PriceIDs) > 0 {
 		if !lo.Contains(f.PriceIDs, p.ID) {
 			return false
 		}
+	}
+
+	if len(f.ProductIDs) > 0 && !lo.Contains(f.ProductIDs, p.ProductID) {
+		return false
 	}
 
 	// Filter by status
@@ -82,6 +90,11 @@ func priceFilterFn(ctx context.Context, p *price.Price, filter interface{}) bool
 		if f.EndTime != nil && p.CreatedAt.After(*f.EndTime) {
 			return false
 		}
+	}
+
+	// UpdatedAfter matches edits, which the created_at range above cannot see.
+	if f.UpdatedAfter != nil && p.UpdatedAt.Before(*f.UpdatedAfter) {
+		return false
 	}
 
 	return true
@@ -246,10 +259,6 @@ func (s *InMemoryPriceStore) DeleteBulk(ctx context.Context, ids []string) error
 	return nil
 }
 
-func (s *InMemoryPriceStore) GetByPlanID(ctx context.Context, planID string) ([]*price.Price, error) {
-	return s.InMemoryStore.List(ctx, types.NewPriceFilter().WithEntityIDs([]string{planID}), priceFilterFn, priceSortFn)
-}
-
 // Clear clears the price store
 func (s *InMemoryPriceStore) Clear() {
 	s.InMemoryStore.Clear()
@@ -274,6 +283,25 @@ func (s *InMemoryPriceStore) GetByGroupIDs(ctx context.Context, groupIDs []strin
 	if err != nil {
 		return nil, ierr.WithError(err).
 			WithHint("Failed to get prices by group IDs").
+			Mark(ierr.ErrDatabase)
+	}
+	return prices, nil
+}
+
+// ListByIDs returns the prices whose ids are in ids; missing ids are absent.
+func (s *InMemoryPriceStore) ListByIDs(ctx context.Context, ids []string) ([]*price.Price, error) {
+	prices, err := s.InMemoryStore.List(ctx, nil, func(ctx context.Context, p *price.Price, _ interface{}) bool {
+		if p == nil {
+			return false
+		}
+		if !CheckTenantFilter(ctx, p.TenantID) || !CheckEnvironmentFilter(ctx, p.EnvironmentID) {
+			return false
+		}
+		return lo.Contains(ids, p.ID)
+	}, priceSortFn)
+	if err != nil {
+		return nil, ierr.WithError(err).
+			WithHint("Failed to list prices by ids").
 			Mark(ierr.ErrDatabase)
 	}
 	return prices, nil
@@ -353,4 +381,10 @@ func (s *InMemoryPriceStore) GetByLookupKey(ctx context.Context, lookupKey strin
 	}
 
 	return foundPrice, nil
+}
+
+func (s *InMemoryPriceStore) GetLinkedCustomerID(_ context.Context, _ string) (string, error) {
+	return "", ierr.NewError("not implemented").
+		WithHint("not implemented").
+		Mark(ierr.ErrSystem)
 }

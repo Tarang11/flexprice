@@ -57,6 +57,12 @@ func (Customer) Fields() []ent.Field {
 			}).
 			Optional().
 			Nillable(),
+		field.String("billing_currency").
+			SchemaType(map[string]string{
+				"postgres": "varchar(10)",
+			}).
+			Optional().
+			Nillable(),
 		// Address fields
 		field.String("address_line1").
 			SchemaType(map[string]string{
@@ -101,7 +107,30 @@ func (Customer) Fields() []ent.Field {
 			}).
 			Default(string(types.TaxTreatmentTaxable)).
 			NotEmpty(),
+		field.JSON("contact_persons", []*ContactPerson{}).
+			Optional(),
+		field.String("billing_entity_id").
+			SchemaType(map[string]string{
+				"postgres": "varchar(50)",
+			}).
+			Optional().
+			Nillable(),
+		field.JSON("settings", &types.SettingsOverride{}).
+			Optional(),
 	}
+}
+
+// ContactPerson is the stored shape of a customer's contact person.
+type ContactPerson struct {
+	ID          string `json:"id,omitempty"`
+	IsPrimary   bool   `json:"is_primary,omitempty"`
+	Salutation  string `json:"salutation,omitempty"`
+	FirstName   string `json:"first_name"`
+	LastName    string `json:"last_name,omitempty"`
+	Email       string `json:"email,omitempty"`
+	Mobile      string `json:"mobile,omitempty"`
+	Designation string `json:"designation,omitempty"`
+	Department  string `json:"department,omitempty"`
 }
 
 // Edges of the Customer.
@@ -125,5 +154,10 @@ func (Customer) Indexes() []ent.Index {
 		index.Fields("metadata").
 			Annotations(entsql.IndexAnnotation{Type: "GIN"}).
 			StorageKey(Idx_customer_metadata_gin),
+		index.Fields("tenant_id", "environment_id", "billing_entity_id").
+			StorageKey("idx_customers_tenant_env_billing_entity"),
+		index.Fields("tenant_id", "environment_id").
+			StorageKey("idx_customers_settings_override").
+			Annotations(entsql.IndexWhere("((settings IS NOT NULL) AND ((status)::text = 'published'::text))")),
 	}
 }

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"github.com/flexprice/flexprice/internal/api/dto"
 	"sort"
 
 	ierr "github.com/flexprice/flexprice/internal/errors"
@@ -9,11 +10,6 @@ import (
 	"github.com/samber/lo"
 )
 
-// gatewayCapabilities mirrors three switch statements that must agree with it:
-// Factory.GetCheckoutProvider, Factory.GetPaymentMethodProvider, and
-// paymentProcessor.handlePaymentLinkCreation. Stripe's unattended settlement
-// (processPaymentMethodCharge) is absent on purpose — it is not on the
-// CheckoutProvider seam, so nothing resolved here can route to it.
 var gatewayCapabilities = map[types.PaymentGatewayType][]types.IntegrationCapabilityType{
 	types.PaymentGatewayTypeChargebee: {
 		types.IntegrationCapabilityCheckout,
@@ -21,23 +17,32 @@ var gatewayCapabilities = map[types.PaymentGatewayType][]types.IntegrationCapabi
 		types.IntegrationCapabilityAutoCharge,
 		types.IntegrationCapabilityPaymentMethodManagement,
 		types.IntegrationCapabilitySetDefaultMethod,
+		types.IntegrationCapabilityListPaymentMethods,
+		types.IntegrationCapabilityAddPaymentMethod,
+		types.IntegrationCapabilityDeletePaymentMethod,
 	},
 	types.PaymentGatewayTypeRazorpay: {
 		types.IntegrationCapabilityCheckout,
 		types.IntegrationCapabilityAutoCharge,
 		types.IntegrationCapabilityPaymentLink,
+		types.IntegrationCapabilityListPaymentMethods,
+		types.IntegrationCapabilityAddPaymentMethod,
 	},
 	types.PaymentGatewayTypeStripe: {
+		types.IntegrationCapabilityCheckout,
 		types.IntegrationCapabilityPaymentLink,
+		types.IntegrationCapabilityAutoCharge,
+		types.IntegrationCapabilityPaymentMethodManagement,
+		types.IntegrationCapabilitySetDefaultMethod,
+		types.IntegrationCapabilityListPaymentMethods,
+		types.IntegrationCapabilityAddPaymentMethod,
+		types.IntegrationCapabilityDeletePaymentMethod,
 	},
 	types.PaymentGatewayTypeNomod: {
 		types.IntegrationCapabilityPaymentLink,
 	},
 }
 
-// PaymentProviderResolver answers which payment gateway an operation runs against,
-// from the tenant's published connections intersected with the capabilities
-// FlexPrice implements per gateway.
 type PaymentProviderResolver struct {
 	ServiceParams
 }
@@ -46,15 +51,21 @@ func NewPaymentProviderResolver(params ServiceParams) *PaymentProviderResolver {
 	return &PaymentProviderResolver{ServiceParams: params}
 }
 
+// ProviderCapabilities holds a payment gateway and its list of supported capabilities.
 type ProviderCapabilities struct {
-	Gateway      types.PaymentGatewayType
+	// Gateway is the payment gateway type.
+	Gateway types.PaymentGatewayType
+	// Capabilities is the list of capabilities supported by the gateway.
 	Capabilities []types.IntegrationCapability
 }
 
-// ListProviders returns configured gateways with a usable capability, ordered by
-// gateway name.
 func (s *PaymentProviderResolver) ListProviders(ctx context.Context, customerID string) ([]ProviderCapabilities, error) {
-	gateways, err := s.configuredGateways(ctx)
+	ctx, err := s.scopeToCustomer(ctx, customerID)
+	if err != nil {
+		return nil, err
+	}
+
+	gateways, err := s.ConfiguredGateways(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -66,7 +77,15 @@ func (s *PaymentProviderResolver) ListProviders(ctx context.Context, customerID 
 	out := make([]ProviderCapabilities, 0, len(usable))
 	for _, gw := range usable {
 		caps := lo.Map(gatewayCapabilities[gw], func(c types.IntegrationCapabilityType, _ int) types.IntegrationCapability {
-			return types.IntegrationCapability{Type: c}
+			capability := types.IntegrationCapability{Type: c}
+			switch c {
+			case types.IntegrationCapabilityAddPaymentMethod:
+				capability.AddPaymentMethodOptions = &types.AddPaymentMethodOptions{
+					PaymentMethodTypes: dto.SetupIntentMethodTypes(types.SecretProvider(gw)),
+					SetsDefault:        gw == types.PaymentGatewayTypeStripe,
+				}
+			}
+			return capability
 		})
 		out = append(out, ProviderCapabilities{Gateway: gw, Capabilities: caps})
 	}
@@ -74,7 +93,6 @@ func (s *PaymentProviderResolver) ListProviders(ctx context.Context, customerID 
 	return out, nil
 }
 
-// ResolveProvider picks the gateway serving capability.
 func (s *PaymentProviderResolver) ResolveProvider(
 	ctx context.Context,
 	customerID string,
@@ -92,7 +110,12 @@ func (s *PaymentProviderResolver) ResolveProvider(
 		}
 	}
 
-	gateways, err := s.configuredGateways(ctx)
+	ctx, err := s.scopeToCustomer(ctx, customerID)
+	if err != nil {
+		return "", err
+	}
+
+	gateways, err := s.ConfiguredGateways(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -140,9 +163,9 @@ func (s *PaymentProviderResolver) ResolveProvider(
 	}
 }
 
-// configuredGateways deduplicates and sorts so listings and error messages are stable.
-func (s *PaymentProviderResolver) configuredGateways(ctx context.Context) ([]types.PaymentGatewayType, error) {
-	connections, err := s.ConnectionRepo.ListAllPublished(ctx)
+// ConfiguredGateways lists the payment gateways connected for the billing entity in ctx.
+func (s *PaymentProviderResolver) ConfiguredGateways(ctx context.Context) ([]types.PaymentGatewayType, error) {
+	connections, err := s.ConnectionRepo.ListPublishedInScope(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -166,4 +189,12 @@ func (s *PaymentProviderResolver) configuredGateways(ctx context.Context) ([]typ
 
 	sort.Slice(gateways, func(i, j int) bool { return gateways[i] < gateways[j] })
 	return gateways, nil
+}
+
+// scopeToCustomer puts the customer's billing entity in ctx; an empty customer leaves ctx unchanged.
+func (s *PaymentProviderResolver) scopeToCustomer(ctx context.Context, customerID string) (context.Context, error) {
+	if customerID == "" {
+		return ctx, nil
+	}
+	return NewBillingEntityService(s.ServiceParams).ScopeToCustomer(ctx, customerID)
 }

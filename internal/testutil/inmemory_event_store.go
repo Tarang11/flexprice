@@ -17,8 +17,9 @@ import (
 )
 
 type InMemoryEventStore struct {
-	mu     sync.RWMutex
-	events map[string]*events.Event
+	mu       sync.RWMutex
+	events   map[string]*events.Event
+	versions []*events.Event
 }
 
 func NewInMemoryEventStore() *InMemoryEventStore {
@@ -37,6 +38,7 @@ func (s *InMemoryEventStore) InsertEvent(ctx context.Context, event *events.Even
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.events[event.ID] = event
+	s.versions = append(s.versions, event)
 	return nil
 }
 
@@ -45,6 +47,7 @@ func (s *InMemoryEventStore) BulkInsertEvents(ctx context.Context, events []*eve
 	defer s.mu.Unlock()
 	for _, event := range events {
 		s.events[event.ID] = event
+		s.versions = append(s.versions, event)
 	}
 	return nil
 }
@@ -77,6 +80,46 @@ func (s *InMemoryEventStore) GetEventByID(ctx context.Context, eventID string) (
 	}
 
 	return event, nil
+}
+
+func (s *InMemoryEventStore) ListEventsByID(ctx context.Context, externalCustomerID, eventID string, window events.TimeRange, limit int) ([]*events.Event, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	tenantID := types.GetTenantID(ctx)
+	environmentID := types.GetEnvironmentID(ctx)
+
+	matched := make([]*events.Event, 0)
+	for _, event := range s.versions {
+		if event.ID != eventID || event.ExternalCustomerID != externalCustomerID {
+			continue
+		}
+		if event.Timestamp.Before(window.Start) || !event.Timestamp.Before(window.End) {
+			continue
+		}
+		if event.TenantID != tenantID {
+			continue
+		}
+		if event.EnvironmentID != environmentID {
+			continue
+		}
+		matched = append(matched, event)
+	}
+
+	sort.Slice(matched, func(i, j int) bool {
+		if matched[i].IngestedAt.Equal(matched[j].IngestedAt) {
+			return matched[i].Timestamp.After(matched[j].Timestamp)
+		}
+		return matched[i].IngestedAt.After(matched[j].IngestedAt)
+	})
+
+	if limit <= 0 {
+		limit = 50
+	}
+	if len(matched) > limit {
+		matched = matched[:limit]
+	}
+	return matched, nil
 }
 
 func (s *InMemoryEventStore) GetUsage(ctx context.Context, params *events.UsageParams) (*events.AggregationResult, error) {
@@ -518,89 +561,6 @@ func (s *InMemoryEventStore) GetEvents(ctx context.Context, params *events.GetEv
 	return filteredEvents, totalCount, nil
 }
 
-func (s *InMemoryEventStore) GetUsageWithFilters(ctx context.Context, params *events.UsageWithFiltersParams) ([]*events.AggregationResult, error) {
-	if params == nil || params.UsageParams == nil {
-		return nil, ierr.NewError("params cannot be nil").
-			WithHint("Params cannot be nil").
-			Mark(ierr.ErrValidation)
-	}
-
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	// Process each filter group and calculate usage
-	var results []*events.AggregationResult
-	for _, group := range params.FilterGroups {
-		// Filter events based on base filters and group filters
-		var filteredEvents []*events.Event
-		for _, event := range s.events {
-			if !s.matchesBaseFilters(ctx, event, params.UsageParams) {
-				continue
-			}
-
-			if !s.matchesFilterGroup(event, group) {
-				continue
-			}
-
-			filteredEvents = append(filteredEvents, event)
-		}
-
-		// Calculate usage for filtered events
-		var value decimal.Decimal
-		switch params.AggregationType {
-		case types.AggregationCount:
-			value = decimal.NewFromInt(int64(len(filteredEvents)))
-		case types.AggregationSum, types.AggregationAvg:
-			var sum decimal.Decimal
-			count := 0
-			for _, event := range filteredEvents {
-				if val, ok := event.Properties[params.PropertyName]; ok {
-					// Try to convert the value to float64
-					var floatVal float64
-					switch v := val.(type) {
-					case float64:
-						floatVal = v
-					case int64:
-						floatVal = float64(v)
-					case int:
-						floatVal = float64(v)
-					case string:
-						var err error
-						floatVal, err = strconv.ParseFloat(v, 64)
-						if err != nil {
-							continue
-						}
-					default:
-						continue
-					}
-					sum = sum.Add(decimal.NewFromFloat(floatVal))
-					count++
-				}
-			}
-			if count > 0 {
-				if params.AggregationType == types.AggregationAvg {
-					value = sum.Div(decimal.NewFromInt(int64(count)))
-				} else {
-					value = sum
-				}
-			}
-			log.Printf("Calculated %s: sum=%v, count=%d, value=%v",
-				params.AggregationType, sum, count, value)
-		}
-		result := &events.AggregationResult{
-			EventName: params.EventName,
-			Type:      params.AggregationType,
-			Metadata: map[string]string{
-				"filter_group_id": group.ID,
-			},
-			Value: value,
-		}
-		results = append(results, result)
-	}
-
-	return results, nil
-}
-
 func (s *InMemoryEventStore) GetDistinctEventNames(ctx context.Context, externalCustomerIDs []string, startTime, endTime time.Time) ([]string, error) {
 	if len(externalCustomerIDs) == 0 {
 		return nil, nil
@@ -724,31 +684,6 @@ func (s *InMemoryEventStore) matchesBaseFilters(ctx context.Context, event *even
 	return true
 }
 
-func (s *InMemoryEventStore) matchesFilterGroup(event *events.Event, group events.FilterGroup) bool {
-	if len(group.Filters) == 0 {
-		return true
-	}
-
-	for key, values := range group.Filters {
-		if propValue, ok := event.Properties[key]; !ok {
-			return false
-		} else {
-			found := false
-			for _, value := range values {
-				if fmt.Sprintf("%v", propValue) == value {
-					found = true
-					break
-				}
-			}
-			if !found {
-				return false
-			}
-		}
-	}
-
-	return true
-}
-
 func (s *InMemoryEventStore) HasEvent(id string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -760,6 +695,7 @@ func (s *InMemoryEventStore) Clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.events = make(map[string]*events.Event)
+	s.versions = nil
 }
 
 func (s *InMemoryEventStore) FindUnprocessedEvents(ctx context.Context, params *events.FindUnprocessedEventsParams) ([]*events.Event, error) {
@@ -853,3 +789,5 @@ func (s *InMemoryEventStore) getWindowStart(t time.Time, windowSize types.Window
 		return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), 0, 0, 0, t.Location())
 	}
 }
+
+var _ events.Repository = (*InMemoryEventStore)(nil)

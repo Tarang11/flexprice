@@ -10,6 +10,7 @@ import (
 
 // CheckoutProvider is implemented by each payment gateway that supports hosted checkout.
 type CheckoutProvider interface {
+	// CreatePaymentLink creates a hosted payment link or session for one-time checkout.
 	CreatePaymentLink(ctx context.Context, req CheckoutProviderRequest) (*CheckoutProviderResponse, error)
 
 	// CreateAuthorizationLink registers a payment instrument for future off-session
@@ -23,6 +24,11 @@ type CheckoutProvider interface {
 	// fall back to CreateAuthorizationLink). A hard provider error is returned as err.
 	TryAutoChargingSavedMethod(ctx context.Context, req AuthorizationLinkRequest) (resp *CheckoutProviderResponse, charged bool, err error)
 
+	// HasAutoChargeableMethod returns true if the customer has an active instrument
+	// (e.g., a confirmed mandate token or an active vaulted payment source)
+	// ready for off-session automatic charges, optionally within the specified amount ceiling.
+	HasAutoChargeableMethod(ctx context.Context, req HasAutoChargeableMethodRequest) (bool, error)
+
 	// FetchPaymentState asks the provider what happened to a checkout's payment, so a
 	// session can be reconciled when the webhook was late, dropped, or errored.
 	//
@@ -30,6 +36,24 @@ type CheckoutProvider interface {
 	// what kind of object each is, so interpreting them is the adapter's job.
 	// Providers without a read API return ierr.ErrNotImplemented.
 	FetchPaymentState(ctx context.Context, req PaymentStateRequest) (*PaymentState, error)
+
+	// ExpirePaymentLink stops a hosted link from accepting payment. A link that is
+	// already closed is not an error; one the customer already paid is reported in the
+	// response. Providers that cannot close links return ierr.ErrNotImplemented.
+	ExpirePaymentLink(ctx context.Context, req ExpirePaymentLinkRequest) (*ExpirePaymentLinkResponse, error)
+}
+
+// ExpirePaymentLinkResponse reports a link the customer paid before it could be closed.
+type ExpirePaymentLinkResponse struct {
+	AlreadyPaid bool
+}
+
+// ExpirePaymentLinkRequest identifies the hosted link to close.
+type ExpirePaymentLinkRequest struct {
+	// GatewayTrackingID is the handle the adapter returned as ProviderSessionID, stored
+	// on payment.gateway_tracking_id.
+	GatewayTrackingID string
+	InvoiceID         string
 }
 
 // PaymentStateRequest carries the provider handles recorded on the payment at
@@ -69,7 +93,8 @@ type CheckoutProviderRequest struct {
 	LineItems  []CheckoutLineItem
 	// ExpiresAt is when the hosted object should stop accepting payments. Providers
 	// that cannot express this ignore it.
-	ExpiresAt *time.Time
+	ExpiresAt      *time.Time
+	NotifyCustomer bool
 }
 
 // CheckoutLineItem itemises what is being charged. Providers that can only carry a
@@ -85,11 +110,12 @@ type CheckoutLineItem struct {
 
 // CheckoutProviderResponse is the unified output from all checkout provider adapters.
 type CheckoutProviderResponse struct {
-	ProviderSessionID       string              // stored in EntityIntegrationMapping
-	NextAction              types.PaymentAction // type + URL for the customer
-	ProviderPaymentIntentID string              // charge/intent ID, stored after payment confirmation
-	ExpiresAt               *time.Time          // nil if provider doesn't return expiry
-	ProviderMetadata        map[string]string   // debug data only, not for business logic
+	ProviderSessionID       string                  // stored in EntityIntegrationMapping
+	NextAction              types.PaymentAction     // type + URL for the customer
+	ProviderPaymentIntentID string                  // charge/intent ID, stored after payment confirmation
+	ExpiresAt               *time.Time              // nil if provider doesn't return expiry
+	ProviderMetadata        map[string]string       // debug data only, not for business logic
+	PaymentMethod           types.PaymentMethodType // method a saved-method charge used
 }
 
 // AuthorizationLinkRequest is the unified input for mandate/authorization
@@ -110,6 +136,14 @@ type AuthorizationLinkRequest struct {
 	CancelURL       string
 	Metadata        map[string]string
 	LineItems       []CheckoutLineItem
+	NotifyCustomer  bool
+}
+
+// HasAutoChargeableMethodRequest is the input for checking if a customer has
+// a usable instrument ready for automatic off-session charges.
+type HasAutoChargeableMethodRequest struct {
+	CustomerID string
+	Amount     *decimal.Decimal // optional: nil = check instrument existence; non-nil = check mandate ceiling
 }
 
 // ProviderPaymentMethod is a normalized view of one active, usable token at the
@@ -117,13 +151,15 @@ type AuthorizationLinkRequest struct {
 type ProviderPaymentMethod struct {
 	GatewayMethodID  string                  // opaque id at the gateway
 	Method           types.PaymentMethodType // e.g. PaymentMethodTypeUPI
-	MaxAmount        *decimal.Decimal
-	ExpiresAt        *time.Time
 	CreatedAt        time.Time
 	ProviderMetadata map[string]string
 
 	// Card is set only for card methods; nil for UPI, ACH and the rest.
-	Card *ProviderCardDetails
+	Card                *ProviderCardDetails
+	UPI                 *ProviderUPIDetails
+	BankAccount         *ProviderBankAccountDetails
+	Recurring           *ProviderRecurringPaymentDetails
+	InstantlyChargeable bool
 	// IsDefault is the gateway's own default/primary flag, which is what decides
 	// the card charged when no method is named. Scoped per provider.
 	IsDefault bool
@@ -145,4 +181,45 @@ type ProviderCardDetails struct {
 	Last4    string
 	ExpMonth int
 	ExpYear  int
+}
+
+type ProviderUPIDetails struct {
+	VPA string
+}
+
+// ProviderBankAccountDetails is the displayable part of a bank-account mandate.
+type ProviderBankAccountDetails struct {
+	Bank        string
+	IFSC        string
+	Last4       string
+	AccountType string
+	AuthType    string
+}
+
+type ProviderRecurringPaymentDetails struct {
+	Status             types.RecurringPaymentStatus
+	FailureReason      string
+	AutoChargeableTill *time.Time
+	MaxAmount          *decimal.Decimal
+}
+
+func (m *ProviderPaymentMethod) RecurringStatus() types.RecurringPaymentStatus {
+	if m == nil || m.Recurring == nil {
+		return ""
+	}
+	return m.Recurring.Status
+}
+
+func (m *ProviderPaymentMethod) RecurringAutoChargeableTill() *time.Time {
+	if m == nil || m.Recurring == nil {
+		return nil
+	}
+	return m.Recurring.AutoChargeableTill
+}
+
+func (m *ProviderPaymentMethod) RecurringMaxAmount() *decimal.Decimal {
+	if m == nil || m.Recurring == nil {
+		return nil
+	}
+	return m.Recurring.MaxAmount
 }

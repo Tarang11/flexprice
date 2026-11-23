@@ -41,6 +41,7 @@ type Logger struct {
 	// exception span events (SigNoz Exceptions tab). Mirrors
 	// otel.traces.capture_exceptions; see logErrorToSpan.
 	captureExceptions bool
+	providerCalls     bool
 	// ctxBound is true once WithContext has wrapped the core with otelCtxCore.
 	// Guards against repeated WithContext calls accumulating nested wrappers,
 	// which would append multiple _span_ctx fields on every Write.
@@ -186,6 +187,7 @@ func NewLogger(cfg *config.Configuration) (*Logger, error) {
 		SugaredLogger:     sugar,
 		otelLogProvider:   otelLogProvider,
 		captureExceptions: cfg.Otel.Enabled && cfg.Otel.Traces.Enabled && cfg.Otel.Traces.CaptureExceptions,
+		providerCalls:     cfg.Logging.ProviderCallsEnabled,
 	}, nil
 }
 
@@ -196,7 +198,12 @@ func NewNoopLogger() *Logger {
 
 // NewFromSugared creates a Logger from an existing SugaredLogger. For use in tests only.
 func NewFromSugared(s *zap.SugaredLogger) *Logger {
-	return &Logger{SugaredLogger: s}
+	return &Logger{SugaredLogger: s, providerCalls: true}
+}
+
+// ProviderCallsEnabled reports whether provider calls are logged.
+func (l *Logger) ProviderCallsEnabled() bool {
+	return l != nil && l.providerCalls
 }
 
 // resolveOtelLogsConfig picks the active log-export settings. Precedence:
@@ -236,6 +243,24 @@ func resolveOtelLogsConfig(cfg *config.Configuration) (config.OtelLogsConfig, ma
 	}
 
 	return config.OtelLogsConfig{}, nil, false
+}
+
+// logResourceAttrs builds service.name, deployment.environment, and cloud.region.
+func logResourceAttrs(cfg *config.Configuration) []attribute.KeyValue {
+	attrs := []attribute.KeyValue{
+		semconv.ServiceName(cfg.Otel.ResolveServiceName(cfg)),
+	}
+	if cfg.Logging.Environment != "" {
+		attrs = append(attrs,
+			semconv.DeploymentEnvironmentName(cfg.Logging.Environment),
+			// SigNoz usage meter reads the legacy key.
+			attribute.String("deployment.environment", cfg.Logging.Environment),
+		)
+	}
+	if cfg.Logging.Region != "" {
+		attrs = append(attrs, semconv.CloudRegion(cfg.Logging.Region))
+	}
+	return attrs
 }
 
 // newOtelLogProvider builds a sdklog.LoggerProvider that exports via OTLP (gRPC or HTTP).
@@ -283,18 +308,8 @@ func newOtelLogProvider(ctx context.Context, cfg *config.Configuration, logsCfg 
 		return nil, err
 	}
 
-	// Build resource with service.name, deployment.environment, and cloud.region
-	resAttrs := []attribute.KeyValue{
-		semconv.ServiceName(cfg.Otel.ResolveServiceName(cfg)),
-	}
-	if cfg.Logging.Environment != "" {
-		resAttrs = append(resAttrs, semconv.DeploymentEnvironmentName(cfg.Logging.Environment))
-	}
-	if cfg.Logging.Region != "" {
-		resAttrs = append(resAttrs, semconv.CloudRegion(cfg.Logging.Region))
-	}
 	res, err := resource.New(ctx,
-		resource.WithAttributes(resAttrs...),
+		resource.WithAttributes(logResourceAttrs(cfg)...),
 	)
 	if err != nil {
 		return nil, err
@@ -385,6 +400,7 @@ func (l *Logger) WithContext(ctx context.Context) *Logger {
 		SugaredLogger:     newSugared,
 		otelLogProvider:   l.otelLogProvider,
 		captureExceptions: l.captureExceptions,
+		providerCalls:     l.providerCalls,
 		ctxBound:          ctxBound,
 	}
 }
@@ -402,18 +418,32 @@ func (l *Logger) Ctx(ctx context.Context) *Logger {
 // ctx-first logging API (preferred)
 // ---------------------------------------------------------------------------
 
+// enabled checks core level gating.
+func (l *Logger) enabled(level zapcore.Level) bool {
+	return l.SugaredLogger.Desugar().Core().Enabled(level)
+}
+
 // Debug logs at debug level with auto-bound context fields.
 func (l *Logger) Debug(ctx context.Context, msg string, fields ...any) {
+	if !l.enabled(zapcore.DebugLevel) {
+		return
+	}
 	l.WithContext(ctx).SugaredLogger.Debugw(msg, fields...)
 }
 
 // Info logs at info level with auto-bound context fields.
 func (l *Logger) Info(ctx context.Context, msg string, fields ...any) {
+	if !l.enabled(zapcore.InfoLevel) {
+		return
+	}
 	l.WithContext(ctx).SugaredLogger.Infow(msg, fields...)
 }
 
 // Warn logs at warn level. Only use in bootstrap/startup code.
 func (l *Logger) Warn(ctx context.Context, msg string, fields ...any) {
+	if !l.enabled(zapcore.WarnLevel) {
+		return
+	}
 	l.WithContext(ctx).SugaredLogger.Warnw(msg, fields...)
 }
 

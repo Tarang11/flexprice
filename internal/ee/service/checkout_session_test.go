@@ -49,6 +49,9 @@ func (s *CheckoutCreateDraftSubscriptionSuite) buildParams() ServiceParams {
 		Config:                       s.GetConfig(),
 		DB:                           s.GetDB(),
 		SubRepo:                      s.GetStores().SubscriptionRepo,
+		CommitmentRepo:               s.GetStores().CommitmentRepo,
+		BillingTermRepo:              s.GetStores().BillingTermRepo,
+		BillingInstalmentRepo:        s.GetStores().BillingInstalmentRepo,
 		SubscriptionLineItemRepo:     s.GetStores().SubscriptionLineItemRepo,
 		SubscriptionPhaseRepo:        s.GetStores().SubscriptionPhaseRepo,
 		SubScheduleRepo:              s.GetStores().SubscriptionScheduleRepo,
@@ -88,6 +91,7 @@ func (s *CheckoutCreateDraftSubscriptionSuite) buildParams() ServiceParams {
 		ProrationCalculator:          s.GetCalculator(),
 		IntegrationFactory:           s.GetIntegrationFactory(),
 		PlanPriceSyncRepo:            s.GetStores().PlanPriceSyncRepo,
+		AddonPriceSyncRepo:           s.GetStores().AddonPriceSyncRepo,
 		WalletBalanceAlertPubSub:     types.WalletBalanceAlertPubSub{PubSub: testutil.NewInMemoryPubSub()},
 	}
 }

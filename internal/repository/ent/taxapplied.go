@@ -3,7 +3,10 @@ package ent
 import (
 	"context"
 	"errors"
-	"time"
+
+	"github.com/flexprice/flexprice/internal/clock"
+
+	"github.com/lib/pq"
 
 	"github.com/flexprice/flexprice/ent"
 	"github.com/flexprice/flexprice/ent/predicate"
@@ -15,7 +18,6 @@ import (
 	"github.com/flexprice/flexprice/internal/logger"
 	"github.com/flexprice/flexprice/internal/postgres"
 	"github.com/flexprice/flexprice/internal/types"
-	"github.com/lib/pq"
 )
 
 type taxappliedRepository struct {
@@ -38,7 +40,7 @@ func (r *taxappliedRepository) Create(ctx context.Context, ta *domainTaxApplied.
 	// Start a span for this repository operation
 	span := StartRepositorySpan(ctx, "taxapplied", "create", map[string]interface{}{
 		"taxapplied_id": ta.ID,
-		"tax_rate_id":   ta.TaxRateID,
+		"tax_rate_id":   ta.GetTaxRateID(),
 		"entity_type":   ta.EntityType,
 		"entity_id":     ta.EntityID,
 		"tenant_id":     ta.TenantID,
@@ -49,7 +51,7 @@ func (r *taxappliedRepository) Create(ctx context.Context, ta *domainTaxApplied.
 
 	r.log.Debug(ctx, "creating taxapplied",
 		"taxapplied_id", ta.ID,
-		"tax_rate_id", ta.TaxRateID,
+		"tax_rate_id", ta.GetTaxRateID(),
 		"entity_type", ta.EntityType,
 		"entity_id", ta.EntityID,
 		"tenant_id", ta.TenantID,
@@ -60,16 +62,19 @@ func (r *taxappliedRepository) Create(ctx context.Context, ta *domainTaxApplied.
 		ta.EnvironmentID = types.GetEnvironmentID(ctx)
 	}
 
-	_, err := client.TaxApplied.Create().
+	create := client.TaxApplied.Create().
 		SetID(ta.ID).
 		SetTenantID(ta.TenantID).
-		SetTaxRateID(ta.TaxRateID).
+		SetNillableTaxRateID(ta.TaxRateID).
 		SetEntityType(string(ta.EntityType)).
 		SetEntityID(ta.EntityID).
 		SetNillableTaxAssociationID(ta.TaxAssociationID).
 		SetTaxableAmount(ta.TaxableAmount).
 		SetTaxAmount(ta.TaxAmount).
-		SetTaxBehavior(ta.TaxBehavior).
+		SetProvider(ta.Provider).
+		SetNillableTaxTransactionID(ta.TaxTransactionID).
+		SetTaxTransactionType(ta.TaxTransactionType).
+		SetExternalTaxDetails(ta.ExternalTaxDetails).
 		SetCurrency(ta.Currency).
 		SetAppliedAt(ta.AppliedAt).
 		SetEnvironmentID(ta.EnvironmentID).
@@ -79,8 +84,15 @@ func (r *taxappliedRepository) Create(ctx context.Context, ta *domainTaxApplied.
 		SetNillableIdempotencyKey(ta.IdempotencyKey).
 		SetUpdatedAt(ta.UpdatedAt).
 		SetCreatedBy(ta.CreatedBy).
-		SetUpdatedBy(ta.UpdatedBy).
-		Save(ctx)
+		SetUpdatedBy(ta.UpdatedBy)
+
+	// A reversal row carries no behavior, and the field's validator rejects an empty one, so
+	// it is left unset rather than sent as a blank.
+	if ta.TaxBehavior != "" {
+		create = create.SetTaxBehavior(ta.TaxBehavior)
+	}
+
+	_, err := create.Save(ctx)
 
 	if err != nil {
 		SetSpanError(span, err)
@@ -93,7 +105,7 @@ func (r *taxappliedRepository) Create(ctx context.Context, ta *domainTaxApplied.
 					WithHint("Tax applied record with same identifier already exists").
 					WithReportableDetails(map[string]any{
 						"taxapplied_id": ta.ID,
-						"tax_rate_id":   ta.TaxRateID,
+						"tax_rate_id":   ta.GetTaxRateID(),
 						"entity_id":     ta.EntityID,
 						"error":         err.Error(),
 					}).
@@ -104,7 +116,7 @@ func (r *taxappliedRepository) Create(ctx context.Context, ta *domainTaxApplied.
 			WithHint("Failed to create tax applied record").
 			WithReportableDetails(map[string]any{
 				"taxapplied_id": ta.ID,
-				"tax_rate_id":   ta.TaxRateID,
+				"tax_rate_id":   ta.GetTaxRateID(),
 				"entity_id":     ta.EntityID,
 			}).
 			Mark(ierr.ErrDatabase)
@@ -165,7 +177,7 @@ func (r *taxappliedRepository) Update(ctx context.Context, ta *domainTaxApplied.
 	// Start a span for this repository operation
 	span := StartRepositorySpan(ctx, "taxapplied", "update", map[string]interface{}{
 		"taxapplied_id": ta.ID,
-		"tax_rate_id":   ta.TaxRateID,
+		"tax_rate_id":   ta.GetTaxRateID(),
 		"entity_id":     ta.EntityID,
 	})
 	defer FinishSpan(span)
@@ -174,7 +186,7 @@ func (r *taxappliedRepository) Update(ctx context.Context, ta *domainTaxApplied.
 
 	r.log.Debug(ctx, "updating taxapplied",
 		"taxapplied_id", ta.ID,
-		"tax_rate_id", ta.TaxRateID,
+		"tax_rate_id", ta.GetTaxRateID(),
 		"entity_id", ta.EntityID,
 	)
 
@@ -192,9 +204,12 @@ func (r *taxappliedRepository) Update(ctx context.Context, ta *domainTaxApplied.
 		SetTaxableAmount(ta.TaxableAmount).
 		SetTaxAmount(ta.TaxAmount).
 		SetTaxBehavior(ta.TaxBehavior).
+		SetProvider(ta.Provider).
+		SetNillableTaxTransactionID(ta.TaxTransactionID).
+		SetCurrency(ta.Currency).
 		SetMetadata(ta.Metadata).
 		SetStatus(string(ta.Status)).
-		SetUpdatedAt(time.Now().UTC()).
+		SetUpdatedAt(clock.Now()).
 		SetUpdatedBy(types.GetUserID(ctx)).
 		Save(ctx)
 
@@ -250,7 +265,7 @@ func (r *taxappliedRepository) Delete(ctx context.Context, id string) error {
 			taxapplied.EnvironmentID(types.GetEnvironmentID(ctx)),
 		).
 		SetStatus(string(types.StatusArchived)).
-		SetUpdatedAt(time.Now().UTC()).
+		SetUpdatedAt(clock.Now()).
 		SetUpdatedBy(types.GetUserID(ctx)).
 		Save(ctx)
 
@@ -415,6 +430,11 @@ func (o TaxAppliedQueryOptions) applyEntityQueryOptions(_ context.Context, f *ty
 		predicates = append(predicates, taxapplied.EntityID(f.EntityID))
 	}
 
+	// Apply entity IDs filter, for loading several entities' taxes in one query
+	if len(f.EntityIDs) > 0 {
+		predicates = append(predicates, taxapplied.EntityIDIn(f.EntityIDs...))
+	}
+
 	// Apply tax association ID filter
 	if f.TaxAssociationID != "" {
 		predicates = append(predicates, taxapplied.TaxAssociationID(f.TaxAssociationID))
@@ -482,36 +502,4 @@ func (r *taxappliedRepository) DeleteCache(ctx context.Context, taxapplied *doma
 	cacheKey := cache.GenerateKey(ctx, cache.PrefixTaxApplied, taxapplied.ID)
 	r.redisCache.Delete(ctx, cacheKey)
 	r.log.Debug(ctx, "cache deleted", "key", cacheKey)
-}
-
-func (r *taxappliedRepository) GetByIdempotencyKey(ctx context.Context, idempotencyKey string) (*domainTaxApplied.TaxApplied, error) {
-	span := StartRepositorySpan(ctx, "taxapplied", "get_by_idempotency_key", map[string]interface{}{
-		"idempotency_key": idempotencyKey,
-	})
-	defer FinishSpan(span)
-
-	client := r.client.Reader(ctx)
-
-	taxapplied, err := client.TaxApplied.Query().
-		Where(taxapplied.IdempotencyKey(idempotencyKey),
-			taxapplied.TenantID(types.GetTenantID(ctx)),
-			taxapplied.EnvironmentID(types.GetEnvironmentID(ctx)),
-		).
-		Only(ctx)
-
-	if err != nil {
-		SetSpanError(span, err)
-
-		if ent.IsNotFound(err) {
-			return nil, ierr.WithError(err).
-				WithHint("Tax applied record with idempotency key was not found").
-				Mark(ierr.ErrNotFound)
-		}
-
-		return nil, ierr.WithError(err).
-			WithHint("Failed to get tax applied record by idempotency key").
-			Mark(ierr.ErrDatabase)
-	}
-
-	return domainTaxApplied.FromEnt(taxapplied), nil
 }

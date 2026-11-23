@@ -65,6 +65,9 @@ func (s *SubscriptionTimezoneE2ETestSuite) setupService() {
 		TaxAssociationRepo:         s.GetStores().TaxAssociationRepo,
 		TaxRateRepo:                s.GetStores().TaxRateRepo,
 		SubRepo:                    s.GetStores().SubscriptionRepo,
+		CommitmentRepo:             s.GetStores().CommitmentRepo,
+		BillingTermRepo:            s.GetStores().BillingTermRepo,
+		BillingInstalmentRepo:      s.GetStores().BillingInstalmentRepo,
 		SubscriptionLineItemRepo:   s.GetStores().SubscriptionLineItemRepo,
 		SubscriptionPhaseRepo:      s.GetStores().SubscriptionPhaseRepo,
 		SubScheduleRepo:            s.GetStores().SubscriptionScheduleRepo,
@@ -76,6 +79,7 @@ func (s *SubscriptionTimezoneE2ETestSuite) setupService() {
 		MeterRepo:                  s.GetStores().MeterRepo,
 		CustomerRepo:               s.GetStores().CustomerRepo,
 		InvoiceRepo:                s.GetStores().InvoiceRepo,
+		HostedInvoiceTokenRepo:     s.GetStores().HostedInvoiceTokenRepo,
 		InvoiceLineItemRepo:        s.GetStores().InvoiceLineItemRepo,
 		EntitlementRepo:            s.GetStores().EntitlementRepo,
 		EnvironmentRepo:            s.GetStores().EnvironmentRepo,
@@ -99,6 +103,7 @@ func (s *SubscriptionTimezoneE2ETestSuite) setupService() {
 		ProrationCalculator:        s.GetCalculator(),
 		IntegrationFactory:         s.GetIntegrationFactory(),
 		PlanPriceSyncRepo:          s.GetStores().PlanPriceSyncRepo,
+		AddonPriceSyncRepo:         s.GetStores().AddonPriceSyncRepo,
 		// CreateSubscription touches these on cancellation branches / alerts —
 		// the anchor test doesn't exercise them but the constructor needs them
 		// non-nil to reach the plan-price-sequence stamping step.
